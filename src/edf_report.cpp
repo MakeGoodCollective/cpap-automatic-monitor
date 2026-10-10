@@ -695,30 +695,49 @@ bool prepare_channels(Input &input, uint8_t file, SessionData &data) {
 
 bool scan_channels(const SdStorage::Session &session, const Job &job,
                    Input &input, uint8_t file, SessionData &data) {
-    size_t offset = 0;
-    ReportEdf::Sample samples[32];
+    int signals[CHANNEL_COUNT];
+    bool present = false;
     for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
-        auto &channel = data.header.channels[c];
-        if (CHANNELS[c].file == file && channel.bins) {
-            const int signal = ReportEdf::find_signal(*input.header, CHANNELS[c].signal);
-            auto hist = histogram(channel, data.bins + offset);
-            const uint64_t count = ReportEdf::sample_count(*input.header, signal);
-            for (uint64_t first = 0; first < count;) {
-                if (aborted(&job, session)) return false;
-                const size_t take = std::min<uint64_t>(32, count - first);
-                if (!ReportEdf::read_samples(input.reader, *input.header, signal,
-                                             first, take, samples)) return false;
-                for (size_t i = 0; i < take; ++i)
-                    if (!ReportEdf::add_sample(hist, samples[i].raw, samples[i].valid)) return false;
-                first += take;
+        signals[c] = -1;
+        if (CHANNELS[c].file != file || !data.header.channels[c].bins) continue;
+        signals[c] = ReportEdf::find_signal(*input.header, CHANNELS[c].signal);
+        if (signals[c] < 0) return false;
+        present = true;
+    }
+    if (!present) return true;
+
+    ReportEdf::Sample samples[32];
+    for (uint32_t record = 0; record < input.header->records; ++record) {
+        size_t offset = 0;
+        for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
+            auto &channel = data.header.channels[c];
+            if (signals[c] >= 0) {
+                auto hist = histogram(channel, data.bins + offset);
+                const uint32_t count = channel.signal.samples_per_record;
+                const uint64_t first = uint64_t(record) * count;
+                // Stay inside this record so every channel reuses Input's buffer.
+                for (uint32_t slot = 0; slot < count;) {
+                    if (aborted(&job, session)) return false;
+                    const size_t take = std::min<size_t>(32, count - slot);
+                    if (!ReportEdf::read_samples(input.reader, *input.header, signals[c],
+                                                 first + slot, take, samples)) return false;
+                    for (size_t i = 0; i < take; ++i)
+                        if (!ReportEdf::add_sample(hist, samples[i].raw, samples[i].valid)) return false;
+                    slot += take;
+                }
+                channel.count = hist.count;
+                channel.missing = hist.missing;
+                channel.sum = hist.sum;
             }
-            channel.count = hist.count;
-            channel.missing = hist.missing;
-            channel.sum = hist.sum;
-            channel.coverage_seconds = hist.count * input.header->record_seconds /
+            offset += channel.bins;
+        }
+    }
+    for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
+        if (signals[c] >= 0) {
+            auto &channel = data.header.channels[c];
+            channel.coverage_seconds = channel.count * input.header->record_seconds /
                 channel.signal.samples_per_record;
         }
-        offset += channel.bins;
     }
     return true;
 }
