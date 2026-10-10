@@ -6,6 +6,7 @@
 namespace ReportEdf {
 
 constexpr size_t MAX_SIGNALS = 32;
+constexpr size_t MAX_STR_SIGNALS = 128;
 
 struct Reader {
     // Exact offset read; the caller owns the immutable file and its I/O lease.
@@ -22,16 +23,19 @@ struct Signal {
     uint32_t samples_per_record = 0, record_offset = 0;
     bool annotation = false, crc = false;
 
-    bool valid(int16_t raw) const;
-    double physical(int16_t raw) const;
+    bool valid(int32_t raw) const;
+    double physical(int32_t raw) const;
 };
 
-struct Header {
+struct Layout {
     uint32_t header_bytes = 0, record_bytes = 0, records = 0;
     double record_seconds = 0;
     // Native EDF wall-time in epoch-like seconds, NOT UTC or host-local time.
     int64_t start_seconds = 0;
     size_t signal_count = 0;
+};
+
+struct Header : Layout {
     Signal signals[MAX_SIGNALS];
 };
 
@@ -76,6 +80,11 @@ struct RecordedBounds {
 // Reject incomplete/mismatched file sizes and unfinished record counts (-1).
 // Output is usable only on success; zero-record headers are valid.
 bool read_header(const Reader &reader, Header &out);
+// Two-phase header read for STR: allocate the actual signal count separately,
+// without enlarging every detail Header. Only read_signals validates file size.
+bool read_layout(const Reader &reader, Layout &out);
+bool read_signals(const Reader &reader, Layout &layout, Signal *signals,
+                  size_t capacity, bool unsigned_ranges = false);
 int find_signal(const Header &header, const char *label);
 uint64_t sample_count(const Header &header, size_t signal);
 

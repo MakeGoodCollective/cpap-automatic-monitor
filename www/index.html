@@ -99,23 +99,32 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .report-selection{font-size:12px;color:var(--text-dim);font-variant-numeric:tabular-nums}
 .report-load-state{position:absolute;right:0;bottom:0;display:flex;align-items:center;gap:6px;height:14px;white-space:nowrap;font-size:11px;color:var(--text-dim)}
 .report-load-state .spinner{flex:none;margin:0;width:14px;height:14px;border-width:2px}
-.report-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:16px}
-.report-metric{min-width:0;text-align:left;padding:14px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font:inherit}
-.report-metric-label,.report-metric-unit{display:block;font-size:11px;color:var(--text-dim)}
-.report-metric-value{display:block;font-size:22px;font-weight:600;margin:8px 0;font-variant-numeric:tabular-nums}
+#reportStatsCard{container-type:inline-size}
+.report-metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin-bottom:12px}
+.report-metric{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-areas:'label label' 'value spark' 'unit delta';grid-template-rows:16px 28px 20px;gap:3px 4px;align-items:center;min-width:0;text-align:left;padding:8px;border:1px solid var(--border);border-top:2px solid var(--metric-color);border-radius:5px;background:var(--bg);color:var(--text);font:inherit}
+.report-metric-label{grid-area:label;white-space:nowrap}
+.report-metric-unit{grid-area:unit;white-space:nowrap}
+.report-metric-label,.report-metric-unit{font-size:11px;color:var(--text-dim)}
+.report-metric-value{grid-area:value;font-size:20px;font-weight:600;line-height:1.15;font-variant-numeric:tabular-nums;white-space:nowrap}
 .report-metric[aria-expanded]{cursor:pointer}
-.report-metric[aria-expanded=true]{border-color:var(--accent)}
-.report-metric svg{float:right;width:56px;height:24px}
-.report-metric-delta{display:block;margin-top:8px;font-size:11px;color:var(--text-dim)}
+.report-metric[aria-expanded]:hover,.report-metric[aria-expanded=true]{background:var(--border)}
+.report-metric:focus-visible{outline:2px solid var(--metric-color);outline-offset:2px}
+.report-metric svg{grid-area:spark;justify-self:end;width:48px;height:22px}
+.report-metric[data-metric=usage] .report-metric-value{grid-column:1/-1}
+.report-metric[data-metric=usage] svg{grid-area:unit;justify-self:start}
+.report-metric-delta{grid-area:delta;justify-self:end;font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .report-history{margin-bottom:16px;border-bottom:1px solid var(--border);padding-bottom:12px}
 .report-history svg{display:block;width:100%;height:auto;max-height:180px;color:var(--text-dim)}
 .report-history-head{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;font-size:12px;margin-bottom:6px}
 .report-events{display:flex;flex-wrap:wrap;gap:8px 18px;margin:12px 0 18px;font-size:12px;font-variant-numeric:tabular-nums}
 .report-events span{white-space:nowrap}
 .report-events b{margin-left:6px}
-@media(max-width:600px){.report-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.report-metric{padding:10px}.report-metric-value{font-size:19px}}
+@container(max-width:900px){.report-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@container(max-width:520px){.report-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .report-statistics>summary{cursor:pointer;font-size:12px;color:var(--text-dim);padding:4px 0}
 .report-statistics[open]>summary{margin-bottom:8px}
+.report-stat-source{margin-left:8px;color:var(--text-dim);font-size:10px}
+.report-settings{margin-top:16px}
 .report-channel-options{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
 .report-channel-options .btn{padding:4px 9px;font-weight:500}
 .report-channel-options .btn[aria-pressed=true]{background:var(--accent-dim);border-color:var(--accent)}
@@ -516,6 +525,7 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
             </div>
             <div class="report-events" id="reportTotals" aria-label="Therapy totals"></div>
             <details class="report-statistics"><summary>Statistics</summary><div class="report-table-wrap"><table class="report-table"><thead><tr><th>Channel</th><th>Min</th><th>Mean</th><th>Median</th><th>P95</th><th>Max</th></tr></thead><tbody id="reportStats"></tbody></table></div></details>
+            <details class="report-statistics report-settings" id="reportSettings" hidden><summary>Settings</summary><div class="status-grid" id="reportSettingsFields"></div></details>
           </div>
         </div>
         <div class="card" id="reportMaskCard" hidden>
@@ -1744,10 +1754,11 @@ function reportNumber(value) {
   return Number.isFinite(value) ? value.toLocaleString('en-US', {maximumFractionDigits:2}) : '--';
 }
 
-function reportDuration(seconds) {
+function reportDuration(seconds, compact = false) {
   if (!Number.isFinite(seconds)) return '--';
   const hours = Math.floor(seconds/3600), minutes = Math.floor(seconds%3600/60);
-  return (hours ? hours + ' h' : '') + (minutes || !hours ? (hours ? ' ' : '') + minutes + ' min' : '');
+  const text = (hours ? hours + ' h' : '') + (minutes || !hours ? (hours ? ' ' : '') + minutes + ' min' : '');
+  return compact ? text.replace(' min','m').replace(' h','h') : text;
 }
 
 function reportSessions() {
@@ -1761,50 +1772,58 @@ function reportSessionRange() {
 }
 
 const reportMetrics = [
-  {id:'usage',label:'Usage',unit:'',field:'used_seconds'},
-  {id:'ahi',label:'AHI',unit:'events/h',field:'ahi'},
-  {id:'pressure',label:'Pressure',unit:'cmH2O',channel:'Press'},
-  {id:'leak',label:'Leak',unit:'L/min',channel:'Leak'},
-  {id:'vt',label:'Tidal volume',unit:'mL',channel:'TidVol'},
-  {id:'mv',label:'Minute ventilation',unit:'L/min',channel:'MinVent'},
+  {id:'usage',label:'Therapy time',unit:'',field:'used_seconds',color:'#7dd3fc'},
+  {id:'ahi',label:'AHI',unit:'/h',field:'ahi',color:'#c084fc',digits:2},
+  {id:'pressure',label:'Pressure',unit:'cmH2O',channel:'Press',color:'#34d399',digits:2},
+  {id:'leak',label:'Leak',unit:'L/min',channel:'Leak',color:'#fb923c',digits:2},
+  {id:'vt',label:'Vt',name:'Tidal volume',unit:'mL',channel:'TidVol',color:'#f0abfc',digits:0},
+  {id:'mv',label:'MV',name:'Minute ventilation',unit:'L/min',channel:'MinVent',color:'#a78bfa',digits:2},
 ];
 
 function renderReportMetrics(data) {
+  const focused = document.activeElement?.dataset.metric;
   const fragment = document.createDocumentFragment();
   for (const metric of reportMetrics) {
+    const format = value => !Number.isFinite(value) ? '--'
+      : metric.id === 'usage' ? (value < 0 ? '-' : '') + reportDuration(Math.round(Math.abs(value)/60)*60,true) : value.toFixed(metric.digits);
     const value = metric.field ? data[metric.field] : data.channels?.find(c => c.id === metric.channel)?.mean;
     const tile = document.createElement(data.view === 'day' ? 'button' : 'div'); tile.className = 'report-metric';
+    tile.dataset.metric = metric.id;
+    tile.style.cssText = '--metric-color:'+metric.color;
+    tile.title = metric.name || metric.label;
     if (data.view === 'day') {
       tile.type = 'button';
       tile.setAttribute('aria-expanded',String(reportPlot.historyMetric === metric.id));
       tile.setAttribute('aria-controls','reportHistory');
       tile.addEventListener('click',() => showReportHistory(metric.id));
     }
-    for (const [className,text] of [['label',metric.label],['value',metric.id === 'usage' ? reportDuration(value) : reportNumber(value)],
-        ['unit',(metric.channel ? 'Mean ' : '') + metric.unit]]) {
+    for (const [className,text] of [['label',metric.label + (metric.channel ? ' \u00b7 avg' : '')],['value',format(value)],['unit',metric.unit]]) {
       const item = document.createElement('span'); item.className = 'report-metric-' + className;
       item.textContent = text; tile.append(item);
     }
     const trend = reportPlot.history?.metrics.find(m => m.id === metric.id);
     if (data.view === 'day' && trend) {
-      const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
-      svg.setAttribute('aria-hidden','true'); drawReportHistory(svg,metric,trend,false); tile.append(svg);
+      tile.title += '; previous 7 days: '+format(trend.baseline)+' '+metric.unit+' ('+(trend.baseline_count || 0)+'/7 days)';
+      if (trend.points.filter(Number.isFinite).length > 1) {
+        const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+        svg.setAttribute('aria-hidden','true'); drawReportHistory(svg,metric,trend,false); tile.append(svg);
+      }
       const delta = document.createElement('span'); delta.className = 'report-metric-delta';
+      delta.title = 'Change from the previous 7 days';
       delta.textContent = Number.isFinite(trend.delta)
-        ? (trend.delta > 0 ? '+' : '') + reportNumber(metric.id === 'usage' ? trend.delta/60 : trend.delta)
-          + (metric.id === 'usage' ? ' min' : '') + ' vs previous 7 days'
-        : 'Previous 7 days: --';
+        ? (trend.delta > 0 ? '+' : '') + format(trend.delta) : '--';
       tile.append(delta);
     }
     fragment.append(tile);
   }
   document.getElementById('reportMetrics').replaceChildren(fragment);
+  if (focused) [...document.getElementById('reportMetrics').children].find(tile => tile.dataset.metric === focused)?.focus({preventScroll:true});
 }
 
 function drawReportHistory(svg, metric, trend, expanded) {
   svg.replaceChildren();
   const width = expanded ? 600 : 56, height = expanded ? 160 : 24;
-  const left = expanded ? 58 : 2, right = expanded ? 18 : 2, top = 12, bottom = expanded ? 24 : 2;
+  const left = expanded ? 58 : 2, right = expanded ? 18 : 2, top = expanded ? 12 : 2, bottom = expanded ? 24 : 2;
   svg.setAttribute('viewBox',`0 0 ${width} ${height}`);
   const points = trend?.points || [], values = points.filter(Number.isFinite);
   if (!values.length) return;
@@ -1822,10 +1841,10 @@ function drawReportHistory(svg, metric, trend, expanded) {
     if (!Number.isFinite(value)) { previous = false; return; }
     path += `${previous ? 'L' : 'M'}${x(i)} ${y(value)} `; previous = true;
   });
-  node('path',{d:path,fill:'none',stroke:'var(--accent)','stroke-width':1.5});
+  node('path',{d:path,fill:'none',stroke:metric.color,'stroke-width':1.5});
   points.forEach((value,i) => {
     if (!Number.isFinite(value)) return;
-    const dot = node('circle',{cx:x(i),cy:y(value),r:expanded ? 3 : 1.4,fill:'var(--accent)'});
+    const dot = node('circle',{cx:x(i),cy:y(value),r:expanded ? 3 : 1.4,fill:metric.color});
     const title = document.createElementNS('http://www.w3.org/2000/svg','title');
     title.textContent = reportDate(reportPlot.history.first_day+i)+': '+(metric.id === 'usage' ? reportDuration(value) : reportNumber(value)+' '+metric.unit);
     dot.append(title);
@@ -1891,8 +1910,7 @@ function renderEdfReport(data) {
   document.getElementById('reportGrid').hidden = true;
   renderReportMetrics(data);
   const totals = document.createDocumentFragment();
-  for (const [label, value] of [['Sessions',reportNumber(data.session_count)],
-      ...Object.entries(data.counts || {}).map(([type,count]) => [type.toUpperCase(),reportNumber(count)]),
+  for (const [label, value] of [...Object.entries(data.counts || {}).map(([type,count]) => [type.toUpperCase(),reportNumber(count)]),
       ['RDI',reportNumber(data.rdi)], ['CSR',reportDuration(data.csr_seconds)],
       ['Leak > ' + reportNumber(data.leak_threshold) + ' L/min',reportDuration(data.leak_high_seconds)]]) {
     const item = document.createElement('span'); item.textContent = label;
@@ -1907,9 +1925,22 @@ function renderEdfReport(data) {
         ...['min','mean','median','p95','max'].map(key => reportNumber(channel[key]))]) {
       const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
     }
+    if (channel.source === 'str') {
+      const source = document.createElement('span'); source.className = 'report-stat-source'; source.textContent = 'STR';
+      row.children[0].append(source);
+    }
     statistics.append(row);
   }
   document.getElementById('reportStats').replaceChildren(statistics);
+  const fields = document.createDocumentFragment();
+  for (const field of data.settings?.fields || []) {
+    const row = document.createElement('div'); row.className = 'stat';
+    const label = document.createElement('span'); label.className = 'k'; label.textContent = field.label;
+    const value = document.createElement('span'); value.className = 'v'; value.textContent = field.value + (field.unit ? ' '+field.unit : '');
+    row.append(label,value); fields.append(row);
+  }
+  document.getElementById('reportSettingsFields').replaceChildren(fields);
+  document.getElementById('reportSettings').hidden = !day || !data.settings?.fields?.length;
   document.getElementById('reportStatsCard').hidden = !data.present;
   document.getElementById('reportMaskCard').hidden = true;
   if (!day) return;

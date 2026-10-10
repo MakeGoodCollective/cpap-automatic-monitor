@@ -109,6 +109,21 @@ static const var_def_t *var_lookup(const char *cmd) {
     return NULL;
 }
 
+static inline bool setting_enum_label(const var_def_t *def, int value, char *out, size_t capacity) {
+    const char *label = def ? def->enum_options : nullptr;
+    if (!label || value < 0 || !capacity) return false;
+    while (value-- > 0) {
+        label = strchr(label, ',');
+        if (!label) return false;
+        ++label;
+    }
+    const size_t size = strcspn(label, ",");
+    if (!size || size >= capacity) return false;
+    memcpy(out, label, size);
+    out[size] = 0;
+    return true;
+}
+
 // Each mode lists its GRP_MODE variables in display order.
 // NULL-terminated.
 #define MODE_COUNT 12

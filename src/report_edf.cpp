@@ -16,12 +16,12 @@ bool read_at(const Reader &reader, uint64_t offset, uint8_t *out, size_t size) {
            reader.read(reader.context, offset, out, size);
 }
 
-bool text_field(const uint8_t *bytes, size_t width, char *out, size_t capacity) {
+bool text_field(const uint8_t *bytes, size_t width, char *out, size_t capacity, bool unit = false) {
     while (width && bytes[width - 1] == ' ') width--;
     while (width && *bytes == ' ') { bytes++; width--; }
     if (width >= capacity) return false;
     for (size_t i = 0; i < width; i++)
-        if (bytes[i] < 0x20 || bytes[i] > 0x7e) return false;
+        if (bytes[i] < 0x20 || bytes[i] == 0x7f || (!unit && bytes[i] > 0x7e)) return false;
     memcpy(out, bytes, width);
     out[width] = 0;
     return true;
@@ -93,17 +93,17 @@ bool record_has_valid(const Reader &reader, const Header &header, size_t signal,
 
 }  // namespace
 
-bool Signal::valid(int16_t raw) const {
+bool Signal::valid(int32_t raw) const {
     return !crc && !annotation && raw >= digital_min && raw <= digital_max;
 }
 
-double Signal::physical(int16_t raw) const {
+double Signal::physical(int32_t raw) const {
     return physical_min + (static_cast<int32_t>(raw) - digital_min) *
            (physical_max - physical_min) / (digital_max - digital_min);
 }
 
-bool read_header(const Reader &reader, Header &out) {
-    out = Header{};
+bool read_layout(const Reader &reader, Layout &out) {
+    out = Layout{};
     uint8_t fixed[256];
     if (!read_at(reader, 0, fixed, sizeof(fixed))) return false;
 
@@ -112,8 +112,8 @@ bool read_header(const Reader &reader, Header &out) {
     if (!text_field(fixed, 8, version, sizeof(version)) || strcmp(version, "0") ||
         !text_field(fixed + 192, 44, reserved, sizeof(reserved)) ||
         (strcmp(reserved, "EDF") && strcmp(reserved, "EDF+D")) ||
-        !integer(fixed + 184, 8, 256, 256 + MAX_SIGNALS * 256, bytes) ||
-        !integer(fixed + 252, 4, 1, MAX_SIGNALS, signals) ||
+        !integer(fixed + 184, 8, 256, 256 + MAX_STR_SIGNALS * 256, bytes) ||
+        !integer(fixed + 252, 4, 1, MAX_STR_SIGNALS, signals) ||
         bytes != 256 + signals * 256 || uint64_t(bytes) > reader.size ||
         !integer(fixed + 236, 8, 0, UINT32_MAX, records) ||
         !number(fixed + 244, 8, out.record_seconds) || out.record_seconds < 0 ||
@@ -122,16 +122,29 @@ bool read_header(const Reader &reader, Header &out) {
     out.header_bytes = static_cast<uint32_t>(bytes);
     out.signal_count = static_cast<size_t>(signals);
     out.records = static_cast<uint32_t>(records);
+    return true;
+}
+
+bool read_signals(const Reader &reader, Layout &out, Signal *signals,
+                  size_t capacity, bool unsigned_ranges) {
+    if (!signals || !out.signal_count || out.signal_count > MAX_STR_SIGNALS ||
+        out.signal_count > capacity) return false;
+    out.record_bytes = 0;
+    for (size_t i = 0; i < out.signal_count; ++i) signals[i] = {};
     // Read whole descriptor columns, not one tiny SD callback per signal.
     uint8_t slab[MAX_SIGNALS * 16];
     const size_t columns[] = {0, 96, 104, 112, 120, 128, 216};
     for (size_t column : columns) {
         const size_t width = column == 0 ? 16 : 8;
-        if (!read_at(reader, 256 + out.signal_count * column, slab,
-                     out.signal_count * width)) return false;
+        size_t loaded = 0;
         for (size_t i = 0; i < out.signal_count; i++) {
-            Signal &signal = out.signals[i];
-            const uint8_t *field = slab + i * width;
+            if (i == loaded) {
+                const size_t take = out.signal_count - i < MAX_SIGNALS ? out.signal_count - i : MAX_SIGNALS;
+                if (!read_at(reader, 256 + out.signal_count * column + i * width, slab, take * width)) return false;
+                loaded += take;
+            }
+            Signal &signal = signals[i];
+            const uint8_t *field = slab + (i % MAX_SIGNALS) * width;
             int64_t value = 0;
             switch (column) {
                 case 0:
@@ -139,7 +152,7 @@ bool read_header(const Reader &reader, Header &out) {
                         !signal.label[0]) return false;
                     break;
                 case 96:
-                    if (!text_field(field, width, signal.unit, sizeof(signal.unit))) return false;
+                    if (!text_field(field, width, signal.unit, sizeof(signal.unit), true)) return false;
                     break;
                 case 104:
                     if (!number(field, width, signal.physical_min)) return false;
@@ -149,7 +162,7 @@ bool read_header(const Reader &reader, Header &out) {
                     break;
                 case 120:
                 case 128:
-                    if (!integer(field, width, INT16_MIN, INT16_MAX, value)) return false;
+                    if (!integer(field, width, INT16_MIN, unsigned_ranges ? UINT16_MAX : INT16_MAX, value)) return false;
                     if (column == 120) signal.digital_min = static_cast<int32_t>(value);
                     else signal.digital_max = static_cast<int32_t>(value);
                     break;
@@ -163,12 +176,13 @@ bool read_header(const Reader &reader, Header &out) {
 
     bool numeric = false;
     for (size_t i = 0; i < out.signal_count; i++) {
-        Signal &signal = out.signals[i];
+        Signal &signal = signals[i];
         if (signal.digital_min >= signal.digital_max ||
+            (signal.digital_min < 0 && signal.digital_max > INT16_MAX) ||
             signal.physical_min == signal.physical_max ||
             signal.samples_per_record * 2 > 65536 - out.record_bytes) return false;
         for (size_t j = 0; j < i; j++)
-            if (!strcmp(signal.label, out.signals[j].label)) return false;
+            if (!strcmp(signal.label, signals[j].label)) return false;
         signal.record_offset = out.record_bytes;
         signal.crc = !strcmp(signal.label, "Crc16");
         signal.annotation = !strcmp(signal.label, "EDF Annotations");
@@ -177,6 +191,11 @@ bool read_header(const Reader &reader, Header &out) {
     }
     return (!numeric || out.record_seconds > 0) &&
            reader.size == out.header_bytes + uint64_t(out.records) * out.record_bytes;
+}
+
+bool read_header(const Reader &reader, Header &out) {
+    out = Header{};
+    return read_layout(reader, out) && read_signals(reader, out, out.signals, MAX_SIGNALS);
 }
 
 int find_signal(const Header &header, const char *label) {

@@ -59,6 +59,8 @@ Result::Result(Result &&other) noexcept
 
 #if AB_STORAGE_HAS_SDCARD
 #include "air10_clock.h"
+#include "air10_edf.h"
+#include "air10_str_timeline.h"
 #include "airsense_state.h"
 #include "edf_catalog.h"
 #include "debug_log.h"
@@ -66,6 +68,7 @@ Result::Result(Result &&other) noexcept
 #include "large_text_buffer.h"
 #include "hex_util.h"
 #include "report_edf.h"
+#include "settings_defs.h"
 #include <Arduino.h>
 #include <FS.h>
 #include <esp_heap_caps.h>
@@ -400,6 +403,7 @@ bool refresh_index(const SdStorage::Session &session) {
         index_count = changes.catalog.entries;
     }
     bool detail_changed = !index_ready || changes.catalog.entries < old_count;
+    bool summary_changed = false;
     const size_t count = full ? index_count : changes.count;
     for (size_t n = 0; n < count; ++n) {
         if (aborted(nullptr, session)) {
@@ -417,6 +421,8 @@ bool refresh_index(const SdStorage::Session &session) {
         index_error = "catalog_day";
         if (!catalog_day(next.entry.therapy_day, next.day)) return false;
         // STR/Identification readiness is not a detail-data revision.
+        summary_changed |= index[i].entry.str_revision != next.entry.str_revision ||
+            ((index[i].entry.flags ^ next.entry.flags) & EdfCatalog::ENTRY_STR_READY);
         const bool changed = strcmp(index[i].entry.file_prefix, next.entry.file_prefix) ||
             strcmp(index[i].entry.therapy_day, next.entry.therapy_day) ||
             ((index[i].entry.flags ^ next.entry.flags) & EdfCatalog::ENTRY_LIVE_COMPLETE);
@@ -453,13 +459,13 @@ bool refresh_index(const SdStorage::Session &session) {
         cache_usage_known = false;
         if (!prune_cache(session)) { index_ready = false; index_error = "cache_prune"; return false; }
     }
-    if (detail_changed && !invalidated) __atomic_add_fetch(&data_revision, 1, __ATOMIC_RELEASE);
+    if ((detail_changed || summary_changed) && !invalidated) __atomic_add_fetch(&data_revision, 1, __ATOMIC_RELEASE);
     portENTER_CRITICAL(&status_mux);
     status.catalog_generation = catalog_generation;
     status.files_revision = file_revision;
     status.sessions = index_count;
     status.data_revision = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
-    if (detail_changed || invalidated) ++status.revision;
+    if (detail_changed || summary_changed || invalidated) ++status.revision;
     portEXIT_CRITICAL(&status_mux);
     return true;
 }
@@ -484,10 +490,17 @@ struct Input {
         aircannect::Memory::free(record);
     }
     bool open(const SdStorage::Session &session, const IndexedSession &entry, uint8_t kind) {
+        char source[96];
+        source_path(entry, kind, "edf", source);
+        if (!open_file(source)) return false;
+        if (!ReportEdf::read_header(reader, *header)) return note_issue(job, "source_header", path);
+        return prepare_record();
+    }
+    bool open_file(const char *source) {
         if (!header) return note_issue(job, "header_alloc");
         record_offset = UINT64_MAX;
         *header = {};
-        source_path(entry, kind, "edf", path);
+        snprintf(path, sizeof(path), "%s", source);
         if (!file.open(session, path)) return note_issue(job, "source_open", path);
         reader = {[](void *ctx, uint64_t offset, uint8_t *out, size_t count) {
             auto &input = *static_cast<Input *>(ctx);
@@ -524,7 +537,9 @@ struct Input {
             }
             return true;
         }, this, file.size()};
-        if (!ReportEdf::read_header(reader, *header)) return note_issue(job, "source_header", path);
+        return true;
+    }
+    bool prepare_record() {
         if (header->record_bytes > record_capacity) {
             // One actual record, at most the reader's validated 64 KiB limit.
             void *grown = aircannect::Memory::realloc_large(record, header->record_bytes,
@@ -536,6 +551,120 @@ struct Input {
         }
         if (record_capacity < header->record_bytes) return note_issue(job, "record_alloc", path);
         return true;
+    }
+};
+
+struct HistoricalStr {
+    Input input;
+    ReportEdf::Signal *signals = nullptr;
+    bool present = false;
+
+    HistoricalStr(const SdStorage::Session &session, const Job &job) : input(session, job) {}
+    ~HistoricalStr() { aircannect::Memory::free(signals); }
+
+    const ReportEdf::Signal *find(const char *label) const {
+        if (!signals || !input.header) return nullptr;
+        for (size_t i = 0; i < input.header->signal_count; ++i)
+            if (!strcmp(signals[i].label, label)) return &signals[i];
+        return nullptr;
+    }
+    double value(const char *label, double scale = 1) const {
+        const auto *signal = find(label);
+        if (!present || !signal || signal->samples_per_record != 1) return NAN;
+        const uint8_t *sample = input.record + signal->record_offset;
+        const uint16_t raw = sample[0] | uint16_t(sample[1]) << 8;
+        if (raw == UINT16_MAX) return NAN;
+        const int32_t digital = signal->digital_min < 0 ? int16_t(raw) : int32_t(raw);
+        return signal->valid(digital) ? signal->physical(digital) * scale : NAN;
+    }
+    bool load(uint16_t day) {
+        if (!input.open_file("/STR.edf") || !ReportEdf::read_layout(input.reader, *input.header)) return false;
+        auto &header = *input.header;
+        if (header.record_seconds != 86400 || header.records > Air10StrTimeline::RECORD_LIMIT) return false;
+        const size_t bytes = header.signal_count * sizeof(*signals);
+        signals = static_cast<ReportEdf::Signal *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
+        if (!signals || !ReportEdf::read_signals(input.reader, header, signals, header.signal_count, true) ||
+            header.record_bytes > 4096 || !input.prepare_record()) return false;
+        const auto *date = find("Date");
+        if (!date || date->samples_per_record != 1 || date->digital_min != 0 ||
+            date->physical_min != 0 || date->physical_max != date->digital_max) return false;
+        const int64_t guessed = int64_t(day) - header.start_seconds / 86400;
+        auto read = [&](uint32_t record) {
+            uint8_t bytes[2];
+            return input.reader.read(input.reader.context,
+                header.header_bytes + uint64_t(record) * header.record_bytes + date->record_offset,
+                bytes, sizeof(bytes));
+        };
+        // The current timeline is continuous. Older compact files are located
+        // by their Date samples, never by substituting a neighbouring record.
+        if (guessed >= 0 && guessed < header.records) {
+            if (!read(uint32_t(guessed))) return false;
+            present = true;
+            if (value("Date") == day) {
+                present = std::isfinite(value("Mode")) || std::isfinite(value("Duration"));
+                input.file.close(); return true;
+            }
+        }
+        for (uint32_t record = 0; record < header.records; ++record) {
+            if (!read(record)) return false;
+            present = true;
+            if (value("Date") == day) {
+                present = std::isfinite(value("Mode")) || std::isfinite(value("Duration"));
+                input.file.close(); return true;
+            }
+        }
+        present = false;
+        input.file.close();
+        return true;
+    }
+    void settings_json(Payload &body, uint16_t day) const {
+        body.print(",\"settings\":{\"day\":%u,\"available\":%s,\"fields\":[", day, present ? "true" : "false");
+        bool comma = false;
+        auto append = [&](const char *tag) {
+            const auto *def = var_lookup(tag);
+            if (!def) return;
+            const auto &schema = Air10Edf::str_schema();
+            for (size_t i = 0; i < schema.signal_count; ++i) {
+                if (strcmp(Air10Edf::str_signal_tag(i), tag)) continue;
+                const auto &spec = schema.signals[i];
+                const auto *signal = find(spec.label);
+                const double saved = value(spec.label);
+                if (!std::isfinite(saved) || !signal || strcmp(signal->unit, spec.dimension)) return;
+                char text[48];
+                if (def->type != SET_ENUM || saved < 0 || saved > INT32_MAX || saved != std::floor(saved) ||
+                    !setting_enum_label(def, int(saved), text, sizeof(text)))
+                    snprintf(text, sizeof(text), "%.8g", saved);
+                // Text and labels come only from the static Air10 catalog or
+                // numeric formatting, never live metadata or file strings.
+                body.print("%s{\"tag\":\"%s\",\"label\":\"%s\",\"value\":\"%s\",\"unit\":\"%s\"}",
+                           comma ? "," : "", tag, def->label, text, spec.dimension);
+                comma = true;
+                return;
+            }
+        };
+        append("MOP");
+        const double mode = value("Mode");
+        if (std::isfinite(mode) && mode >= 0 && mode < MODE_COUNT && mode == std::floor(mode)) {
+            for (const char *tag : MODE_LAYOUT[int(mode)]) { if (!tag) break; append(tag); }
+            for (const char *tag : COMFORT_LAYOUT[int(mode)]) { if (!tag) break; append(tag); }
+        }
+        for (const char *tag : EPR_VARS) { if (!tag) break; append(tag); }
+        append("SST");
+        for (const char *tag : ACCESSORY_VARS) { if (!tag) break; append(tag); }
+        body.print("]}");
+    }
+    double statistic(size_t channel, const char *suffix) const {
+        const char *base = channel == 0 ? "TgtIPAP" : channel == 1 ? "TgtEPAP" : CHANNELS[channel].id;
+        char label[32];
+        snprintf(label, sizeof(label), "%s.%s", base, suffix);
+        const auto *signal = find(label);
+        if (!signal) return NAN;
+        double scale = 1;
+        if (channel == 3 && !strcmp(signal->unit, "L/s")) scale = 60;
+        else if (channel == 6 && !strcmp(signal->unit, "L")) scale = 1000;
+        else if (channel == 12 && !strcmp(signal->unit, "seconds")) scale = 1;
+        else if (strcmp(signal->unit, CHANNELS[channel].unit)) return NAN;
+        return value(label, scale);
     }
 };
 
@@ -965,7 +1094,8 @@ uint16_t last_day(const Request &request) {
     uint16_t day = 0;
     for (size_t i = 0; i < index_count; ++i)
         if ((index[i].entry.flags & EdfCatalog::ENTRY_LIVE_COMPLETE) &&
-            index[i].key.present) day = std::max(day, index[i].day);
+            (index[i].key.present || (index[i].entry.flags & EdfCatalog::ENTRY_STR_READY)))
+            day = std::max(day, index[i].day);
     return day;
 }
 uint16_t first_day(const Request &request, uint16_t last) {
@@ -997,7 +1127,7 @@ bool days_json(Job &job) {
     bool partial = false;
     for (size_t i = 0; i < index_count; ++i) {
         if (!(index[i].entry.flags & EdfCatalog::ENTRY_LIVE_COMPLETE)) continue;
-        if (index[i].key.present & 7) days[count++] = index[i].day;
+        if ((index[i].key.present & 7) || (index[i].entry.flags & EdfCatalog::ENTRY_STR_READY)) days[count++] = index[i].day;
         if (index[i].key.present != 31 || index[i].key.checksums != 31) partial = true;
     }
     if (count) std::sort(days, days + count, std::greater<uint16_t>());
@@ -1017,11 +1147,17 @@ bool days_json(Job &job) {
 }
 
 struct Aggregate {
-    ReportEdf::Histogram channels[CHANNEL_COUNT];
+    ReportEdf::Histogram *channels = nullptr;
     double coverage[CHANNEL_COUNT] = {};
     bool incompatible[CHANNEL_COUNT] = {};
+    Aggregate() {
+        const size_t bytes = CHANNEL_COUNT * sizeof(*channels);
+        channels = static_cast<ReportEdf::Histogram *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
+        if (channels) for (size_t c = 0; c < CHANNEL_COUNT; ++c) new (&channels[c]) ReportEdf::Histogram;
+    }
     ~Aggregate() {
-        for (auto &channel : channels) aircannect::Memory::free(channel.bins);
+        if (channels) for (size_t c = 0; c < CHANNEL_COUNT; ++c) aircannect::Memory::free(channels[c].bins);
+        aircannect::Memory::free(channels);
     }
     bool merge(const SessionData &data, bool &partial) {
         size_t offset = 0;
@@ -1054,6 +1190,7 @@ bool history_json(const SdStorage::Session &session, Job &job, bool build);
 
 bool summary_json(const SdStorage::Session &session, Job &job) {
     Aggregate aggregate;
+    if (!aggregate.channels) return note_issue(job, "aggregate_alloc");
     Payload events;
     const uint16_t last = last_day(job.request), first = first_day(job.request, last);
     bool partial = false, event_comma = false, session_comma = false, events_truncated = false;
@@ -1114,8 +1251,19 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
             append_event(events, data.events[e], event_comma);
         }
     }
+    HistoricalStr str(session, job);
+    bool str_expected = false;
+    if (job.request.view == View::Day)
+        for (size_t i = 0; i < index_count; ++i)
+            str_expected |= index[i].day == last && (index[i].entry.flags & EdfCatalog::ENTRY_STR_READY);
+    if (str_expected && !str.load(last)) {
+        if (aborted(&job, session)) return false;
+        str.present = false;
+        partial = true;
+        note_issue(job, "str_read", "/STR.edf");
+    }
     job.body.print("],\"present\":%s,\"partial\":%s,\"used_seconds\":",
-                   sessions ? "true" : "false", partial ? "true" : "false");
+                   sessions || str.present ? "true" : "false", partial ? "true" : "false");
     if (usage_known && seconds > 0) job.body.print("%.10g", seconds);
     else job.body.print("null");
     job.body.print(",\"rdi\":");
@@ -1147,11 +1295,20 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
                        c ? "," : "", CHANNELS[c].id, CHANNELS[c].label, CHANNELS[c].unit,
                        static_cast<unsigned long long>(present ? stats.count : 0));
         job.body.print("\"coverage_seconds\":%.10g,", present ? aggregate.coverage[c] : 0);
-        if (present) job.body.print("\"min\":%.10g,\"mean\":%.10g,\"median\":%.10g,\"p95\":%.10g,\"max\":%.10g}",
-                                   stats.min, stats.mean, stats.median, stats.p95, stats.max);
-        else job.body.print("\"min\":null,\"mean\":null,\"median\":null,\"p95\":null,\"max\":null}");
+        const double values[] = {present ? stats.min : NAN, present ? stats.mean : NAN,
+            present ? stats.median : str.statistic(c, "50"),
+            present ? stats.p95 : str.statistic(c, "95"), present ? stats.max : str.statistic(c, "Max")};
+        constexpr const char *keys[] = {"min", "mean", "median", "p95", "max"};
+        bool str_value = false;
+        for (size_t n = 0; n < 5; ++n) {
+            job.body.print("\"%s\":", keys[n]);
+            if (std::isfinite(values[n])) { job.body.print("%.10g,", values[n]); str_value |= !present; }
+            else job.body.print("null,");
+        }
+        job.body.print("\"source\":\"%s\"}", present ? "edf" : str_value ? "str" : "");
     }
     job.body.print("]");
+    if (job.request.view == View::Day) str.settings_json(job.body, last);
     if (job.request.view == View::Day && !history_json(session, job, false)) return false;
     job.body.print("}");
     return job.body.good() && events.good();
