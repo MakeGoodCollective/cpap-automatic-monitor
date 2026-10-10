@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <utility>
 
 namespace EdfReport {
@@ -18,8 +19,9 @@ bool Request::operator==(const Request &other) const {
 }
 
 bool valid(const Request &request) {
-    if (request.action > Action::Series || request.view > View::Period ||
+    if (request.action > Action::History || request.view > View::Period ||
         request.day == UINT16_MAX) return false;
+    if (request.action == Action::History && request.view != View::Day) return false;
     if (request.view == View::Period && request.period != 1 && request.period != 7 &&
         request.period != 30 && request.period != 90 && request.period != 180 &&
         request.period != 365) return false;
@@ -217,7 +219,7 @@ void log_result(const Job &job) {
         job.issue ? LOG_WARN : LOG_DEBUG,
         "EDF job=%lu %s day=%u code=%d %s path=%s\n",
         (unsigned long)job.id, job.request.action == Action::Days ? "days" :
-        job.request.action == Action::Summary ? "summary" : "series",
+        job.request.action == Action::Summary ? "summary" : job.request.action == Action::History ? "history" : "series",
         unsigned(job.request.day), job.code, reason ? reason : "complete",
         expected || !job.issue_path[0] ? "-" : job.issue_path);
 }
@@ -241,7 +243,7 @@ struct JobTiming {
             "report job=%lu action=%s code=%d bytes=%u ms total=%lu "
             "idx=%lu num=%lu evt=%lu enc=%lu\n",
             static_cast<unsigned long>(id), action == Action::Days ? "days" :
-                action == Action::Summary ? "summary" : "series", code,
+                action == Action::Summary ? "summary" : action == Action::History ? "history" : "series", code,
             static_cast<unsigned>(bytes), static_cast<unsigned long>((stamp() - started_us) / 1000),
             static_cast<unsigned long>(index_us / 1000), static_cast<unsigned long>(numeric_us / 1000),
             static_cast<unsigned long>(events_us / 1000), static_cast<unsigned long>(encode_us / 1000));
@@ -1048,6 +1050,8 @@ struct Aggregate {
     }
 };
 
+bool history_json(const SdStorage::Session &session, Job &job, bool build);
+
 bool summary_json(const SdStorage::Session &session, Job &job) {
     Aggregate aggregate;
     Payload events;
@@ -1147,7 +1151,9 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
                                    stats.min, stats.mean, stats.median, stats.p95, stats.max);
         else job.body.print("\"min\":null,\"mean\":null,\"median\":null,\"p95\":null,\"max\":null}");
     }
-    job.body.print("]}");
+    job.body.print("]");
+    if (job.request.view == View::Day && !history_json(session, job, false)) return false;
+    job.body.print("}");
     return job.body.good() && events.good();
 }
 
@@ -1605,6 +1611,75 @@ bool build_summary_header(const SdStorage::Session &session, const Job &job,
     return true;
 }
 
+bool history_json(const SdStorage::Session &session, Job &job, bool build) {
+    constexpr size_t DAYS = 14, METRICS = 6;
+    constexpr size_t channels[] = {0, 3, 6, 4};
+    constexpr const char *names[] = {"usage", "ahi", "pressure", "leak", "vt", "mv"};
+    struct Day {
+        uint64_t count[4] = {}, events = 0;
+        double sum[4] = {}, seconds = 0;
+        bool present = false, ready = true, usage = true, event_count = true;
+        double value(size_t metric) const {
+            if (!present || !ready) return NAN;
+            if (!metric) return usage && seconds > 0 ? seconds : NAN;
+            if (metric == 1) return usage && event_count && seconds > 0 ? events * 3600.0 / seconds : NAN;
+            return count[metric - 2] ? sum[metric - 2] / count[metric - 2] : NAN;
+        }
+    };
+    struct Work { Day days[DAYS]; CacheHeader header; };
+    void *memory = aircannect::Memory::alloc_large(sizeof(Work), sizeof(Work) <= INTERNAL_WORK);
+    if (!memory) return false;
+    std::unique_ptr<Work, decltype(&aircannect::Memory::free)> work(new (memory) Work, aircannect::Memory::free);
+    const uint16_t last = last_day(job.request), first = last > DAYS - 1 ? last - DAYS + 1 : 0;
+    bool complete = true;
+    for (size_t i = 0; i < index_count; ++i) {
+        const auto &entry = index[i];
+        if (!selected(entry, first, last) || entry.day - first >= DAYS) continue;
+        if (aborted(&job, session)) return false;
+        auto &day = work->days[entry.day - first];
+        day.present = true;
+        auto &header = work->header;
+        if (!cached_summary_header(session, entry, header) &&
+            (!build || !build_summary_header(session, job, entry, header))) {
+            day.ready = complete = false;
+            continue;
+        }
+        day.usage &= header.usage_known;
+        day.event_count &= header.events_known || !header.recorded;
+        day.seconds += header.used_seconds;
+        for (size_t c = 0; c < 4; ++c) {
+            day.events += header.counts[c];
+            day.count[c] += header.channels[channels[c]].count;
+            day.sum[c] += header.channels[channels[c]].sum;
+        }
+    }
+    job.body.print(",\"history\":{\"first_day\":%u,\"last_day\":%u,\"complete\":%s,\"metrics\":[",
+                   first, last, complete ? "true" : "false");
+    for (size_t m = 0; m < METRICS; ++m) {
+        double sum = 0;
+        unsigned count = 0;
+        for (size_t d = DAYS - 8; d < DAYS - 1; ++d) {
+            const double value = work->days[d].value(m);
+            if (std::isfinite(value)) { sum += value; ++count; }
+        }
+        const double current = work->days[DAYS - 1].value(m);
+        job.body.print("%s{\"id\":\"%s\",\"baseline_count\":%u,\"baseline\":", m ? "," : "", names[m], count);
+        if (count) job.body.print("%.10g", sum / count); else job.body.print("null");
+        job.body.print(",\"delta\":");
+        if (count && std::isfinite(current)) job.body.print("%.10g", current - sum / count);
+        else job.body.print("null");
+        job.body.print(",\"points\":[");
+        for (size_t d = 0; d < DAYS; ++d) {
+            const double value = work->days[d].value(m);
+            if (d) job.body.print(",");
+            if (std::isfinite(value)) job.body.print("%.10g", value); else job.body.print("null");
+        }
+        job.body.print("]}");
+    }
+    job.body.print("]}");
+    return job.body.good();
+}
+
 bool window_events(const SdStorage::Session &session, const Job &job,
                    const IndexedSession &entry, const CacheHeader &header,
                    int64_t from, int64_t to, Payload &out, bool &comma, bool &truncated) {
@@ -1840,7 +1915,12 @@ bool work_once() {
     else if (job->request.revision && job->request.revision != job->data_revision)
         error_body(*job, 409, "stale_revision");
     else {
-        success = job->request.action == Action::Days ? days_json(*job) :
+        if (job->request.action == Action::History) {
+            start_json(job->body, revision() + 1, job->data_revision);
+            job->body.print("\"day\":%u", last_day(job->request));
+            success = history_json(session, *job, true);
+            job->body.print("}");
+        } else success = job->request.action == Action::Days ? days_json(*job) :
             job->request.action == Action::Summary ? summary_json(session, *job) : series_json(session, *job, timing);
         if (success) job->code = 200;
     }

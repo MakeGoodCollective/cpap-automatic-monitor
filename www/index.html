@@ -103,6 +103,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .report-metric{min-width:0;text-align:left;padding:14px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font:inherit}
 .report-metric-label,.report-metric-unit{display:block;font-size:11px;color:var(--text-dim)}
 .report-metric-value{display:block;font-size:22px;font-weight:600;margin:8px 0;font-variant-numeric:tabular-nums}
+.report-metric[aria-expanded]{cursor:pointer}
+.report-metric[aria-expanded=true]{border-color:var(--accent)}
+.report-metric svg{float:right;width:56px;height:24px}
+.report-metric-delta{display:block;margin-top:8px;font-size:11px;color:var(--text-dim)}
+.report-history{margin-bottom:16px;border-bottom:1px solid var(--border);padding-bottom:12px}
+.report-history svg{display:block;width:100%;height:auto;max-height:180px;color:var(--text-dim)}
+.report-history-head{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;font-size:12px;margin-bottom:6px}
 .report-events{display:flex;flex-wrap:wrap;gap:8px 18px;margin:12px 0 18px;font-size:12px;font-variant-numeric:tabular-nums}
 .report-events span{white-space:nowrap}
 .report-events b{margin-left:6px}
@@ -502,6 +509,11 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
           <div id="reportGrid" class="status-grid"></div>
           <div id="reportStatsCard" hidden>
             <div class="report-metrics" id="reportMetrics"></div>
+            <div class="report-history" id="reportHistory" hidden>
+              <div class="report-history-head"><b id="reportHistoryTitle"></b><span id="reportHistoryBaseline"></span></div>
+              <p class="report-note" id="reportHistoryNote" role="status"></p>
+              <svg id="reportHistoryChart" role="img" aria-label="14-day history"></svg>
+            </div>
             <div class="report-events" id="reportTotals" aria-label="Therapy totals"></div>
             <details class="report-statistics"><summary>Statistics</summary><div class="report-table-wrap"><table class="report-table"><thead><tr><th>Channel</th><th>Min</th><th>Mean</th><th>Median</th><th>P95</th><th>Max</th></tr></thead><tbody id="reportStats"></tbody></table></div></details>
           </div>
@@ -1348,6 +1360,7 @@ const reportReads = {};
 const reportCalendar = {days:[], month:null, cache:null, epoch:0};
 let reportDisplayedSource = null;
 const reportPlot = {summary:null, selection:null, full:null, view:null, fullSeries:null, series:null,
+  history:null, historyMetric:null, historyPending:false,
   pending:null, flight:null, serial:0, cursor:null, frame:null, request:false, rows:[],
   axes:null, axesAllSessions:false, hiddenSessions:new Set(), excluded:'', pointers:new Map(), gesture:null,
   cache:new Map(), hiddenChannels:new Set(), availableChannels:[]};
@@ -1760,15 +1773,101 @@ function renderReportMetrics(data) {
   const fragment = document.createDocumentFragment();
   for (const metric of reportMetrics) {
     const value = metric.field ? data[metric.field] : data.channels?.find(c => c.id === metric.channel)?.mean;
-    const tile = document.createElement('div'); tile.className = 'report-metric';
+    const tile = document.createElement(data.view === 'day' ? 'button' : 'div'); tile.className = 'report-metric';
+    if (data.view === 'day') {
+      tile.type = 'button';
+      tile.setAttribute('aria-expanded',String(reportPlot.historyMetric === metric.id));
+      tile.setAttribute('aria-controls','reportHistory');
+      tile.addEventListener('click',() => showReportHistory(metric.id));
+    }
     for (const [className,text] of [['label',metric.label],['value',metric.id === 'usage' ? reportDuration(value) : reportNumber(value)],
         ['unit',(metric.channel ? 'Mean ' : '') + metric.unit]]) {
       const item = document.createElement('span'); item.className = 'report-metric-' + className;
       item.textContent = text; tile.append(item);
     }
+    const trend = reportPlot.history?.metrics.find(m => m.id === metric.id);
+    if (data.view === 'day' && trend) {
+      const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+      svg.setAttribute('aria-hidden','true'); drawReportHistory(svg,metric,trend,false); tile.append(svg);
+      const delta = document.createElement('span'); delta.className = 'report-metric-delta';
+      delta.textContent = Number.isFinite(trend.delta)
+        ? (trend.delta > 0 ? '+' : '') + reportNumber(metric.id === 'usage' ? trend.delta/60 : trend.delta)
+          + (metric.id === 'usage' ? ' min' : '') + ' vs previous 7 days'
+        : 'Previous 7 days: --';
+      tile.append(delta);
+    }
     fragment.append(tile);
   }
   document.getElementById('reportMetrics').replaceChildren(fragment);
+}
+
+function drawReportHistory(svg, metric, trend, expanded) {
+  svg.replaceChildren();
+  const width = expanded ? 600 : 56, height = expanded ? 160 : 24;
+  const left = expanded ? 58 : 2, right = expanded ? 18 : 2, top = 12, bottom = expanded ? 24 : 2;
+  svg.setAttribute('viewBox',`0 0 ${width} ${height}`);
+  const points = trend?.points || [], values = points.filter(Number.isFinite);
+  if (!values.length) return;
+  if (Number.isFinite(trend.baseline)) values.push(trend.baseline);
+  const low = Math.min(...values), high = Math.max(...values), pad = Math.max((high-low)*.1,.01);
+  const x = i => left + i/13*(width-left-right), y = value => top+(high+pad-value)/(high-low+2*pad)*(height-top-bottom);
+  const node = (tag,attributes,text) => {
+    const el = document.createElementNS('http://www.w3.org/2000/svg',tag);
+    for (const [name,value] of Object.entries(attributes)) el.setAttribute(name,String(value));
+    if (text !== undefined) el.textContent = text;
+    svg.append(el); return el;
+  };
+  let path = '', previous = false;
+  points.forEach((value,i) => {
+    if (!Number.isFinite(value)) { previous = false; return; }
+    path += `${previous ? 'L' : 'M'}${x(i)} ${y(value)} `; previous = true;
+  });
+  node('path',{d:path,fill:'none',stroke:'var(--accent)','stroke-width':1.5});
+  points.forEach((value,i) => {
+    if (!Number.isFinite(value)) return;
+    const dot = node('circle',{cx:x(i),cy:y(value),r:expanded ? 3 : 1.4,fill:'var(--accent)'});
+    const title = document.createElementNS('http://www.w3.org/2000/svg','title');
+    title.textContent = reportDate(reportPlot.history.first_day+i)+': '+(metric.id === 'usage' ? reportDuration(value) : reportNumber(value)+' '+metric.unit);
+    dot.append(title);
+  });
+  if (!expanded) return;
+  if (Number.isFinite(trend.baseline)) node('line',{x1:left,x2:width-right,y1:y(trend.baseline),y2:y(trend.baseline),stroke:'currentColor','stroke-dasharray':'3 4'});
+  for (const value of new Set([low,high])) node('text',{x:left-6,y:y(value)+4,'text-anchor':'end',fill:'currentColor','font-size':11},metric.id === 'usage' ? reportDuration(value) : reportNumber(value));
+  for (const i of [0,6,13]) node('text',{x:x(i),y:height-3,'text-anchor':i === 0 ? 'start' : i === 13 ? 'end' : 'middle',fill:'currentColor','font-size':11},reportDate(reportPlot.history.first_day+i).slice(5));
+}
+
+function renderReportHistory() {
+  const metric = reportMetrics.find(m => m.id === reportPlot.historyMetric);
+  document.getElementById('reportHistory').hidden = !metric;
+  if (!metric) return;
+  const trend = reportPlot.history?.metrics.find(m => m.id === metric.id);
+  document.getElementById('reportHistoryTitle').textContent = metric.label + ' / 14 days';
+  document.getElementById('reportHistoryBaseline').textContent = 'Previous 7 days: '
+    + (metric.id === 'usage' ? reportDuration(trend?.baseline) : reportNumber(trend?.baseline) + ' ' + metric.unit)
+    + ' (' + (trend?.baseline_count || 0) + '/7 days)';
+  drawReportHistory(document.getElementById('reportHistoryChart'),metric,trend,true);
+}
+
+async function showReportHistory(id) {
+  if (reportLoading || !reportPlot.summary || reportPlot.summary.view !== 'day') return;
+  reportPlot.historyMetric = reportPlot.historyMetric === id ? null : id;
+  renderReportMetrics(reportPlot.summary); renderReportHistory();
+  if (!reportPlot.historyMetric || reportPlot.history?.complete || reportPlot.historyPending) return;
+  const generation = reportGeneration, summary = reportPlot.summary;
+  reportPlot.historyPending = true;
+  document.getElementById('reportHistoryNote').textContent = 'Loading history...';
+  try {
+    const data = await edfReportRequest('history','action=history&day='+summary.day+'&revision='+summary.data_revision,generation,reportController.signal);
+    if (generation !== reportGeneration || reportPlot.summary !== summary) return;
+    if (data.data_revision !== summary.data_revision) throw new Error('EDF data changed; refresh the report');
+    reportPlot.history = data.history;
+    renderReportMetrics(summary); renderReportHistory();
+    document.getElementById('reportHistoryNote').textContent = data.history.complete ? '' : 'History incomplete';
+  } catch(e) {
+    if (generation === reportGeneration && e.name !== 'AbortError') document.getElementById('reportHistoryNote').textContent = e.message;
+  } finally {
+    if (generation === reportGeneration) reportPlot.historyPending = false;
+  }
 }
 
 function renderEdfReport(data) {
@@ -1778,6 +1877,7 @@ function renderEdfReport(data) {
   reportDisplayedSource = 'edf';
   document.getElementById('reportLoadState').textContent = '';
   reportPlot.summary = data;
+  reportPlot.history = data.history || null;
   const day = data.view === 'day';
   if (day && data.day) document.getElementById('reportDay').value = reportDate(data.day);
   const selectedDate = document.getElementById('reportDay').value;
@@ -1861,6 +1961,10 @@ function toggleReportSession(id) {
 
 function clearReportPlots() {
   reportPlot.serial++;
+  if (reportReads.history) reportReads.history.cancel();
+  reportPlot.history = reportPlot.historyMetric = null; reportPlot.historyPending = false;
+  document.getElementById('reportHistory').hidden = true;
+  document.getElementById('reportHistoryNote').textContent = '';
   reportPlot.summary = reportPlot.selection = reportPlot.full = reportPlot.view = null;
   reportPlot.fullSeries = reportPlot.series = reportPlot.pending = reportPlot.cursor = reportPlot.gesture = null;
   reportPlot.axes = null; reportPlot.axesAllSessions = false;

@@ -7,7 +7,7 @@
 namespace EdfReport {
 
 enum class State : uint8_t { Ready, WaitingStorage, Building, Blocked, Error };
-enum class Action : uint8_t { Days, Summary, Series };
+enum class Action : uint8_t { Days, Summary, Series, History };
 enum class View : uint8_t { Day, Period };
 
 constexpr size_t MAX_SESSION_COUNT = 8192;

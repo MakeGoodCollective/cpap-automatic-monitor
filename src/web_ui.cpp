@@ -962,6 +962,7 @@ static void handleReport(AsyncWebServerRequest *request) {
     if (const auto *param = request->getParam("action")) {
         if (param->value() == "days") local.action = EdfReport::Action::Days;
         else if (param->value() == "series") local.action = EdfReport::Action::Series;
+        else if (param->value() == "history") local.action = EdfReport::Action::History;
         else if (param->value() != "summary") { invalid(); return; }
     }
     if (const auto *param = request->getParam("view")) {
