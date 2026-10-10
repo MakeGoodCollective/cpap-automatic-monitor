@@ -99,7 +99,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .report-selection{font-size:12px;color:var(--text-dim);font-variant-numeric:tabular-nums}
 .report-load-state{position:absolute;right:0;bottom:0;display:flex;align-items:center;gap:6px;height:14px;white-space:nowrap;font-size:11px;color:var(--text-dim)}
 .report-load-state .spinner{flex:none;margin:0;width:14px;height:14px;border-width:2px}
-.report-totals{margin-bottom:8px}
+.report-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:16px}
+.report-metric{min-width:0;text-align:left;padding:14px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font:inherit}
+.report-metric-label,.report-metric-unit{display:block;font-size:11px;color:var(--text-dim)}
+.report-metric-value{display:block;font-size:22px;font-weight:600;margin:8px 0;font-variant-numeric:tabular-nums}
+.report-events{display:flex;flex-wrap:wrap;gap:8px 18px;margin:12px 0 18px;font-size:12px;font-variant-numeric:tabular-nums}
+.report-events span{white-space:nowrap}
+.report-events b{margin-left:6px}
+@media(max-width:600px){.report-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.report-metric{padding:10px}.report-metric-value{font-size:19px}}
 .report-statistics>summary{cursor:pointer;font-size:12px;color:var(--text-dim);padding:4px 0}
 .report-statistics[open]>summary{margin-bottom:8px}
 .report-channel-options{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
@@ -494,8 +501,9 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
           <p class="report-note" id="reportNote"></p>
           <div id="reportGrid" class="status-grid"></div>
           <div id="reportStatsCard" hidden>
-            <div class="report-table-wrap report-totals"><table class="report-table" id="reportTotals" aria-label="Therapy totals"></table></div>
-            <details class="report-statistics" open><summary>Channel statistics</summary><div class="report-table-wrap"><table class="report-table"><thead><tr><th>Channel</th><th>Mean</th><th>Median</th><th>P95</th><th>Max</th></tr></thead><tbody id="reportStats"></tbody></table></div></details>
+            <div class="report-metrics" id="reportMetrics"></div>
+            <div class="report-events" id="reportTotals" aria-label="Therapy totals"></div>
+            <details class="report-statistics"><summary>Statistics</summary><div class="report-table-wrap"><table class="report-table"><thead><tr><th>Channel</th><th>Min</th><th>Mean</th><th>Median</th><th>P95</th><th>Max</th></tr></thead><tbody id="reportStats"></tbody></table></div></details>
           </div>
         </div>
         <div class="card" id="reportMaskCard" hidden>
@@ -1739,6 +1747,30 @@ function reportSessionRange() {
   return sessions.length ? [Math.min(...sessions.map(s => s.start_ms)), Math.max(...sessions.map(s => s.end_ms))] : null;
 }
 
+const reportMetrics = [
+  {id:'usage',label:'Usage',unit:'',field:'used_seconds'},
+  {id:'ahi',label:'AHI',unit:'events/h',field:'ahi'},
+  {id:'pressure',label:'Pressure',unit:'cmH2O',channel:'Press'},
+  {id:'leak',label:'Leak',unit:'L/min',channel:'Leak'},
+  {id:'vt',label:'Tidal volume',unit:'mL',channel:'TidVol'},
+  {id:'mv',label:'Minute ventilation',unit:'L/min',channel:'MinVent'},
+];
+
+function renderReportMetrics(data) {
+  const fragment = document.createDocumentFragment();
+  for (const metric of reportMetrics) {
+    const value = metric.field ? data[metric.field] : data.channels?.find(c => c.id === metric.channel)?.mean;
+    const tile = document.createElement('div'); tile.className = 'report-metric';
+    for (const [className,text] of [['label',metric.label],['value',metric.id === 'usage' ? reportDuration(value) : reportNumber(value)],
+        ['unit',(metric.channel ? 'Mean ' : '') + metric.unit]]) {
+      const item = document.createElement('span'); item.className = 'report-metric-' + className;
+      item.textContent = text; tile.append(item);
+    }
+    fragment.append(tile);
+  }
+  document.getElementById('reportMetrics').replaceChildren(fragment);
+}
+
 function renderEdfReport(data) {
   const selection = reportPlot.selection;
   clearReportPlots();
@@ -1757,22 +1789,22 @@ function renderEdfReport(data) {
   document.getElementById('reportNote').textContent = !data.present ? 'No saved EDF data for this selection.'
     : data.partial ? 'Incomplete report' : '';
   document.getElementById('reportGrid').hidden = true;
+  renderReportMetrics(data);
   const totals = document.createDocumentFragment();
-  const headings = document.createElement('tr'), values = document.createElement('tr');
-  for (const [label, value] of [['Usage',reportDuration(data.used_seconds)], ['Sessions',reportNumber(data.session_count)],
-      ['AHI',reportNumber(data.ahi)], ...Object.entries(data.counts || {}).map(([type,count]) => [type.toUpperCase(),reportNumber(count)])]) {
-    const key = document.createElement('th'); key.textContent = label; key.setAttribute('scope','col');
-    const text = document.createElement('td'); text.textContent = value;
-    headings.append(key); values.append(text);
+  for (const [label, value] of [['Sessions',reportNumber(data.session_count)],
+      ...Object.entries(data.counts || {}).map(([type,count]) => [type.toUpperCase(),reportNumber(count)]),
+      ['RDI',reportNumber(data.rdi)], ['CSR',reportDuration(data.csr_seconds)],
+      ['Leak > ' + reportNumber(data.leak_threshold) + ' L/min',reportDuration(data.leak_high_seconds)]]) {
+    const item = document.createElement('span'); item.textContent = label;
+    const text = document.createElement('b'); text.textContent = value;
+    item.append(text); totals.append(item);
   }
-  const head = document.createElement('thead'), body = document.createElement('tbody');
-  head.append(headings); body.append(values); totals.append(head,body);
   document.getElementById('reportTotals').replaceChildren(totals);
   const statistics = document.createDocumentFragment();
   for (const channel of data.channels || []) {
     const row = document.createElement('tr');
     for (const value of [channel.label + (channel.unit ? ' (' + channel.unit + ')' : ''),
-        ...['mean','median','p95','max'].map(key => channel.count > 0 ? reportNumber(channel[key]) : '--')]) {
+        ...['min','mean','median','p95','max'].map(key => reportNumber(channel[key]))]) {
       const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
     }
     statistics.append(row);

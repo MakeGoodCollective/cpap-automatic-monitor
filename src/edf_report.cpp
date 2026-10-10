@@ -74,7 +74,7 @@ Result::Result(Result &&other) noexcept
 
 namespace EdfReport {
 namespace {
-constexpr uint32_t STATS_CACHE_VERSION = 6;
+constexpr uint32_t STATS_CACHE_VERSION = 7;
 constexpr uint32_t SERIES_CACHE_VERSION = 5;
 constexpr size_t MAX_BINS = 16384;
 constexpr size_t MAX_EVENTS = 4096;
@@ -85,7 +85,8 @@ constexpr size_t INTERNAL_WORK = 8 * 1024;
 constexpr uint64_t MAX_SD_CACHE = 128ull * 1024 * 1024;
 constexpr uint32_t RETAIN_MS = 30000;
 constexpr size_t SLOT_COUNT = 2;
-constexpr size_t CHANNEL_COUNT = 9;
+constexpr size_t CHART_CHANNEL_COUNT = 9;
+constexpr double LEAK_THRESHOLD = 24;
 constexpr int64_t LEVEL_MS[] = {10000, 60000, 600000, 3600000};
 constexpr size_t LEVEL_COUNT = sizeof(LEVEL_MS) / sizeof(LEVEL_MS[0]);
 constexpr const char *CACHE_DIR = "/airbridge/report";
@@ -105,7 +106,14 @@ constexpr ChannelSpec CHANNELS[] = {
     {"TidVol", "Tidal volume", "mL", "TidVol.2s", 1},
     {"SpO2", "SpO2", "%", "SpO2.1s", 2},
     {"Pulse", "Pulse", "bpm", "Pulse.1s", 2},
+    {"FlowLim", "Flow limitation", "", "FlowLim.2s", 1},
+    {"Snore", "Snore", "", "Snore.2s", 1},
+    {"TgtVent", "Target ventilation", "L/min", "TgtVent.2s", 1},
+    {"Ti", "Inspiratory time", "s", "Ti.2s", 1},
+    {"IERatio", "I:E", "%", "IERatio.2s", 1},
+    {"AlvMinVent", "Alveolar ventilation", "L/min", "AlvMinVent.2s", 1},
 };
+constexpr size_t CHANNEL_COUNT = sizeof(CHANNELS) / sizeof(CHANNELS[0]);
 
 // Sidecars are identity inputs, not recomputed source-data checksums.
 struct SourceKey {
@@ -151,6 +159,8 @@ struct CacheHeader {
     uint16_t day = 0;
     bool recorded = false, partial = false, events_truncated = false, events_known = false;
     bool usage_known = false;
+    double csr_seconds = 0, leak_high_seconds = 0;
+    bool csr_known = false;
 };
 struct SessionData {
     CacheHeader header;
@@ -557,6 +567,8 @@ bool sane_header(const CacheHeader &h, const IndexedSession &entry, uint64_t byt
         h.chart_start_ms < 0 || h.chart_end_ms < h.chart_start_ms ||
         h.event_from_ms < 0 || h.event_to_ms < h.event_from_ms ||
         !std::isfinite(h.used_seconds) || h.used_seconds < 0 || h.used_seconds > 86400 ||
+        !std::isfinite(h.csr_seconds) || h.csr_seconds < 0 || h.csr_seconds > h.used_seconds ||
+        !std::isfinite(h.leak_high_seconds) || h.leak_high_seconds < 0 || h.leak_high_seconds > 86400 ||
         bytes != sizeof(h) + total_bins(h) * sizeof(uint64_t) + h.events * sizeof(Event) ||
         h.bytes != bytes) return false;
     for (const auto &channel : h.channels) {
@@ -721,8 +733,11 @@ bool scan_channels(const SdStorage::Session &session, const Job &job,
                     const size_t take = std::min<size_t>(32, count - slot);
                     if (!ReportEdf::read_samples(input.reader, *input.header, signals[c],
                                                  first + slot, take, samples)) return false;
-                    for (size_t i = 0; i < take; ++i)
+                    for (size_t i = 0; i < take; ++i) {
                         if (!ReportEdf::add_sample(hist, samples[i].raw, samples[i].valid)) return false;
+                        if (c == 3 && samples[i].valid && channel.signal.physical(samples[i].raw) > LEAK_THRESHOLD)
+                            data.header.leak_high_seconds += input.header->record_seconds / count;
+                    }
                     slot += take;
                 }
                 channel.count = hist.count;
@@ -772,6 +787,31 @@ bool numeric_extent(const ReportEdf::Header &header, int64_t &start, int64_t &en
     end = start + llround(duration * 1000);
     return true;
 }
+
+struct CsrPairing {
+    Event start;
+    bool active = false, unmatched = false;
+
+    template <typename Sink>
+    void consume(const Event &event, Sink emit) {
+        if (event.kind == ReportEdf::EventKind::CsrStart) {
+            if (active) { emit(start, false); unmatched = true; }
+            start = event;
+            active = true;
+        } else if (event.kind == ReportEdf::EventKind::CsrEnd) {
+            if (active && event.time_ms > start.time_ms) {
+                Event interval = event;
+                interval.duration_ms = event.time_ms - start.time_ms;
+                emit(interval, true);
+            } else {
+                if (active) emit(start, false);
+                emit(event, false);
+                unmatched = true;
+            }
+            active = false;
+        } else emit(event, false);
+    }
+};
 
 bool build_session(const SdStorage::Session &session, const Job &job,
                    const IndexedSession &entry, SessionData &out) {
@@ -846,6 +886,7 @@ bool build_session(const SdStorage::Session &session, const Job &job,
         input.file.close();
     }
     uint32_t events = 0;
+    CsrPairing csr;
     for (uint8_t kind : {uint8_t(3), uint8_t(4)}) {
         if (!(entry.key.present & (1u << kind))) continue;
         if (!input.open(session, entry, kind)) {
@@ -855,16 +896,24 @@ bool build_session(const SdStorage::Session &session, const Job &job,
             input.file.close();
             continue;
         }
+        if (kind == 4) out.header.csr_known = true;
         for (uint32_t i = 0; i < input.header->records; ++i) {
             if (aborted(&job, session)) return false;
             Event event;
             if (!read_event(input, i, event)) {
                 if (aborted(&job, session)) return false;
                 if (kind == 3) out.header.events_known = false;
+                if (kind == 4) out.header.csr_known = false;
                 out.header.partial = true;
                 break;
             }
             if (event.kind == ReportEdf::EventKind::Unknown) continue;
+            if (kind == 4) csr.consume(event, [&](const Event &interval, bool paired) {
+                if (!paired || !out.header.recorded) return;
+                const int64_t begin = std::max(out.header.start_ms, interval.time_ms - interval.duration_ms);
+                const int64_t end = std::min(out.header.end_ms, interval.time_ms);
+                if (end > begin) out.header.csr_seconds += (end - begin) / 1000.0;
+            });
             const int64_t begin = event.time_ms - event.duration_ms;
             if (!events) {
                 out.header.event_from_ms = begin;
@@ -884,6 +933,7 @@ bool build_session(const SdStorage::Session &session, const Job &job,
         input.file.close();
     }
     out.header.events = events;
+    out.header.csr_known &= !csr.active && !csr.unmatched && out.header.usage_known;
     if (events) std::sort(out.events, out.events + std::min<uint32_t>(events, event_capacity), [](const Event &a, const Event &b) {
         return a.time_ms < b.time_ms;
     });
@@ -1003,10 +1053,10 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
     Payload events;
     const uint16_t last = last_day(job.request), first = first_day(job.request, last);
     bool partial = false, event_comma = false, session_comma = false, events_truncated = false;
-    bool usage_known = true, events_known = true;
+    bool usage_known = true, events_known = true, csr_known = true;
     uint32_t sessions = 0;
     uint64_t counts[5] = {};
-    double seconds = 0;
+    double seconds = 0, csr_seconds = 0, leak_high_seconds = 0;
     start_json(job.body, revision() + 1, job.data_revision);
     job.body.print("\"view\":\"%s\",\"day\":%u,\"first_day\":%u,\"last_day\":%u,\"sessions\":[",
                    job.request.view == View::Day ? "day" : "period", last, first, last);
@@ -1017,19 +1067,22 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
         if (!(entry.key.present & 7)) {
             note_issue(job, "numeric_files_missing", entry.entry.file_prefix);
             partial = true;
-            usage_known = events_known = false;
+            usage_known = events_known = csr_known = false;
             continue;
         }
         SessionData data;
         if (!session_data(session, job, entry, data)) {
             if (aborted(&job, session)) return false;
             partial = true;
-            usage_known = events_known = false;
+            usage_known = events_known = csr_known = false;
             continue;
         }
         partial |= data.header.partial;
         usage_known &= data.header.usage_known;
         events_known &= data.header.usage_known;
+        csr_known &= data.header.csr_known;
+        csr_seconds += data.header.csr_seconds;
+        leak_high_seconds += data.header.leak_high_seconds;
         entry.bounds_known = data.header.chart_end_ms > data.header.chart_start_ms;
         entry.start_ms = data.header.chart_start_ms;
         entry.end_ms = data.header.chart_end_ms;
@@ -1061,6 +1114,15 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
                    sessions ? "true" : "false", partial ? "true" : "false");
     if (usage_known && seconds > 0) job.body.print("%.10g", seconds);
     else job.body.print("null");
+    job.body.print(",\"rdi\":");
+    if (seconds > 0 && events_known) job.body.print("%.10g", (counts[0] + counts[1] + counts[2] + counts[3] + counts[4]) * 3600.0 / seconds);
+    else job.body.print("null");
+    job.body.print(",\"csr_seconds\":");
+    if (csr_known && seconds > 0) job.body.print("%.10g", csr_seconds);
+    else job.body.print("null");
+    job.body.print(",\"leak_threshold\":%.10g,\"leak_high_seconds\":", LEAK_THRESHOLD);
+    if (!aggregate.incompatible[3] && aggregate.coverage[3] > 0) job.body.print("%.10g", leak_high_seconds);
+    else job.body.print("null");
     job.body.print(",\"session_count\":%u,\"ahi\":", sessions);
     if (seconds > 0 && events_known) job.body.print("%.10g", (counts[0] + counts[1] + counts[2] + counts[3]) * 3600.0 / seconds);
     else job.body.print("null");
@@ -1081,9 +1143,9 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
                        c ? "," : "", CHANNELS[c].id, CHANNELS[c].label, CHANNELS[c].unit,
                        static_cast<unsigned long long>(present ? stats.count : 0));
         job.body.print("\"coverage_seconds\":%.10g,", present ? aggregate.coverage[c] : 0);
-        if (present) job.body.print("\"mean\":%.10g,\"median\":%.10g,\"p95\":%.10g,\"max\":%.10g}",
-                                   stats.mean, stats.median, stats.p95, stats.max);
-        else job.body.print("\"mean\":null,\"median\":null,\"p95\":null,\"max\":null}");
+        if (present) job.body.print("\"min\":%.10g,\"mean\":%.10g,\"median\":%.10g,\"p95\":%.10g,\"max\":%.10g}",
+                                   stats.min, stats.mean, stats.median, stats.p95, stats.max);
+        else job.body.print("\"min\":null,\"mean\":null,\"median\":null,\"p95\":null,\"max\":null}");
     }
     job.body.print("]}");
     return job.body.good() && events.good();
@@ -1107,7 +1169,7 @@ struct ReducedHeader {
     uint32_t version = SERIES_CACHE_VERSION, header_bytes = sizeof(ReducedHeader);
     uint64_t bytes = 0;
     SourceKey key;
-    ReducedChannel channels[CHANNEL_COUNT + 1];
+    ReducedChannel channels[CHART_CHANNEL_COUNT + 1];
 };
 
 uint8_t chart_file(size_t c) { return c ? CHANNELS[c - 1].file : 0; }
@@ -1269,7 +1331,7 @@ bool build_reduced(const SdStorage::Session &session, const Job &job,
         if (!input.open(session, entry, kind)) return false;
         int64_t start = 0, end = 0;
         if (!numeric_extent(*input.header, start, end)) return false;
-        for (size_t c = 0; c <= CHANNEL_COUNT; ++c) {
+        for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
             if (chart_file(c) != kind || ReportEdf::find_signal(*input.header, chart_signal(c)) < 0)
                 continue;
             auto &channel = out.channels[c];
@@ -1296,7 +1358,7 @@ bool build_reduced(const SdStorage::Session &session, const Job &job,
     if (!prune_cache(session, out.bytes, path)) return false;
     PartGuard part_guard{session, part};
     if (!start_part(session, part, reinterpret_cast<const uint8_t *>(&out), sizeof(out))) return false;
-    for (size_t c = 0; c <= CHANNEL_COUNT; ++c) {
+    for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
         const auto &channel = out.channels[c];
         size_t count = 0;
         for (const auto &level : channel.levels) count += level.count;
@@ -1367,7 +1429,7 @@ struct Series {
             px = (request.to_ms - from_ms + step_ms - 1) / step_ms;
             to_ms = from_ms + px * step_ms;
         } else px = (to_ms - from_ms + step_ms - 1) / step_ms;
-        const size_t count = px * (CHANNEL_COUNT + 1), bytes = count * sizeof(Bucket);
+        const size_t count = px * (CHART_CHANNEL_COUNT + 1), bytes = count * sizeof(Bucket);
         buckets = static_cast<Bucket *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
         if (buckets) for (size_t i = 0; i < count; ++i) new (&buckets[i]) Bucket;
     }
@@ -1458,7 +1520,7 @@ bool cached_series(const SdStorage::Session &session, const Job &job,
     SdStorage::Reader reader;
     if (!reader.open(session, path)) return false;
     Cell cells[64];
-    for (size_t c = 0; c <= CHANNEL_COUNT; ++c) {
+    for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
         const auto &channel = header.channels[c];
         const auto &level = channel.levels[series.level_index];
         const uint32_t count = level.count;
@@ -1490,7 +1552,7 @@ bool window_series(const SdStorage::Session &session, const Job &job,
                    const IndexedSession &entry, Series &series) {
     Input input(session, job);
     ReportEdf::Sample values[32];
-    for (size_t c = 0; c <= CHANNEL_COUNT; ++c) {
+    for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
         if (!(entry.key.present & (1u << chart_file(c)))) { series.partial = true; continue; }
         if (!input.open(session, entry, chart_file(c))) return false;
         const int signal = ReportEdf::find_signal(*input.header, chart_signal(c));
@@ -1560,26 +1622,9 @@ bool window_events(const SdStorage::Session &session, const Job &job,
     };
     // Pair before viewport filtering, retaining only one pending start per
     // session. A repeated start leaves the preceding boundary unmatched.
-    Event csr_start;
-    bool csr_active = false;
+    CsrPairing csr;
     auto consume = [&](const Event &event) {
-        if (event.kind == ReportEdf::EventKind::CsrStart) {
-            if (csr_active) append(csr_start);
-            csr_start = event;
-            csr_active = true;
-        } else if (event.kind == ReportEdf::EventKind::CsrEnd) {
-            if (csr_active && event.time_ms > csr_start.time_ms) {
-                Event interval = event;
-                interval.duration_ms = event.time_ms - csr_start.time_ms;
-                append(interval, "csr");
-            } else {
-                if (csr_active) append(csr_start);
-                append(event);
-            }
-            csr_active = false;
-        } else {
-            append(event);
-        }
+        csr.consume(event, [&](const Event &value, bool paired) { append(value, paired ? "csr" : nullptr); });
     };
     char path[96];
     cache_path(entry, "stats", path);
@@ -1595,7 +1640,7 @@ bool window_events(const SdStorage::Session &session, const Job &job,
             if (truncated) return out.good();
             n += take;
         }
-        if (csr_active) append(csr_start);
+        if (csr.active) append(csr.start);
         return out.good();
     }
     reader.close();
@@ -1613,7 +1658,7 @@ bool window_events(const SdStorage::Session &session, const Job &job,
         }
         input.file.close();
     }
-    if (csr_active) append(csr_start);
+    if (csr.active) append(csr.start);
     return out.good();
 }
 
@@ -1681,7 +1726,7 @@ bool series_json(const SdStorage::Session &session, Job &job, JobTiming &timing)
     job.body.print("\"requested_from_ms\":%lld,\"requested_to_ms\":%lld,\"partial\":%s,\"channels\":[",
                    static_cast<long long>(job.request.from_ms), static_cast<long long>(job.request.to_ms),
                    series.partial ? "true" : "false");
-    for (size_t c = 0; c <= CHANNEL_COUNT; ++c) {
+    for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
         job.body.print("%s{\"id\":\"%s\",\"label\":\"%s\",\"unit\":\"%s\",", c ? "," : "",
                        c ? CHANNELS[c - 1].id : "Flow", c ? CHANNELS[c - 1].label : "Flow",
                        c ? CHANNELS[c - 1].unit : "L/min");
