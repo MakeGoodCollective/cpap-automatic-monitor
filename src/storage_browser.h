@@ -7,7 +7,7 @@
 
 namespace StorageBrowser {
 
-enum class Kind { List, File, Archive, Rename, Delete };
+enum class Kind { List, File, Archive, Rename, Delete, Immutable };
 enum class StartResult { Started, BadRequest, Busy, Unavailable };
 
 struct Request {
@@ -15,6 +15,9 @@ struct Request {
     char path[256];
     char selection[2048]; // Child names separated by newlines, or new name for Rename.
     uint32_t offset;
+    struct Range { uint32_t first = 0, last = 0; } ranges[8];
+    uint8_t range_count = 0;
+    bool head = false, unchanged = false;
 };
 
 class Transfer {
@@ -24,6 +27,7 @@ public:
     virtual bool failed() const = 0;
     virtual bool finished() const = 0;
     virtual void cancel() = 0;
+    virtual uint64_t representation_size() const { return 0; }
 };
 
 using Ready = std::function<void(int code, const char *error,

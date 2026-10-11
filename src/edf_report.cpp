@@ -2823,6 +2823,23 @@ void cancel(uint32_t id) {
     if (wake) xSemaphoreGive(wake);
 }
 
+StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
+    bool document, StorageBrowser::Request &operation, StorageBrowser::Ready ready,
+    std::weak_ptr<StorageBrowser::Transfer> &active) {
+    uint16_t parsed = 0;
+    const bool root = day && !strcmp(day, "index");
+    if ((!root && (!day || !catalog_day(day, parsed))) || !digest || strlen(digest) != 64)
+        return StorageBrowser::StartResult::BadRequest;
+    for (const char *p = digest; *p; ++p)
+        if (!(*p >= '0' && *p <= '9') && !(*p >= 'a' && *p <= 'f')) return StorageBrowser::StartResult::BadRequest;
+    if (root && !document) return StorageBrowser::StartResult::BadRequest;
+    operation.kind = StorageBrowser::Kind::Immutable;
+    operation.selection[0] = 0;
+    snprintf(operation.path, sizeof(operation.path), "%s/%s%s%s.%s", CACHE_DIR,
+        root ? "" : day, root ? "" : "/", digest, document ? "abp" : "abt");
+    return StorageBrowser::start(operation, std::move(ready), active);
+}
+
 int poll(uint32_t id, Result &out) {
     out.reset();
     if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return 503;
@@ -2881,6 +2898,10 @@ bool submit(const Request &, uint32_t &, const char **error) {
     return false;
 }
 void cancel(uint32_t) {}
+StorageBrowser::StartResult open_artifact(const char *, const char *, bool, StorageBrowser::Request &,
+    StorageBrowser::Ready, std::weak_ptr<StorageBrowser::Transfer> &) {
+    return StorageBrowser::StartResult::Unavailable;
+}
 int poll(uint32_t, Result &out) { out.reset(); return 422; }
 void Result::reset() { id_ = 0; data_ = nullptr; length_ = 0; }
 }  // namespace EdfReport

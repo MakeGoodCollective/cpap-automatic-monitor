@@ -38,6 +38,7 @@ const char *kind_name(Kind kind) {
     case Kind::Archive: return "zip";
     case Kind::Rename: return "rename";
     case Kind::Delete: return "delete";
+    case Kind::Immutable: return "artifact";
     }
     return "unknown";
 }
@@ -78,6 +79,14 @@ bool rename_target(const Request &request, char (&out)[256]) {
 bool valid_request(const Request &request) {
     if (!memchr(request.path, 0, sizeof(request.path)) || !valid_path(request.path) ||
         !memchr(request.selection, 0, sizeof(request.selection))) return false;
+    if (request.range_count > 8 || (request.kind != Kind::Immutable && request.range_count)) return false;
+    uint64_t bytes = 0;
+    for (unsigned i = 0; i < request.range_count; ++i) {
+        const auto &range = request.ranges[i];
+        if (range.last < range.first || (i && range.first <= request.ranges[i - 1].last)) return false;
+        bytes += uint64_t(range.last) - range.first + 1;
+    }
+    if (bytes > 256 * 1024) return false;
     char path[256];
     if (request.kind == Kind::Rename) return rename_target(request, path);
     if (request.kind == Kind::Delete && !strcmp(request.path, "/") && !*request.selection)
@@ -118,6 +127,8 @@ public:
     char failure_path[256] = {};
     ZipEntry *entries = nullptr;
     size_t entry_count = 0, entry_capacity = 0;
+    uint64_t representation = 0;
+    uint64_t representation_size() const override { return representation; }
 
     ~Job() override {
         // Releasing an HTTP response also happens on success. Only unread
@@ -329,9 +340,9 @@ uint64_t zip_data_size(uint32_t size, size_t block_bytes) {
 }
 
 bool copy_file(Job &job, SdStorage::Reader &file, uint32_t *checksum = nullptr,
-               const char *path = nullptr) {
+               const char *path = nullptr, uint64_t limit = UINT64_MAX) {
     uint8_t *buffer = job.copy_buffer;
-    uint64_t remaining = file.size();
+    uint64_t remaining = std::min(file.size(), limit);
     uint32_t crc = crc32_ieee_initial();
     do {
         const size_t count = std::min<uint64_t>(job.copy_capacity, remaining);
@@ -350,6 +361,51 @@ bool copy_file(Job &job, SdStorage::Reader &file, uint32_t *checksum = nullptr,
     } while (remaining);
     if (checksum) *checksum = crc32_ieee_finish(crc);
     return true;
+}
+
+size_t range_header(const Job &job, unsigned index, char (&out)[160]) {
+    const auto &range = job.request.ranges[index];
+    return snprintf(out, sizeof(out), "--ab-range\r\nContent-Type: application/octet-stream\r\n"
+        "Content-Range: bytes %lu-%lu/%llu\r\n\r\n", static_cast<unsigned long>(range.first),
+        static_cast<unsigned long>(range.last), static_cast<unsigned long long>(job.representation));
+}
+
+bool immutable_file(const std::shared_ptr<Job> &transfer) {
+    auto &job = *transfer;
+    SdStorage::Reader file;
+    if (!file.open(job.session, job.request.path)) {
+        job.ready(404, "artifact_unavailable", nullptr, 0);
+        return job.fail("file_open_failed");
+    }
+    job.representation = file.size();
+    uint64_t length = 0;
+    char header[160];
+    for (unsigned i = 0; i < job.request.range_count; ++i) {
+        const auto &range = job.request.ranges[i];
+        if (range.last >= file.size()) {
+            job.ready(416, "range_unsatisfiable", nullptr, 0);
+            return job.fail("range_unsatisfiable");
+        }
+        length += uint64_t(range.last) - range.first + 1;
+        if (job.request.range_count > 1) length += range_header(job, i, header) + 2;
+    }
+    if (!job.request.range_count) length = file.size();
+    else if (job.request.range_count > 1) length += sizeof("--ab-range--\r\n") - 1;
+    if (job.request.unchanged || job.request.head) {
+        job.ready(job.request.unchanged ? 304 : 200, nullptr, nullptr, file.size());
+        return true;
+    }
+    job.ready(job.request.range_count ? 206 : 200, nullptr, transfer, length);
+    if (!job.request.range_count) return copy_file(job, file);
+    for (unsigned i = 0; i < job.request.range_count; ++i) {
+        const auto &range = job.request.ranges[i];
+        if (job.request.range_count > 1 &&
+            !job.emit(reinterpret_cast<const uint8_t *>(header), range_header(job, i, header))) return false;
+        if (!file.seek(range.first) || !copy_file(job, file, nullptr, nullptr,
+            uint64_t(range.last) - range.first + 1)) return job.fail("range_read_failed");
+        if (job.request.range_count > 1 && !job.emit(reinterpret_cast<const uint8_t *>("\r\n"), 2)) return false;
+    }
+    return job.request.range_count == 1 || job.emit(reinterpret_cast<const uint8_t *>("--ab-range--\r\n"), 14);
 }
 
 bool archive(Job &job) {
@@ -456,6 +512,8 @@ void produce(void *context) {
             job->ready(200, nullptr, job, json.length());
             success = job->emit(reinterpret_cast<const uint8_t *>(json.c_str()), json.length());
         } else job->ready(409, "listing_failed", nullptr, 0);
+    } else if (job->request.kind == Kind::Immutable) {
+        success = immutable_file(job);
     } else if (job->request.kind == Kind::File) {
         SdStorage::Reader file;
         if (file.open(job->session, job->request.path)) {
@@ -513,7 +571,7 @@ StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &
         }
         if (!job->ring) { job->report(LOG_WARN, "ring_no_memory"); return StartResult::Unavailable; }
     }
-    if (request.kind == Kind::File || request.kind == Kind::Archive) {
+    if (request.kind == Kind::File || request.kind == Kind::Archive || request.kind == Kind::Immutable) {
         job->copy_capacity = SdStorage::READ_CHUNK_BYTES;
         job->copy_buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(job->copy_capacity, false));
         if (!job->copy_buffer) {

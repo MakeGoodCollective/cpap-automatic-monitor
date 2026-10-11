@@ -2,14 +2,13 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "storage_browser.h"
 
 // Local EDF ownership is independent of the UART/ClinicalJobs report path.
 namespace EdfReport {
 
 enum class State : uint8_t { Ready, WaitingStorage, Building, Blocked, Error };
 enum class Action : uint8_t { Days, Summary, Series, History, Prepare };
-// Prepare is an internal day-only materialization request, not yet an HTTP/UI
-// action. Existing summary/series reads do not run it speculatively.
 enum class View : uint8_t { Day, Period };
 
 constexpr size_t MAX_SESSION_COUNT = 8192;
@@ -47,6 +46,12 @@ void get_status(Status &out);
 uint32_t revision();
 const char *state_name(State state);
 bool valid(const Request &request);
+
+// Immutable selectors, not user filesystem paths. The shared bounded file
+// producer serves bytes; no report computation or SD access in HTTP callbacks.
+StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
+    bool document, StorageBrowser::Request &ranges, StorageBrowser::Ready ready,
+    std::weak_ptr<StorageBrowser::Transfer> &active);
 
 // Two active jobs, coalesced identical requests, bounded PSRAM result retention. Admission
 // and polling do no SD work. Completion changes status.revision only; source

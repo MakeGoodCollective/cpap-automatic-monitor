@@ -966,6 +966,7 @@ static void handleReport(AsyncWebServerRequest *request) {
         if (param->value() == "days") local.action = EdfReport::Action::Days;
         else if (param->value() == "series") local.action = EdfReport::Action::Series;
         else if (param->value() == "history") local.action = EdfReport::Action::History;
+        else if (param->value() == "prepare") local.action = EdfReport::Action::Prepare;
         else if (param->value() != "summary") { invalid(); return; }
     }
     if (const auto *param = request->getParam("view")) {
@@ -2203,8 +2204,8 @@ static void handleTimeAction(AsyncWebServerRequest *request) {
 class StorageResponse : public AsyncAbstractResponse {
 public:
     StorageResponse(std::shared_ptr<StorageBrowser::Transfer> transfer,
-                    StorageBrowser::Kind kind, uint64_t size) : transfer_(std::move(transfer)) {
-        _code = 200;
+                    StorageBrowser::Kind kind, uint64_t size, int code = 200) : transfer_(std::move(transfer)) {
+        _code = code;
         _contentType = kind == StorageBrowser::Kind::List ? "application/json" :
             kind == StorageBrowser::Kind::Archive ? "application/zip" : "application/octet-stream";
         _contentLength = size;
@@ -2220,6 +2221,84 @@ public:
 private:
     std::shared_ptr<StorageBrowser::Transfer> transfer_;
 };
+
+static bool reportRanges(const String &text, StorageBrowser::Request &out) {
+    if (!text.startsWith("bytes=")) return false;
+    const char *at = text.c_str() + 6;
+    while (*at) {
+        if (out.range_count == 8 || *at < '0' || *at > '9') return false;
+        char *end = nullptr;
+        errno = 0;
+        const unsigned long long first = strtoull(at, &end, 10);
+        if (errno || *end != '-' || first > UINT32_MAX) return false;
+        at = end + 1;
+        if (*at < '0' || *at > '9') return false;
+        const unsigned long long last = strtoull(at, &end, 10);
+        if (errno || last > UINT32_MAX || last < first || (*end && *end != ',')) return false;
+        out.ranges[out.range_count++] = {uint32_t(first), uint32_t(last)};
+        at = *end ? end + 1 : end;
+        if (*end && !*at) return false;
+    }
+    return out.range_count != 0;
+}
+
+static void handleReportArtifact(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    if (request->params() != 3 || !request->hasParam("day") || !request->hasParam("hash") || !request->hasParam("kind")) {
+        request->send(400); return;
+    }
+    const String kind = request->getParam("kind")->value();
+    if (kind != "tiles" && kind != "document") { request->send(400); return; }
+    StorageBrowser::Request operation = {};
+    operation.head = request->method() == HTTP_HEAD;
+    const String tag = "\"" + request->getParam("hash")->value() + "\"";
+    operation.unchanged = request->hasHeader("If-None-Match") && request->getHeader("If-None-Match")->value() == tag;
+    if (request->hasHeader("Range") && !reportRanges(request->getHeader("Range")->value(), operation)) {
+        request->send(416); return;
+    }
+    // If-Range mismatch requests the complete representation, never another
+    // generation's byte offsets. Content identities are strong validators.
+    if (request->hasHeader("If-Range") && request->getHeader("If-Range")->value() != tag) operation.range_count = 0;
+    const auto range = operation.ranges[0];
+    const uint8_t count = operation.range_count;
+    const bool head = operation.head;
+    auto paused = request->pause();
+    std::weak_ptr<StorageBrowser::Transfer> active;
+    const auto result = EdfReport::open_artifact(request->getParam("day")->value().c_str(),
+        request->getParam("hash")->value().c_str(), kind == "document", operation,
+        [paused, range, count, head, tag, kind](int code, const char *error,
+            std::shared_ptr<StorageBrowser::Transfer> transfer, uint64_t size) {
+            auto request = paused.lock();
+            if (!request) { if (transfer) transfer->cancel(); return; }
+            if (error) {
+                String body = "{";
+                jsonAddString(body, "error", error, false); body += '}';
+                request->send(code, "application/json", body); return;
+            }
+            AsyncWebServerResponse *response = transfer
+                ? new(std::nothrow) StorageResponse(transfer, StorageBrowser::Kind::Immutable, size, code)
+                : request->beginResponse(code);
+            if (!response) { if (transfer) transfer->cancel(); request->send(503); return; }
+            response->setContentType(count > 1 && code == 206
+                ? "multipart/byteranges; boundary=ab-range" : kind == "document" ? "application/json" : "application/octet-stream");
+            if (head && code != 304) response->setContentLength(size);
+            response->addHeader("ETag", tag);
+            response->addHeader("Cache-Control", "private, max-age=31536000, immutable");
+            response->addHeader("Accept-Ranges", "bytes");
+            if (code == 206 && count == 1) {
+                char text[96];
+                snprintf(text, sizeof(text), "bytes %lu-%lu/%llu", static_cast<unsigned long>(range.first),
+                    static_cast<unsigned long>(range.last), static_cast<unsigned long long>(transfer->representation_size()));
+                response->addHeader("Content-Range", text);
+            }
+            request->send(response);
+        }, active);
+    if (result == StorageBrowser::StartResult::Started) request->onDisconnect([active]() {
+        if (auto transfer = active.lock()) transfer->cancel();
+    });
+    else request->send(result == StorageBrowser::StartResult::BadRequest ? 400 :
+        result == StorageBrowser::StartResult::Busy ? 409 : 503, "application/json", "{\"error\":\"artifact_unavailable\"}");
+}
 
 static void handleStorageUsb(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
@@ -2404,9 +2483,12 @@ void WebUI::init(uint16_t port) {
     http->on("/api/flash", HTTP_POST, handleFlashStart, NULL, handleJsonBody);
     http->on("/api/flash/cancel", HTTP_POST, handleFlashCancel);
     http->on("/api/time", HTTP_POST, handleTimeAction, NULL, handleJsonBody);
-    http->on("/api/report", HTTP_GET, handleReport);
-    http->on("/api/report", HTTP_POST, handleReport);
-    http->on("/api/report", HTTP_DELETE, handleReport);
+#if AB_STORAGE_HAS_SDCARD
+    http->on(AsyncURIMatcher::exact("/api/report/artifact"), HTTP_GET | HTTP_HEAD, handleReportArtifact);
+#endif
+    http->on(AsyncURIMatcher::exact("/api/report"), HTTP_GET, handleReport);
+    http->on(AsyncURIMatcher::exact("/api/report"), HTTP_POST, handleReport);
+    http->on(AsyncURIMatcher::exact("/api/report"), HTTP_DELETE, handleReport);
     http->on("/api/wifi", HTTP_GET, handleWifiGet);
     http->on("/api/wifi", HTTP_POST, handleWifiPost, NULL, handleJsonBody);
     http->on("/api/esp32/upload", HTTP_POST, handleEspOtaDone, handleEspOtaChunk);
