@@ -114,6 +114,7 @@ class Job final : public Transfer {
 public:
     Request request = {};
     Ready ready;
+    Released released = nullptr;
     SdStorage::Session session;
     uint8_t *ring = nullptr;
     size_t capacity = 0;
@@ -543,6 +544,7 @@ void produce(void *context) {
         job->report(success ? LOG_DEBUG : job->failure_level,
             success ? "producer_done" : job->failure);
     job->session.end();
+    if (job->released) job->released();
     free(job->copy_buffer);
     job->copy_buffer = nullptr;
     job->error.store(!success);
@@ -552,7 +554,8 @@ void produce(void *context) {
 }
 }  // namespace
 
-StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active) {
+StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active,
+                  Released released) {
     if (!valid_request(request)) return StartResult::BadRequest;
     if (!SdStorage::local_access_allowed() || !SdStorage::mounted()) return StartResult::Unavailable;
     // The preceding response can outlive its last byte or an aborted fetch.
@@ -579,6 +582,7 @@ StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &
     });
     job->registered = true;
     job->request = request;
+    job->released = released;
     active = job;
     job->ready = std::move(ready);
     if (!mutating(request.kind)) {

@@ -32,6 +32,7 @@ public:
 
 using Ready = std::function<void(int code, const char *error,
     std::shared_ptr<Transfer> transfer, uint64_t size)>;
+using Released = void (*)();
 
 struct MutationStatus {
     bool active;
@@ -44,7 +45,10 @@ struct MutationStatus {
 // the previous response is being released. Ready runs outside the SD executor.
 // Size zero for archives denotes HTTP chunked transfer.
 // Mutations return no Transfer; completion is also retained for the CLI.
-StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active);
+// Released runs once in the producer after ending its SD session, including
+// cancellation/failure. It is not called if start returns other than Started.
+StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active,
+                  Released released = nullptr);
 void mutation_status(MutationStatus &out);
 
 }  // namespace StorageBrowser

@@ -276,6 +276,7 @@ struct Job {
     uint16_t consumers = 1, deliveries = 0;
     bool delivered = false, cancelled = false, shared = false;
     bool background = false;
+    mutable bool artifact_preempted = false;
     uint32_t foreground_epoch = 0;
     int code = 0;
     const char *error = nullptr;
@@ -358,6 +359,7 @@ portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
 Status status;
 uint32_t next_id = 1, data_revision = 1;
 uint32_t foreground_epoch = 0;
+uint32_t artifact_reads = 0;
 uint32_t backfill_revision = 0;
 uint16_t backfill_before = UINT16_MAX;
 uint8_t backfill_period = 0;
@@ -427,6 +429,10 @@ bool aborted(const Job *job, const SdStorage::Session &session) {
     static uint32_t batch_us = 0;
     const uint32_t now = micros();
     if (uint32_t(now - batch_us) >= 4000) { vTaskDelay(1); batch_us = micros(); }
+    if (__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE)) {
+        if (job) job->artifact_preempted = true;
+        return true;
+    }
     return (job && __atomic_load_n(&job->cancelled, __ATOMIC_ACQUIRE)) ||
         (job && job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE)) ||
         !AirSenseState::local_background_allowed() || !session.valid();
@@ -2219,6 +2225,9 @@ bool work_once() {
     }
     if (!SdStorage::local_access_allowed()) { defer_job(job); publish(State::Blocked, "usb_storage"); return false; }
     if (!SdStorage::mounted()) { defer_job(job); publish(State::Blocked, "no_sd"); return false; }
+    if (__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE)) {
+        defer_job(job); publish(State::WaitingStorage, "artifact_read"); return false;
+    }
     if (job && job->background && ExportSync::busy()) {
         defer_job(job); publish(State::WaitingStorage, "export_pending"); return false;
     }
@@ -2247,10 +2256,11 @@ bool work_once() {
     if (!indexed) {
         const bool preempted = !session.valid() || !AirSenseState::local_background_allowed();
         session.end();
-        if (preempted || index_failure == IndexFailure::Preempted || index_failure == IndexFailure::WaitingCatalog) {
+        const bool reading = __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE);
+        if (preempted || reading || index_failure == IndexFailure::Preempted || index_failure == IndexFailure::WaitingCatalog) {
             defer_job(job);
             publish(preempted ? State::Blocked : State::WaitingStorage,
-                    preempted ? "not_idle" : "catalog_not_ready");
+                    preempted ? "not_idle" : reading ? "artifact_read" : "catalog_not_ready");
         } else {
             Log::logf(CAT_REPORT, reported_index_error == index_error ? LOG_DEBUG : LOG_WARN,
                 "EDF index failed: %s entry=%ld\n", index_error,
@@ -2292,6 +2302,7 @@ bool work_once() {
     job->code = 0;
     job->error = job->issue = nullptr;
     job->issue_path[0] = 0;
+    job->artifact_preempted = false;
     job->foreground_epoch = __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
     xSemaphoreGive(mutex);
     bool success = false;
@@ -2315,7 +2326,8 @@ bool work_once() {
     EdfCatalog::get_status(catalog);
     const bool changed = !recovered_index && (catalog.generation != catalog_generation || SdStorage::files_revision() != file_revision ||
         job->data_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE));
-    const bool yielded = job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
+    const bool yielded = job->artifact_preempted || __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) ||
+        (job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE));
     if (job->background && !interrupted && !changed && !yielded) {
         if (job->request.view == View::Period) ++backfill_period;
         else backfill_before = job->request.day;
@@ -2365,6 +2377,11 @@ void worker(void *) {
         xSemaphoreTake(wake, background_retry || publication.state == State::WaitingStorage || publication.state == State::Blocked
             ? pdMS_TO_TICKS(1000) : portMAX_DELAY);
     }
+}
+
+void artifact_read_released() {
+    __atomic_sub_fetch(&artifact_reads, 1, __ATOMIC_ACQ_REL);
+    if (wake) xSemaphoreGive(wake);
 }
 
 }  // namespace
@@ -2562,13 +2579,18 @@ StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
     for (const char *p = digest; *p; ++p)
         if (!(*p >= '0' && *p <= '9') && !(*p >= 'a' && *p <= 'f')) return StorageBrowser::StartResult::BadRequest;
     if (root && !document) return StorageBrowser::StartResult::BadRequest;
+    // Keep priority until the reader releases SD, not just until backfill
+    // observes an epoch change and immediately starts its next attempt.
+    __atomic_add_fetch(&artifact_reads, 1, __ATOMIC_ACQ_REL);
     __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
     operation.kind = StorageBrowser::Kind::Immutable;
     operation.selection[0] = 0;
     snprintf(operation.path, sizeof(operation.path), "%s/%s%s%.*s%s%s.%s", CACHE_DIR,
         root ? "" : day, root ? "" : "/", document ? 2 : 0, digest,
         document ? "/" : "", digest, document ? "abp" : "abt");
-    return StorageBrowser::start(operation, std::move(ready), active);
+    const auto result = StorageBrowser::start(operation, std::move(ready), active, artifact_read_released);
+    if (result != StorageBrowser::StartResult::Started) artifact_read_released();
+    return result;
 }
 
 int poll(uint32_t id, Result &out) {
