@@ -863,16 +863,21 @@ bool Writer::write(const uint8_t *data, size_t length) {
 #endif
 }
 
-bool Writer::finish(uint64_t expected_size) {
-    bool complete = false;
+bool Writer::flush(uint64_t expected_size) {
 #if AB_STORAGE_HAS_SDCARD
-    complete = handle_ && size_ == expected_size && session_.run([&](fs::FS &) {
+    return handle_ && size_ == expected_size && session_.run([&](fs::FS &) {
         OpenFile *file = find_file(handle_);
         if (!file) return false;
         file->file.flush();
         return file->file.size() == expected_size;
     });
+#else
+    return false;
 #endif
+}
+
+bool Writer::finish(uint64_t expected_size) {
+    const bool complete = flush(expected_size);
     close();
     return complete;
 }

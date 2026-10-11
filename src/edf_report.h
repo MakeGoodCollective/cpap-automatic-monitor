@@ -7,7 +7,9 @@
 namespace EdfReport {
 
 enum class State : uint8_t { Ready, WaitingStorage, Building, Blocked, Error };
-enum class Action : uint8_t { Days, Summary, Series, History };
+enum class Action : uint8_t { Days, Summary, Series, History, Prepare };
+// Prepare is an internal day-only materialization request, not yet an HTTP/UI
+// action. Existing summary/series reads do not run it speculatively.
 enum class View : uint8_t { Day, Period };
 
 constexpr size_t MAX_SESSION_COUNT = 8192;

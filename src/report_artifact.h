@@ -19,6 +19,13 @@ constexpr size_t LEVEL_BYTES = 16;
 constexpr size_t MAX_METADATA_BYTES = HEADER_BYTES + MAX_TRACKS *
     (TRACK_BYTES + MAX_LEVELS * LEVEL_BYTES);
 
+enum class SignalId : uint16_t {
+    Flow = 0, Press = 1, EprPress = 2, MaskPress = 3, Leak = 4,
+    MinVent = 5, RespRate = 6, TidVol = 7, SpO2 = 8, Pulse = 9,
+    FlowLim = 10, Snore = 11, TgtVent = 12, Ti = 13, IERatio = 14,
+    AlvMinVent = 15,
+};
+
 struct Level {
     uint32_t factor = 0, count = 0, offset = 0, bytes = 0;
 };

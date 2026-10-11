@@ -151,6 +151,9 @@ public:
     Writer &operator=(const Writer &) = delete;
     bool open(const Session &session, const char *path);
     bool write(const uint8_t *data, size_t length);
+    // Make the completed prefix readable without closing the sequential writer.
+    // Only private, unpublished build files may be read while still growing.
+    bool flush(uint64_t expected_size);
     // Flush, check the complete length and close, including on failure.
     bool finish(uint64_t expected_size);
     void close();

@@ -19,9 +19,9 @@ bool Request::operator==(const Request &other) const {
 }
 
 bool valid(const Request &request) {
-    if (request.action > Action::History || request.view > View::Period ||
+    if (request.action > Action::Prepare || request.view > View::Period ||
         request.day == UINT16_MAX) return false;
-    if (request.action == Action::History && request.view != View::Day) return false;
+    if ((request.action == Action::History || request.action == Action::Prepare) && request.view != View::Day) return false;
     if (request.view == View::Period && request.period != 1 && request.period != 7 &&
         request.period != 30 && request.period != 90 && request.period != 180 &&
         request.period != 365) return false;
@@ -68,6 +68,7 @@ Result::Result(Result &&other) noexcept
 #include "large_text_buffer.h"
 #include "hex_util.h"
 #include "report_edf.h"
+#include "report_artifact_builder.h"
 #include "settings_defs.h"
 #include <Arduino.h>
 #include <FS.h>
@@ -104,23 +105,25 @@ constexpr const char *SUFFIXES[] = {"BRP", "PLD", "SAD", "EVE", "CSL"};
 struct ChannelSpec {
     const char *id, *label, *unit, *signal;
     uint8_t file;
+    ReportArtifact::SignalId artifact_id;
 };
+using ReportArtifact::SignalId;
 constexpr ChannelSpec CHANNELS[] = {
-    {"Press", "Pressure", "cmH2O", "Press.2s", 1},
-    {"EprPress", "Expiratory pressure", "cmH2O", "EprPress.2s", 1},
-    {"MaskPress", "Mask pressure", "cmH2O", "MaskPress.2s", 1},
-    {"Leak", "Leak", "L/min", "Leak.2s", 1},
-    {"MinVent", "Minute ventilation", "L/min", "MinVent.2s", 1},
-    {"RespRate", "Respiratory rate", "bpm", "RespRate.2s", 1},
-    {"TidVol", "Tidal volume", "mL", "TidVol.2s", 1},
-    {"SpO2", "SpO2", "%", "SpO2.1s", 2},
-    {"Pulse", "Pulse", "bpm", "Pulse.1s", 2},
-    {"FlowLim", "Flow limitation", "", "FlowLim.2s", 1},
-    {"Snore", "Snore", "", "Snore.2s", 1},
-    {"TgtVent", "Target ventilation", "L/min", "TgtVent.2s", 1},
-    {"Ti", "Inspiratory time", "s", "Ti.2s", 1},
-    {"IERatio", "I:E", "%", "IERatio.2s", 1},
-    {"AlvMinVent", "Alveolar ventilation", "L/min", "AlvMinVent.2s", 1},
+    {"Press", "Pressure", "cmH2O", "Press.2s", 1, SignalId::Press},
+    {"EprPress", "Expiratory pressure", "cmH2O", "EprPress.2s", 1, SignalId::EprPress},
+    {"MaskPress", "Mask pressure", "cmH2O", "MaskPress.2s", 1, SignalId::MaskPress},
+    {"Leak", "Leak", "L/min", "Leak.2s", 1, SignalId::Leak},
+    {"MinVent", "Minute ventilation", "L/min", "MinVent.2s", 1, SignalId::MinVent},
+    {"RespRate", "Respiratory rate", "bpm", "RespRate.2s", 1, SignalId::RespRate},
+    {"TidVol", "Tidal volume", "mL", "TidVol.2s", 1, SignalId::TidVol},
+    {"SpO2", "SpO2", "%", "SpO2.1s", 2, SignalId::SpO2},
+    {"Pulse", "Pulse", "bpm", "Pulse.1s", 2, SignalId::Pulse},
+    {"FlowLim", "Flow limitation", "", "FlowLim.2s", 1, SignalId::FlowLim},
+    {"Snore", "Snore", "", "Snore.2s", 1, SignalId::Snore},
+    {"TgtVent", "Target ventilation", "L/min", "TgtVent.2s", 1, SignalId::TgtVent},
+    {"Ti", "Inspiratory time", "s", "Ti.2s", 1, SignalId::Ti},
+    {"IERatio", "I:E", "%", "IERatio.2s", 1, SignalId::IERatio},
+    {"AlvMinVent", "Alveolar ventilation", "L/min", "AlvMinVent.2s", 1, SignalId::AlvMinVent},
 };
 constexpr size_t CHANNEL_COUNT = sizeof(CHANNELS) / sizeof(CHANNELS[0]);
 
@@ -296,7 +299,8 @@ void log_result(const Job &job) {
         job.issue ? LOG_WARN : LOG_DEBUG,
         "EDF job=%lu %s day=%u code=%d %s path=%s\n",
         (unsigned long)job.id, job.request.action == Action::Days ? "days" :
-        job.request.action == Action::Summary ? "summary" : job.request.action == Action::History ? "history" : "series",
+        job.request.action == Action::Summary ? "summary" : job.request.action == Action::History ? "history" :
+        job.request.action == Action::Prepare ? "prepare" : "series",
         unsigned(job.request.day), job.code, reason ? reason : "complete",
         expected || !job.issue_path[0] ? "-" : job.issue_path);
 }
@@ -320,7 +324,8 @@ struct JobTiming {
             "report job=%lu action=%s code=%d bytes=%u ms total=%lu "
             "idx=%lu num=%lu evt=%lu enc=%lu\n",
             static_cast<unsigned long>(id), action == Action::Days ? "days" :
-                action == Action::Summary ? "summary" : action == Action::History ? "history" : "series", code,
+                action == Action::Summary ? "summary" : action == Action::History ? "history" :
+                action == Action::Prepare ? "prepare" : "series", code,
             static_cast<unsigned>(bytes), static_cast<unsigned long>((stamp() - started_us) / 1000),
             static_cast<unsigned long>(index_us / 1000), static_cast<unsigned long>(numeric_us / 1000),
             static_cast<unsigned long>(events_us / 1000), static_cast<unsigned long>(encode_us / 1000));
@@ -590,6 +595,7 @@ struct Input {
     char path[96] = {};
     const SdStorage::Session &session;
     const Job &job;
+    ReportArtifact::Producer *artifact = nullptr;
     Input(const SdStorage::Session &session, const Job &job) : session(session), job(job) {
         void *memory = aircannect::Memory::alloc_large(sizeof(ReportEdf::Header),
                                                       sizeof(ReportEdf::Header) <= INTERNAL_WORK);
@@ -678,6 +684,10 @@ struct Input {
         if (!present) return true;
         for (uint32_t n = first; n < end; ++n) {
             if (!load_record(n)) return false;
+            if (artifact && !artifact->record(*header, record, header->record_bytes)) {
+                note_issue(job, artifact->error(), path);
+                artifact = nullptr;
+            }
             for (size_t c = 0; c < count; ++c) {
                 if (signals[c] < 0) continue;
                 ReportEdf::RecordSamples samples;
@@ -706,6 +716,69 @@ struct Input {
                     std::max<double>(0, std::ceil((to - origin) / step)));
                 return consume(c, base, begin, end, samples);
             });
+    }
+};
+
+double chart_scale(size_t c, const ReportEdf::Signal &signal);
+
+bool artifact_identity(const IndexedSession &entry, uint8_t kind, char (&prefix)[96], uint8_t (&key)[32]) {
+    snprintf(prefix, sizeof(prefix), "%s/%s/%s_%s", CACHE_DIR, entry.entry.therapy_day,
+             entry.entry.file_prefix, SUFFIXES[kind]);
+    uint8_t identity[20] = {};
+    SdStorage::put_le16(identity, ReportArtifact::VERSION);
+    identity[2] = kind;
+    identity[3] = (entry.key.checksums >> kind) & 1;
+    SdStorage::put_le32(identity + 4, uint32_t(entry.key.sizes[kind]));
+    SdStorage::put_le32(identity + 8, uint32_t(entry.key.sizes[kind] >> 32));
+    memcpy(identity + 12, entry.key.sidecars[kind], 8);
+    return ReportArtifact::fingerprint(identity, sizeof(identity), key);
+}
+
+struct ArtifactBuild {
+    Input &input;
+    std::unique_ptr<ReportArtifact::Producer> producer;
+
+    ArtifactBuild(Input &input, const IndexedSession &entry, uint8_t kind, bool enabled) : input(input) {
+        if (!enabled) return;
+        char prefix[96];
+        uint8_t key[32];
+        if (!artifact_identity(entry, kind, prefix, key)) { note_issue(input.job, "artifact_digest"); return; }
+        ReportArtifact::Publication existing;
+        const auto lookup = ReportArtifact::lookup(input.session, prefix, key, existing);
+        if (lookup == ReportArtifact::Lookup::Ready) return;
+        if (lookup != ReportArtifact::Lookup::Missing) {
+            note_issue(input.job, lookup == ReportArtifact::Lookup::Invalid ? "artifact_invalid" : "artifact_lookup", prefix);
+            return;
+        }
+        ReportArtifact::Selection selection[ReportArtifact::MAX_TRACKS];
+        size_t count = 0;
+        for (size_t c = 0; c <= CHANNEL_COUNT; ++c) {
+            if ((c ? CHANNELS[c - 1].file : 0) != kind) continue;
+            const int signal = ReportEdf::find_signal(*input.header, c ? CHANNELS[c - 1].signal : "Flow.40ms");
+            if (signal < 0) continue;
+            selection[count++] = {uint16_t(c ? CHANNELS[c - 1].artifact_id : SignalId::Flow),
+                uint16_t(signal), chart_scale(c, input.header->signals[signal]),
+                c ? CHANNELS[c - 1].id : "Flow", c ? CHANNELS[c - 1].unit : "L/min"};
+        }
+        if (!count) return;
+        producer.reset(new (std::nothrow) ReportArtifact::Producer(input.session, [](void *context) {
+            const auto &input = *static_cast<Input *>(context);
+            return aborted(&input.job, input.session);
+        }, &input));
+        if (!producer || !producer->begin(prefix, key, *input.header, selection, count)) {
+            note_issue(input.job, producer ? producer->error() : "artifact_alloc", prefix);
+            producer.reset();
+            return;
+        }
+        input.artifact = producer.get();
+    }
+    ~ArtifactBuild() { input.artifact = nullptr; }
+    bool needed() const { return producer != nullptr; }
+    void finish() {
+        input.artifact = nullptr;
+        ReportArtifact::Publication publication;
+        if (producer && !producer->finish(publication) && !aborted(&input.job, input.session))
+            note_issue(input.job, producer->error(), input.path);
     }
 };
 
@@ -1118,14 +1191,13 @@ struct CsrPairing {
 };
 
 bool build_session(const SdStorage::Session &session, const Job &job,
-                   const IndexedSession &entry, SessionData &out) {
+                   const IndexedSession &entry, SessionData &out, bool artifacts = false) {
     out.header.key = entry.key;
     out.header.day = entry.day;
     out.header.partial = entry.key.present != 31 || entry.key.checksums != 31;
     Input input(session, job);
     uint8_t readable_numeric = 0;
-    // BRP contributes its header extent only. Its samples and overview cache
-    // remain lazy, independent of the PLD/SAD summary statistics.
+    // Gather descriptors before allocating the bounded exact histograms.
     for (uint8_t kind : {uint8_t(0), uint8_t(1), uint8_t(2)}) {
         if (!(entry.key.present & (1u << kind))) continue;
         if (!input.open(session, entry, kind)) {
@@ -1183,11 +1255,20 @@ bool build_session(const SdStorage::Session &session, const Job &job,
     }
     out.header.events = event_capacity;
     if (!allocate_data(out)) return false;
-    for (uint8_t kind : {uint8_t(1), uint8_t(2)}) {
+    for (uint8_t kind : {uint8_t(0), uint8_t(1), uint8_t(2)}) {
         if (!(readable_numeric & (1u << kind))) continue;
-        if (!input.open(session, entry, kind) || !scan_channels(input, kind, out))
-            return false;
+        if (!kind && !artifacts) continue;
+        if (!input.open(session, entry, kind)) return false;
+        ArtifactBuild artifact(input, entry, kind, artifacts);
+        if (kind) {
+            if (!scan_channels(input, kind, out)) return false;
+        } else if (artifact.needed()) {
+            const int flow = ReportEdf::find_signal(*input.header, "Flow.40ms");
+            if (!input.scan_records(&flow, 1, 0, input.header->records,
+                [](size_t, uint64_t, const ReportEdf::RecordSamples &) { return true; })) return false;
+        }
         input.file.close();
+        artifact.finish();
     }
     uint32_t events = 0;
     CsrPairing csr;
@@ -1245,14 +1326,14 @@ bool build_session(const SdStorage::Session &session, const Job &job,
 }
 
 bool session_data(const SdStorage::Session &session, const Job &job,
-                  const IndexedSession &entry, SessionData &out) {
-    if (load_cache(session, entry, out)) {
+                  const IndexedSession &entry, SessionData &out, bool artifacts = false) {
+    if (!artifacts && load_cache(session, entry, out)) {
         if (out.header.partial) note_issue(job, "partial_source", entry.entry.file_prefix);
         return true;
     }
     out.~SessionData();
     new (&out) SessionData;
-    if (!build_session(session, job, entry, out))
+    if (!build_session(session, job, entry, out, artifacts))
         return note_issue(job, "session_build", entry.entry.file_prefix);
     if (out.header.partial) note_issue(job, "partial_source", entry.entry.file_prefix);
     // The cache is derived and replaceable; failed persistence does not discard
@@ -1283,6 +1364,50 @@ bool selected(const IndexedSession &entry, uint16_t first, uint16_t last) {
 void start_json(Payload &body, uint32_t publication, uint32_t dataset) {
     body.print("{\"source\":\"edf\",\"revision\":%u,\"data_revision\":%u,",
                publication, dataset);
+}
+
+bool prepare_json(const SdStorage::Session &session, Job &job) {
+    const uint16_t day = last_day(job.request);
+    start_json(job.body, revision() + 1, job.data_revision);
+    job.body.print("\"day\":%u,\"artifacts\":[", day);
+    bool comma = false;
+    for (size_t i = 0; i < index_count; ++i) {
+        const auto &entry = index[i];
+        if (!selected(entry, day, day)) continue;
+        bool missing = false;
+        for (uint8_t kind = 0; kind < 3; ++kind) {
+            if (!(entry.key.present & (1u << kind))) continue;
+            char prefix[96]; uint8_t key[32];
+            ReportArtifact::Publication publication;
+            if (!artifact_identity(entry, kind, prefix, key)) return note_issue(job, "artifact_digest");
+            const auto found = ReportArtifact::lookup(session, prefix, key, publication);
+            if (found == ReportArtifact::Lookup::Missing) missing = true;
+            else if (found != ReportArtifact::Lookup::Ready) return note_issue(job, "artifact_lookup", prefix);
+        }
+        if (missing) {
+            void *memory = aircannect::Memory::alloc_large(sizeof(SessionData), sizeof(SessionData) <= INTERNAL_WORK);
+            if (!memory) return note_issue(job, "artifact_alloc");
+            auto *data = new (memory) SessionData;
+            const bool built = session_data(session, job, entry, *data, true);
+            data->~SessionData();
+            aircannect::Memory::free(data);
+            if (!built) return false;
+        }
+        for (uint8_t kind = 0; kind < 3; ++kind) {
+            if (!(entry.key.present & (1u << kind))) continue;
+            char prefix[96], digest[65]; uint8_t key[32];
+            ReportArtifact::Publication publication;
+            if (!artifact_identity(entry, kind, prefix, key) ||
+                ReportArtifact::lookup(session, prefix, key, publication) != ReportArtifact::Lookup::Ready)
+                return note_issue(job, "artifact_unavailable", entry.entry.file_prefix);
+            aircannect::hex_encode(publication.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+            job.body.print("%s{\"session\":%u,\"kind\":\"%s\",\"digest\":\"%s\",\"bytes\":%u}",
+                           comma ? "," : "", unsigned(i), SUFFIXES[kind], digest, publication.bytes);
+            comma = true;
+        }
+    }
+    job.body.print("]}");
+    return job.body.good();
 }
 void append_event(Payload &body, const Event &event, bool &comma, const char *type = nullptr) {
     body.print("%s{\"time_ms\":%lld,\"duration_ms\":%lld,\"type\":\"%s\"}",
@@ -2366,7 +2491,8 @@ bool work_once() {
             job->body.print("\"day\":%u", last_day(job->request));
             success = history_json(session, *job, true);
             job->body.print("}");
-        } else success = job->request.action == Action::Days ? days_json(*job) :
+        } else if (job->request.action == Action::Prepare) success = prepare_json(session, *job);
+        else success = job->request.action == Action::Days ? days_json(*job) :
             job->request.action == Action::Summary ? summary_json(session, *job) : series_json(session, *job, timing);
         if (success) job->code = 200;
     }
