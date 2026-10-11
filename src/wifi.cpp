@@ -474,6 +474,11 @@ static void apply_country_code() {
 bool WiFiSetup::init() {
     auto &cfg = Config::get();
 
+    // STA_START reapplies Arduino's saved policy after every radio restart.
+    if (!WiFi.setSleep(false)) {
+        Log::logf(CAT_WIFI, LOG_WARN, "Disabling modem sleep failed\n");
+    }
+
     WiFi.onEvent(wifi_event_cb);
     // This state machine owns recovery; do not race driver auto-association
     // against scans and the explicit BSSID/PMF retry paths.
