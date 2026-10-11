@@ -153,6 +153,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .report-plots canvas{display:block;width:100%;touch-action:pan-y;cursor:crosshair}
 .report-plots canvas:focus{outline:none}
 .report-plots canvas:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.report-chart-surface{position:relative}
+.report-plot-overlay{position:absolute;inset:18px 8px 22px 44px;overflow:hidden;pointer-events:none}
+.report-plot-cursor{position:absolute;top:0;bottom:0;border-left:1px dashed #aaa;transform:translateX(-.5px)}
+.report-plot-selection{position:absolute;top:0;bottom:0;box-sizing:border-box;background:#22d3ee33;border:1px solid #22d3ee}
 .report-plots .chart-card{margin:8px 0;padding:10px 16px}
 .report-chart-legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:11px}
 .report-chart-legend span{white-space:nowrap}
@@ -1772,7 +1776,7 @@ async function reportArtifactSeries(request, px, signal, publish) {
 let reportDisplayedSource = null;
 const reportPlot = {summary:null, selection:null, full:null, view:null, fullSeries:null, series:null,
   history:null, historyMetric:null, historyPending:false,
-  pending:null, flight:null, serial:0, cursor:null, frame:null, request:false, rows:[],
+  pending:null, flight:null, serial:0, cursor:null, frame:null, request:false, redraw:false, rows:[], resizeObserver:null,
   axes:null, hiddenSessions:new Set(), excluded:'', pointers:new Map(), gesture:null,
   hiddenChannels:new Set(), availableChannels:[]};
 
@@ -2420,6 +2424,7 @@ function toggleReportSession(id) {
 }
 
 function clearReportPlots() {
+  reportPlot.resizeObserver?.disconnect(); reportPlot.resizeObserver = null;
   reportPlot.prefetch?.abort();
   reportPlot.flight?.controller?.abort();
   reportPlot.serial++;
@@ -2443,6 +2448,7 @@ function clearReportPlots() {
 }
 
 function suspendReport() {
+  reportPlot.resizeObserver?.disconnect(); reportPlot.resizeObserver = null;
   reportGeneration++;
   if (reportController) reportController.abort();
   reportPlot.pending = null;
@@ -2462,6 +2468,7 @@ function setReportViewport(from, to) {
   from = Math.max(first, Math.min(last-width, from));
   if (reportPlot.view && reportPlot.view[0] === from && reportPlot.view[1] === from+width) return;
   reportPlot.view = [from,from+width];
+  reportPlot.redraw = true;
   reportPlot.serial++;
   reportPlot.flight?.controller?.abort();
   reportPlot.prefetch?.abort();
@@ -2482,14 +2489,16 @@ function resetReportViewport() {
   scheduleReportDraw(true);
 }
 
-function scheduleReportDraw(request = false) {
+function scheduleReportDraw(request = false, redraw = true) {
   if (request) reportPlot.prefetch?.abort();
   reportPlot.request ||= request;
+  reportPlot.redraw ||= redraw;
   if (reportPlot.frame !== null) return;
   reportPlot.frame = requestAnimationFrame(() => {
     reportPlot.frame = null;
     if (!reportPlot.view || document.getElementById('reportChartsCard').hidden) return;
-    drawReportPlots();
+    const redraw = reportPlot.redraw; reportPlot.redraw = false;
+    if (redraw) drawReportPlots(); else drawReportInteraction();
     // Only interaction/release queues data; animation frames never form a loop.
     if (reportPlot.request) {
       reportPlot.request = false;
@@ -2760,29 +2769,37 @@ function prepareReportCanvas(canvas) {
 function drawArtifactSegment(ctx, segment, x, y, flowMidline = false) {
   const points = segment.points;
   if (segment.raw) {
-    let group = [], pixel = null, connected = false, runCount = 0, lastPoint = null;
+    let first = -1, minimum = 0, maximum = 0, last = 0, pixel = null;
+    let connected = false, runCount = 0, lastX = 0, lastY = 0;
     const endRun = () => {
-      if (runCount === 1) ctx.lineTo(lastPoint[0]+0.5,lastPoint[1]);
+      if (runCount === 1) ctx.lineTo(lastX+0.5,lastY);
       connected = false; runCount = 0;
     };
+    const emit = i => {
+      lastX = x(segment.from_ms+i*segment.step_ms); lastY = y(points[i][0]);
+      if (connected) ctx.lineTo(lastX,lastY); else { ctx.moveTo(lastX,lastY); connected = true; }
+      runCount++;
+    };
     const flush = () => {
-      if (!group.length) return;
-      let low = group[0], high = low;
-      for (const point of group) { if (point[1] < low[1]) low = point; if (point[1] > high[1]) high = point; }
-      const selected = [...new Set([group[0],low,high,group.at(-1)])].sort((a,b) => a[0]-b[0]);
-      for (const point of selected) {
-        const xx = x(segment.from_ms+point[0]*segment.step_ms), yy = y(point[1]);
-        if (connected) ctx.lineTo(xx,yy); else { ctx.moveTo(xx,yy); connected = true; }
-        runCount++; lastPoint = [xx,yy];
-      }
-      group = [];
+      if (first < 0) return;
+      emit(first);
+      const early = Math.min(minimum,maximum), late = Math.max(minimum,maximum);
+      if (early > first && early < last) emit(early);
+      if (late !== early && late > first && late < last) emit(late);
+      if (last !== first) emit(last);
+      first = -1;
     };
     ctx.beginPath();
     for (let i = 0; i < points.length; i++) {
       if (!reportBucket(points[i])) { flush(); endRun(); pixel = null; continue; }
       const at = Math.floor(x(segment.from_ms+i*segment.step_ms));
       if (pixel !== at) { flush(); pixel = at; }
-      group.push([i,points[i][0]]);
+      if (first < 0) first = minimum = maximum = i;
+      else {
+        if (points[i][0] < points[minimum][0]) minimum = i;
+        if (points[i][0] > points[maximum][0]) maximum = i;
+      }
+      last = i;
     }
     flush(); endRun(); ctx.stroke();
     return;
@@ -2836,7 +2853,7 @@ function reportArtifactValue(channel, time) {
   return null;
 }
 
-function drawEdfChart(canvas, channel, data, color, cursor = reportPlot.cursor) {
+function drawEdfChart(canvas, channel, data, color) {
   const {ctx,W,H} = prepareReportCanvas(canvas);
   const members = (Array.isArray(channel) ? channel : [channel]).filter(Boolean);
   const firstChannel = members[0];
@@ -2864,17 +2881,6 @@ function drawEdfChart(canvas, channel, data, color, cursor = reportPlot.cursor) 
     for (const segment of member.segments || []) drawArtifactSegment(ctx,segment,x,y,member.id === 'Flow');
   }
   drawReportEventMarkers(ctx,data?.events,view,x,pad,gh,members.length > 0);
-  const selection = reportPlot.gesture?.selection;
-  if (selection) {
-    const left = x(selection[0]), right = x(selection[1]);
-    ctx.fillStyle = '#22d3ee33'; ctx.fillRect(left,pad.t,right-left,gh);
-    ctx.strokeStyle = '#22d3ee'; ctx.strokeRect(left,pad.t,right-left,gh);
-  }
-  if (cursor !== null) {
-    ctx.strokeStyle = '#aaa'; ctx.setLineDash([3,3]);
-    ctx.beginPath(); ctx.moveTo(x(cursor),pad.t); ctx.lineTo(x(cursor),H-pad.b); ctx.stroke();
-    ctx.setLineDash([]);
-  }
   ctx.restore(); ctx.fillStyle = '#777';
   const ticks = W < 480 ? 2 : 4;
   for (let i = 0; i <= ticks; i++) {
@@ -2885,14 +2891,16 @@ function drawEdfChart(canvas, channel, data, color, cursor = reportPlot.cursor) 
   }
 }
 
-function drawReportPlots() {
+function reportPlotData() {
   const fullSeries = reportPlot.fullSeries;
   const current = reportPlot.series, view = reportPlot.view;
-  const data = current && fullSeries && (view[0] < current.from_ms || view[1] > current.to_ms) ? fullSeries : current;
+  return current && fullSeries && (view[0] < current.from_ms || view[1] > current.to_ms) ? fullSeries : current;
+}
+
+function drawReportPlots() {
+  const data = reportPlotData(), view = reportPlot.view;
   reportPlot.axes = reportAxes((data?.channels || []).filter(channel => !reportPlot.hiddenChannels.has(channel.id)),view);
-  const cursor = reportPlot.cursor !== null && reportPlot.summary.sessions.some(s => !reportPlot.hiddenSessions.has(s.id)
-    && reportPlot.cursor >= s.start_ms && reportPlot.cursor < s.end_ms) ? reportPlot.cursor : null;
-  drawEdfChart(document.getElementById('reportEventStrip'),null,data,'#22d3ee',cursor);
+  drawEdfChart(document.getElementById('reportEventStrip'),null,data,'#22d3ee');
   reportPlot.rows.forEach(row => {
     const members = row.channels || [{id:row.channel,title:row.title,value:row.value}];
     const shown = members.filter(member => !reportPlot.hiddenChannels.has(member.id));
@@ -2900,14 +2908,42 @@ function drawReportPlots() {
     for (const member of members) if (member.title) member.title.hidden = !shown.includes(member);
     if (!shown.length) return;
     const channels = shown.map(member => data?.channels?.find(c => c.id === member.id) || {id:member.id});
-    drawEdfChart(row.canvas,channels,data,reportChannelColor(shown[0].id),cursor);
+    drawEdfChart(row.canvas,channels,data,reportChannelColor(shown[0].id));
     row.title.style.color = members.length > 1 ? '' : reportChannelColor(shown[0].id);
+  });
+  drawReportInteraction(data);
+}
+
+function drawReportInteraction(data = reportPlotData()) {
+  const view = reportPlot.view;
+  const cursor = reportPlot.cursor !== null && reportPlot.summary.sessions.some(s => !reportPlot.hiddenSessions.has(s.id)
+    && reportPlot.cursor >= s.start_ms && reportPlot.cursor < s.end_ms) ? reportPlot.cursor : null;
+  const position = time => Math.max(0,Math.min(100,100*(time-view[0])/(view[1]-view[0])));
+  const update = canvas => {
+    const overlay = canvas.reportOverlay;
+    if (!overlay) return;
+    overlay.cursor.hidden = cursor === null || cursor < view[0] || cursor > view[1];
+    if (!overlay.cursor.hidden) overlay.cursor.style.left = position(cursor)+'%';
+    const selection = reportPlot.gesture?.selection;
+    overlay.selection.hidden = !selection || selection[1] <= view[0] || selection[0] >= view[1];
+    if (!overlay.selection.hidden) {
+      const left = position(selection[0]);
+      overlay.selection.style.left = left+'%';
+      overlay.selection.style.width = (position(selection[1])-left)+'%';
+    }
+  };
+  update(document.getElementById('reportEventStrip'));
+  reportPlot.rows.forEach(row => {
+    if (row.card.hidden) return;
+    update(row.canvas);
+    const shown = row.channels.filter(member => !reportPlot.hiddenChannels.has(member.id));
+    const channels = shown.map(member => data?.channels?.find(c => c.id === member.id));
     shown.forEach((member,i) => {
       const bucket = cursor === null ? null : reportArtifactValue(channels[i],cursor);
       const low = reportBucket(bucket) ? reportNumber(bucket[0]) : '--';
       const high = reportBucket(bucket) ? reportNumber(bucket[1]) : '--';
       const text = cursor === null ? '' : low === high ? low : low + '..' + high;
-      (member.value || row.value).textContent = text ? (members.length > 1 ? ' ' : '') + text : '';
+      (member.value || row.value).textContent = text ? (row.channels.length > 1 ? ' ' : '') + text : '';
     });
   });
   document.getElementById('reportCursor').textContent = cursor === null ? '' : reportTime(cursor).slice(11);
@@ -2919,8 +2955,23 @@ function reportPointerX(canvas, clientX) {
 }
 
 function bindReportPlot(canvas) {
+  if (!reportPlot.resizeObserver && typeof ResizeObserver === 'function') {
+    reportPlot.resizeObserver = new ResizeObserver(entries => {
+      if (reportPlot.view && entries.some(entry => entry.contentRect.width > 0 && entry.contentRect.height > 0)) scheduleReportDraw();
+    });
+    reportPlot.resizeObserver.observe(document.getElementById('reportPlots'));
+    reportPlot.resizeObserver.observe(document.getElementById('reportEventCard'));
+  }
   if (canvas.dataset.reportBound) return;
   canvas.dataset.reportBound = '1';
+  const surface = document.createElement('div'); surface.className = 'report-chart-surface';
+  canvas.replaceWith(surface); surface.append(canvas);
+  const overlay = document.createElement('div'); overlay.className = 'report-plot-overlay';
+  overlay.setAttribute('aria-hidden','true');
+  const cursor = document.createElement('div'); cursor.className = 'report-plot-cursor'; cursor.hidden = true;
+  const selection = document.createElement('div'); selection.className = 'report-plot-selection'; selection.hidden = true;
+  overlay.append(selection,cursor); surface.append(overlay);
+  canvas.reportOverlay = {cursor,selection};
   canvas.title = 'Drag to zoom; double-click to reset';
   canvas.addEventListener('dblclick', resetReportViewport);
   canvas.addEventListener('keydown', e => {
@@ -2949,7 +3000,7 @@ function bindReportPlot(canvas) {
       minimum,selection:null,awaitDirection:e.pointerType === 'touch' && reportPlot.pointers.size === 1,
       origin:[e.clientX,e.clientY]};
     if (reportPlot.pointers.size === 2) for (const id of reportPlot.pointers.keys()) canvas.setPointerCapture(id);
-    scheduleReportDraw();
+    scheduleReportDraw(false,false);
   });
   const move = e => {
     if (reportLoading || !reportPlot.view) return;
@@ -2983,7 +3034,7 @@ function bindReportPlot(canvas) {
       }
     }
     reportPlot.cursor = reportPlot.view[0]+x*(reportPlot.view[1]-reportPlot.view[0]);
-    scheduleReportDraw();
+    scheduleReportDraw(false,false);
   };
   canvas.addEventListener('pointermove', move);
   const release = (e, cancelled = false) => {
@@ -3017,7 +3068,7 @@ function bindReportPlot(canvas) {
   canvas.addEventListener('pointercancel', e => release(e,true));
   canvas.addEventListener('lostpointercapture', e => release(e,true));
   canvas.addEventListener('pointerleave', () => {
-    if (!reportPlot.gesture) { reportPlot.cursor = null; scheduleReportDraw(); }
+    if (!reportPlot.gesture) { reportPlot.cursor = null; scheduleReportDraw(false,false); }
   });
 }
 
