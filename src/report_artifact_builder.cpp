@@ -104,6 +104,29 @@ bool document_path(const char *prefix, const uint8_t hash[32], char (&out)[PATH_
     return true;
 }
 
+bool document_content(const SdStorage::Session &session, const char *prefix,
+                      const Document &document, aircannect::LargeTextBuffer *out) {
+    char path[PATH_BYTES];
+    SdStorage::Reader reader;
+    if (!document_path(prefix, document.digest, path) || !reader.open(session, path) ||
+        reader.size() != document.bytes || (out && !out->reserve(document.bytes))) return false;
+    if (out) out->clear();
+    Digest digest;
+    uint8_t bytes[1024], hash[32];
+    for (size_t at = 0; at < document.bytes;) {
+        const size_t count = std::min(sizeof(bytes), size_t(document.bytes - at));
+        if (reader.read(bytes, count) != count || !digest.add(bytes, count) ||
+            (out && !out->append(reinterpret_cast<const char *>(bytes), count))) {
+            if (out) out->clear();
+            return false;
+        }
+        at += count;
+    }
+    const bool valid = digest.finish(hash) && !memcmp(hash, document.digest, 32);
+    if (!valid && out) out->clear();
+    return valid;
+}
+
 Lookup document_head(const SdStorage::Session &session, const char *prefix, unsigned slot, Document &out) {
     char path[PATH_BYTES];
     snprintf(path, sizeof(path), "%s.head%u", prefix, slot);
@@ -120,8 +143,7 @@ Lookup document_head(const SdStorage::Session &session, const char *prefix, unsi
     memcpy(out.key, bytes + 16, 32);
     memcpy(out.digest, bytes + 48, 32);
     reader.close();
-    if (!document_path(prefix, out.digest, path) || !reader.open(session, path)) return Lookup::Failed;
-    return reader.size() == out.bytes ? Lookup::Ready : Lookup::Invalid;
+    return document_content(session, prefix, out, nullptr) ? Lookup::Ready : Lookup::Invalid;
 }
 }  // namespace
 
@@ -143,20 +165,7 @@ Lookup document_lookup(const SdStorage::Session &session, const char *prefix,
 
 bool document_read(const SdStorage::Session &session, const char *prefix,
                    const Document &document, aircannect::LargeTextBuffer &out) {
-    char path[PATH_BYTES];
-    SdStorage::Reader reader;
-    if (!document_path(prefix, document.digest, path) || !reader.open(session, path) ||
-        reader.size() != document.bytes || !out.reserve(document.bytes)) return false;
-    Digest digest;
-    uint8_t bytes[1024], hash[32];
-    for (size_t at = 0; at < document.bytes;) {
-        const size_t count = std::min(sizeof(bytes), size_t(document.bytes - at));
-        if (reader.read(bytes, count) != count || !digest.add(bytes, count) ||
-            !out.append(reinterpret_cast<const char *>(bytes), count)) { out.clear(); return false; }
-        at += count;
-    }
-    if (!digest.finish(hash) || memcmp(hash, document.digest, 32)) { out.clear(); return false; }
-    return true;
+    return document_content(session, prefix, document, &out);
 }
 
 bool document_publish(const SdStorage::Session &session, const char *prefix,
@@ -208,6 +217,9 @@ bool document_publish(const SdStorage::Session &session, const char *prefix,
     memcpy(head + 48, out.digest, 32);
     SdStorage::put_le32(head + 80, crc32_ieee(head, 80));
     if (!writer.open(session, part) || !writer.write(head, sizeof(head)) || !writer.finish(sizeof(head))) return false;
+    if (!reader.open(session, part) || reader.size() != sizeof(head) ||
+        reader.read(block, sizeof(head)) != sizeof(head) || memcmp(block, head, sizeof(head))) return false;
+    reader.close();
     snprintf(path, sizeof(path), "%s.head%u", prefix, unsigned(out.generation & 1));
     return session.run([&](fs::FS &fs) {
         // Only the inactive head is replaced. The previous content/head survive.

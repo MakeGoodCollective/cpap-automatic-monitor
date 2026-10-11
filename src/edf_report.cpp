@@ -21,7 +21,7 @@ bool Request::operator==(const Request &other) const {
 bool valid(const Request &request) {
     if (request.action > Action::Prepare || request.view > View::Period ||
         request.day == UINT16_MAX) return false;
-    if ((request.action == Action::History || request.action == Action::Prepare) && request.view != View::Day) return false;
+    if (request.action == Action::History && request.view != View::Day) return false;
     if (request.view == View::Period && request.period != 1 && request.period != 7 &&
         request.period != 30 && request.period != 90 && request.period != 180 &&
         request.period != 365) return false;
@@ -352,6 +352,9 @@ uint32_t next_id = 1, data_revision = 1;
 uint32_t foreground_epoch = 0;
 uint32_t backfill_revision = 0;
 uint16_t backfill_before = UINT16_MAX;
+uint8_t backfill_period = 0;
+constexpr uint16_t PERIODS[] = {1, 7, 30, 90, 180, 365};
+uint32_t published_index_data = 0, published_index_artifacts = UINT32_MAX;
 uint32_t background_retry = 0;
 bool backfill_enabled = true;
 IndexedSession *index = nullptr;
@@ -555,10 +558,9 @@ bool refresh_index(const SdStorage::Session &session) {
                 if (index[i].day) invalidate_day(index[i].day);
                 invalidate_day(next.day);
             }
-            index_error = "cache_retire";
-            if (index[i].entry.file_prefix[0] && index[i].key.present && (changed || key_changed) &&
-                (next.key.present & index[i].key.present) == index[i].key.present &&
-                !retire_cache(session, index[i])) { index_ready = false; return false; }
+            // A changed fingerprint is not proof that the sources can rebuild
+            // the old cache. Its header rejects mismatches; retain the bytes
+            // until a validated replacement is available.
             detail_changed |= changed || key_changed;
             if (!changed && !key_changed) {
                 next.start_ms = index[i].start_ms;
@@ -1405,6 +1407,11 @@ void publication_prefix(uint16_t day, char (&path)[96]) {
     snprintf(path, sizeof(path), "%s/day-%u", CACHE_DIR, unsigned(day));
 }
 
+void period_prefix(const Request &request, char (&path)[96]) {
+    snprintf(path, sizeof(path), "%s/period-%u-%u", CACHE_DIR,
+             unsigned(last_day(request)), unsigned(request.period));
+}
+
 bool publication_key(const Request &request, uint8_t (&key)[32]) {
     Payload identity;
     const uint16_t last = last_day(request);
@@ -1440,7 +1447,30 @@ bool artifact_headroom(const SdStorage::Session &session, uint16_t day) {
     return storage.total_bytes > storage.used_bytes && storage.total_bytes - storage.used_bytes >= needed + reserve;
 }
 
+bool prepare_period(const SdStorage::Session &session, Job &job) {
+    if (!dataset(session)) return note_issue(job, "dataset_identity");
+    char prefix[96]; uint8_t key[32];
+    period_prefix(job.request, prefix);
+    if (!publication_key(job.request, key)) return note_issue(job, "publication_key");
+    ReportArtifact::Document document;
+    if (ReportArtifact::document_lookup(session, prefix, key, document) == ReportArtifact::Lookup::Ready)
+        return ReportArtifact::document_read(session, prefix, document, job.body);
+    if (!summary_json(session, job) || job.issue || aborted(&job, session)) return false;
+    EdfCatalog::Status current;
+    EdfCatalog::get_status(current);
+    if (current.generation != catalog_generation || SdStorage::files_revision() != file_revision) return false;
+    if (!ReportArtifact::document_publish(session, prefix, key,
+        reinterpret_cast<const uint8_t *>(job.body.c_str()), job.body.length(), document))
+        return note_issue(job, "publication_write", prefix);
+    portENTER_CRITICAL(&status_mux);
+    ++status.artifact_revision;
+    ++status.revision;
+    portEXIT_CRITICAL(&status_mux);
+    return true;
+}
+
 bool prepare_json(const SdStorage::Session &session, Job &job) {
+    if (job.request.view == View::Period) return prepare_period(session, job);
     const uint16_t day = last_day(job.request);
     if (!dataset(session)) return note_issue(job, "dataset_identity");
     char manifest[96], identity[65]; uint8_t manifest_key[32];
@@ -1603,9 +1633,41 @@ bool days_json(const SdStorage::Session &session, Job &job) {
         job.body.print("}");
         n = end;
     }
+    job.body.print("],\"periods\":[");
+    bool period_comma = false;
+    for (uint16_t period : PERIODS) {
+        Request request; request.view = View::Period; request.period = period;
+        char prefix[96]; uint8_t key[32];
+        period_prefix(request, prefix);
+        ReportArtifact::Document document;
+        if (!publication_key(request, key) || ReportArtifact::document_lookup(session, prefix, nullptr, document)
+            != ReportArtifact::Lookup::Ready) continue;
+        char digest[65];
+        aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+        job.body.print("%s{\"period\":%u,\"day\":\"index\",\"digest\":\"%s\",\"bytes\":%u,\"stale\":%s}",
+            period_comma ? "," : "", period, digest, document.bytes, memcmp(key, document.key, 32) ? "true" : "false");
+        period_comma = true;
+    }
     job.body.print("]}");
     aircannect::Memory::free(days);
     return job.body.good();
+}
+
+bool publish_index(const SdStorage::Session &session) {
+    const uint32_t artifacts = status.artifact_revision;
+    const uint32_t data = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
+    if (published_index_data == data && published_index_artifacts == artifacts) return true;
+    Job snapshot;
+    snapshot.data_revision = data;
+    if (!days_json(session, snapshot)) return false;
+    ReportArtifact::Document document;
+    uint8_t key[32];
+    if (!ReportArtifact::fingerprint(reinterpret_cast<const uint8_t *>(snapshot.body.c_str()), snapshot.body.length(), key) ||
+        !ReportArtifact::document_publish(session, "/airbridge/report/index", key,
+            reinterpret_cast<const uint8_t *>(snapshot.body.c_str()), snapshot.body.length(), document)) return false;
+    published_index_data = data;
+    published_index_artifacts = artifacts;
+    return true;
 }
 
 struct Aggregate {
@@ -2577,23 +2639,31 @@ void defer_job(Job *job) {
 bool enqueue_backfill(const SdStorage::Session &session) {
     if (!backfill_enabled || ExportSync::busy()) return false;
     if (background_retry && int32_t(millis() - background_retry) < 0) return false;
-    if (background_retry) { background_retry = 0; backfill_before = UINT16_MAX; }
+    if (background_retry) { background_retry = 0; backfill_before = UINT16_MAX; backfill_period = 0; }
     const uint32_t current = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
-    if (backfill_revision != current) { backfill_revision = current; backfill_before = UINT16_MAX; }
+    if (backfill_revision != current) { backfill_revision = current; backfill_before = UINT16_MAX; backfill_period = 0; }
     uint16_t day = 0;
     for (size_t i = 0; i < index_count; ++i)
         if (selected(index[i], 1, backfill_before - (backfill_before != 0))) day = std::max(day, index[i].day);
-    if (!day || !backfill_before) return false;
+    if (!day) backfill_before = 0;
+    if (!day && backfill_period >= sizeof(PERIODS) / sizeof(PERIODS[0])) return false;
     if (!dataset(session)) return false;
     Request request; request.action = Action::Prepare; request.day = day;
     char prefix[96]; uint8_t key[32];
-    publication_prefix(day, prefix);
+    if (day) publication_prefix(day, prefix);
+    else {
+        request.view = View::Period; request.period = PERIODS[backfill_period];
+        period_prefix(request, prefix);
+    }
     if (!publication_key(request, key)) return false;
     ReportArtifact::Document document;
     const bool ready = ReportArtifact::document_lookup(session, prefix, key, document) == ReportArtifact::Lookup::Ready;
     strcat(prefix, ".refused");
     const bool refused = ReportArtifact::document_lookup(session, prefix, key, document) == ReportArtifact::Lookup::Ready;
-    if (ready || refused) { backfill_before = day; return true; }
+    if (ready || refused) {
+        if (day) backfill_before = day; else ++backfill_period;
+        return true;
+    }
     xSemaphoreTake(mutex, portMAX_DELAY);
     Job *slot = nullptr;
     for (auto &candidate : jobs) if (reusable(candidate) || evictable(candidate)) { slot = &candidate; break; }
@@ -2631,14 +2701,27 @@ bool work_once() {
     if (job && job->background && ExportSync::busy()) {
         defer_job(job); publish(State::WaitingStorage, "export_pending"); return false;
     }
-    if (!job && !dirty() && (!backfill_enabled || !backfill_before || ExportSync::busy() ||
+    if (!job && !dirty() && published_index_artifacts == status.artifact_revision &&
+        (!backfill_enabled || (!backfill_before && backfill_period >= sizeof(PERIODS) / sizeof(PERIODS[0])) || ExportSync::busy() ||
         (background_retry && int32_t(millis() - background_retry) < 0))) { publish(State::Ready); return false; }
     SdStorage::Session session;
     if (!session.begin()) { defer_job(job); publish(State::WaitingStorage, "storage_busy"); return false; }
     JobTiming timing(job);
     publish(State::Building);
     const uint32_t index_started = timing.stamp();
-    const bool indexed = refresh_index(session);
+    bool recovered_index = false;
+    if (job && job->request.action == Action::Days && !index_ready) {
+        ReportArtifact::Document document;
+        Payload saved;
+        if (ReportArtifact::document_lookup(session, "/airbridge/report/index", nullptr, document) == ReportArtifact::Lookup::Ready &&
+            ReportArtifact::document_read(session, "/airbridge/report/index", document, saved) &&
+            saved.length() && saved.c_str()[0] == '{') {
+            job->body.print("{\"stale\":true,");
+            job->body.append(saved.c_str() + 1, saved.length() - 1);
+            recovered_index = job->body.good();
+        }
+    }
+    const bool indexed = recovered_index || refresh_index(session);
     timing.index_us = timing.stamp() - index_started;
     if (!indexed) {
         const bool preempted = !session.valid() || !AirSenseState::local_background_allowed();
@@ -2676,6 +2759,7 @@ bool work_once() {
         reported_index_error = nullptr;
     }
     if (!job) {
+        if (!publish_index(session)) Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
         const bool more = enqueue_backfill(session);
         session.end();
         publish(State::Ready);
@@ -2694,7 +2778,8 @@ bool work_once() {
     else if (job->request.revision && job->request.revision != job->data_revision)
         error_body(*job, 409, "stale_revision");
     else {
-        if (job->request.action == Action::History) {
+        if (recovered_index) success = true;
+        else if (job->request.action == Action::History) {
             start_json(job->body, revision() + 1, job->data_revision);
             job->body.print("\"day\":%u", last_day(job->request));
             success = history_json(session, *job, true);
@@ -2707,15 +2792,18 @@ bool work_once() {
     const bool interrupted = !AirSenseState::local_background_allowed() || !session.valid();
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
-    const bool changed = catalog.generation != catalog_generation || SdStorage::files_revision() != file_revision ||
-        job->data_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
+    const bool changed = !recovered_index && (catalog.generation != catalog_generation || SdStorage::files_revision() != file_revision ||
+        job->data_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE));
     const bool yielded = job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
     if (job->background && !interrupted && !changed && !yielded) {
-        backfill_before = job->request.day;
+        if (job->request.view == View::Period) ++backfill_period;
+        else backfill_before = job->request.day;
         if (!success && job->issue && (!strcmp(job->issue, "partial_source") ||
             !strcmp(job->issue, "source_header") || !strcmp(job->issue, "artifact_lookup"))) {
             char prefix[96]; uint8_t key[32]; ReportArtifact::Document refused;
-            publication_prefix(job->request.day, prefix); strcat(prefix, ".refused");
+            if (job->request.view == View::Period) period_prefix(job->request, prefix);
+            else publication_prefix(job->request.day, prefix);
+            strcat(prefix, ".refused");
             if (publication_key(job->request, key)) ReportArtifact::document_publish(session, prefix, key,
                 reinterpret_cast<const uint8_t *>(job->issue), strlen(job->issue), refused);
         } else if (!success && (!job->issue || strcmp(job->issue, "recording_headroom"))) background_retry = millis() + 30000;

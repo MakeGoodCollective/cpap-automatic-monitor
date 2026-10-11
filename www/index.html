@@ -1932,13 +1932,17 @@ async function loadArtifactReport(view, selection, generation, signal) {
       if (!saved) throw new Error('This period is not cached');
       return {...saved,stale:true};
     }
-    const data = await edfReportRequest('summary','action=summary&view=period&period='+selection,generation,signal);
+    const period = [1,7,30,90,180,365][selection];
+    const publication = days.periods?.find(p => p.period === period && !p.stale);
+    const data = publication
+      ? JSON.parse(new TextDecoder().decode(await reportArtifactBytes(days.dataset,publication,true,signal)))
+      : await edfReportRequest('summary','action=prepare&view=period&period='+selection,generation,signal);
     await reportStoreBinary(key,data);
-    return data;
+    return {...data,stale:!!days.stale};
   }
   const chosen = dates.find(d => d.day === (selection || dates.at(-1)?.day));
   const day = chosen?.day || selection || 0;
-  let manifest = null, stale = !!chosen?.stale || offline;
+  let manifest = null, stale = !!chosen?.stale || !!days.stale || offline;
   const saved = await reportCachedBinary('day:'+days.dataset+':'+day);
   if (saved && (offline || saved.identity === chosen?.identity)) manifest = saved;
   if (!manifest && chosen?.publication) {
