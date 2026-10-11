@@ -80,7 +80,7 @@ Result::Result(Result &&other) noexcept
 namespace EdfReport {
 namespace {
 constexpr uint32_t STATS_CACHE_VERSION = 7;
-constexpr uint32_t SERIES_CACHE_VERSION = 6;
+constexpr uint32_t SERIES_CACHE_VERSION = 7;
 constexpr size_t MAX_BINS = 16384;
 constexpr size_t MAX_EVENTS = 4096;
 constexpr size_t MAX_DISK_EVENTS = 65536;
@@ -94,8 +94,10 @@ constexpr size_t SLOT_COUNT = 2;
 constexpr size_t RETAINED_SLOTS = 32;
 constexpr size_t CHART_CHANNEL_COUNT = 11;
 constexpr double LEAK_THRESHOLD = 24;
-constexpr int64_t LEVEL_MS[] = {10000, 60000, 600000, 3600000};
+constexpr int64_t LEVEL_MS[] = {2000, 10000, 60000, 600000, 3600000};
 constexpr size_t LEVEL_COUNT = sizeof(LEVEL_MS) / sizeof(LEVEL_MS[0]);
+constexpr int64_t FINE_BLOCK_MS = 60000;
+constexpr size_t FINE_BLOCK_CELLS = FINE_BLOCK_MS / LEVEL_MS[0];
 constexpr const char *CACHE_DIR = "/airbridge/report";
 constexpr const char *SUFFIXES[] = {"BRP", "PLD", "SAD", "EVE", "CSL"};
 
@@ -685,6 +687,25 @@ struct Input {
             }
         }
         return true;
+    }
+
+    template <typename Sink>
+    bool scan_window(const int *signals, size_t count, int64_t from, int64_t to, Sink consume) {
+        const int64_t origin = header->start_seconds * 1000;
+        const double record_ms = header->record_seconds * 1000;
+        const uint32_t first = std::min<double>(header->records,
+            std::max<double>(0, std::floor((from - origin) / record_ms)));
+        const uint32_t last = std::min<double>(header->records,
+            std::max<double>(0, std::ceil((to - origin) / record_ms)));
+        return scan_records(signals, count, first, last,
+            [&](size_t c, uint64_t base, const ReportEdf::RecordSamples &samples) {
+                const double step = record_ms / samples.signal->samples_per_record;
+                const uint64_t begin = std::max<uint64_t>(base,
+                    std::max<double>(0, std::floor((from - origin) / step)));
+                const uint64_t end = std::min<uint64_t>(base + samples.signal->samples_per_record,
+                    std::max<double>(0, std::ceil((to - origin) / step)));
+                return consume(c, base, begin, end, samples);
+            });
     }
 };
 
@@ -1473,6 +1494,8 @@ struct ReducedHeader {
     uint32_t version = SERIES_CACHE_VERSION, header_bytes = sizeof(ReducedHeader);
     uint64_t bytes = 0;
     SourceKey key;
+    uint32_t fine = 0;
+    uint32_t fine_stride[3] = {};
     ReducedChannel channels[CHART_CHANNEL_COUNT + 1];
 };
 
@@ -1644,25 +1667,65 @@ bool prune_cache(const SdStorage::Session &session, uint64_t needed, const char 
     }
 }
 
-bool reduced_header(const SdStorage::Session &session, const IndexedSession &entry,
-                    ReducedHeader &out) {
-    char path[96];
-    cache_path(entry, "series", path);
-    SdStorage::Reader reader;
-    if (!reader.open(session, path) || reader.read(reinterpret_cast<uint8_t *>(&out), sizeof(out)) != sizeof(out) ||
-        memcmp(out.magic, "ABSER01", 8) || out.version != SERIES_CACHE_VERSION ||
-        out.header_bytes != sizeof(out) || !(out.key == entry.key) || out.bytes != reader.size()) return false;
+bool reduced_layout(ReducedHeader &out, bool initialize) {
+    if (out.fine > 1) return false;
     uint64_t offset = sizeof(out);
     for (const auto &channel : out.channels) {
         if (channel.end_ms < 0) return false;
         for (size_t n = 0; n < LEVEL_COUNT; ++n) {
             const auto &level = channel.levels[n];
-            if (level.offset != offset || level.count > uint64_t(86400000 / LEVEL_MS[n] + 2) ||
+            const uint64_t limit = n ? 86400000 / LEVEL_MS[n] + 2
+                                     : (86400000 / FINE_BLOCK_MS + 2) * FINE_BLOCK_CELLS;
+            if ((!n && !out.fine && level.count) || level.count > limit ||
                 level.start_ms < 0 || level.start_ms % LEVEL_MS[n]) return false;
+        }
+    }
+    // Fine data is minute-major within each source file. Coarser levels keep
+    // their contiguous channel-major layout, independent of recording length.
+    for (uint8_t kind = 0; kind < 3; ++kind) {
+        uint32_t stride = 0, count = 0;
+        int64_t start = 0;
+        for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
+            if (chart_file(c) != kind) continue;
+            auto &level = out.channels[c].levels[0];
+            if (!level.count) {
+                if (level.offset) return false;
+                continue;
+            }
+            if (level.count % FINE_BLOCK_CELLS || level.start_ms % FINE_BLOCK_MS ||
+                (stride && (level.count != count || level.start_ms != start))) return false;
+            count = level.count;
+            start = level.start_ms;
+            const uint64_t channel_offset = offset + uint64_t(stride) * sizeof(Cell);
+            if (initialize) level.offset = channel_offset;
+            else if (level.offset != channel_offset) return false;
+            stride += FINE_BLOCK_CELLS;
+        }
+        if (initialize) out.fine_stride[kind] = stride;
+        else if (out.fine_stride[kind] != stride) return false;
+        offset += uint64_t(count / FINE_BLOCK_CELLS) * stride * sizeof(Cell);
+    }
+    for (auto &channel : out.channels) {
+        for (size_t n = 1; n < LEVEL_COUNT; ++n) {
+            auto &level = channel.levels[n];
+            if (initialize) level.offset = offset;
+            else if (level.offset != offset) return false;
             offset += uint64_t(level.count) * sizeof(Cell);
         }
     }
+    if (initialize) out.bytes = offset;
     return offset == out.bytes;
+}
+
+bool reduced_header(const SdStorage::Session &session, const IndexedSession &entry,
+                    ReducedHeader &out) {
+    char path[96];
+    cache_path(entry, "series", path);
+    SdStorage::Reader reader;
+    return reader.open(session, path) && reader.read(reinterpret_cast<uint8_t *>(&out), sizeof(out)) == sizeof(out) &&
+        !memcmp(out.magic, "ABSER01", 8) && out.version == SERIES_CACHE_VERSION &&
+        out.header_bytes == sizeof(out) && out.key == entry.key && out.bytes == reader.size() &&
+        reduced_layout(out, false);
 }
 
 void cell_sample(Cell *cells, uint32_t count, int64_t start_ms, int64_t step_ms,
@@ -1682,9 +1745,10 @@ void cell_sample(Cell *cells, uint32_t count, int64_t start_ms, int64_t step_ms,
 }
 
 bool build_reduced(const SdStorage::Session &session, const Job &job,
-                   const IndexedSession &entry, ReducedHeader &out) {
+                   const IndexedSession &entry, bool fine, ReducedHeader &out) {
     out = {};
     out.key = entry.key;
+    out.fine = fine;
     Input input(session, job);
     for (uint8_t kind = 0; kind < 3; ++kind) {
         if (!(entry.key.present & (1u << kind))) continue;
@@ -1697,30 +1761,26 @@ bool build_reduced(const SdStorage::Session &session, const Job &job,
             auto &channel = out.channels[c];
             channel.end_ms = end;
             for (size_t n = 0; n < LEVEL_COUNT; ++n) {
+                if (!n && !fine) continue;
                 auto &level = channel.levels[n];
-                level.start_ms = start / LEVEL_MS[n] * LEVEL_MS[n];
-                level.count = end > start ? (end - level.start_ms + LEVEL_MS[n] - 1) / LEVEL_MS[n] : 0;
+                const int64_t block = n ? LEVEL_MS[n] : FINE_BLOCK_MS;
+                level.start_ms = start / block * block;
+                level.count = end > start ? ((end - level.start_ms + block - 1) / block) * (block / LEVEL_MS[n]) : 0;
             }
         }
         input.file.close();
     }
-    uint64_t offset = sizeof(out);
-    for (auto &channel : out.channels) {
-        for (auto &level : channel.levels) {
-            level.offset = offset;
-            offset += uint64_t(level.count) * sizeof(Cell);
-        }
-    }
-    out.bytes = offset;
+    if (!reduced_layout(out, true)) return false;
     char path[96], part[96];
     cache_path(entry, "series", path);
     cache_path(entry, "series.part", part);
     if (!prune_cache(session, out.bytes, path)) return false;
     PartGuard part_guard{session, part};
     if (!start_part(session, part, reinterpret_cast<const uint8_t *>(&out), sizeof(out))) return false;
-    // Retain only reduced cells, never the session's raw/decoded samples. At
-    // most 24 h x 12 channels x the four LODs: under 1.5 MB, including on GEEK.
-    const size_t bytes = out.bytes - sizeof(out);
+    // Keep only the coarse levels (under 1.5 MB for 24 h x 12 channels).
+    // Fine cells are appended one minute at a time, not retained for the day.
+    const uint64_t coarse_offset = out.channels[0].levels[1].offset;
+    const size_t bytes = out.bytes - coarse_offset;
     std::unique_ptr<Cell, decltype(&aircannect::Memory::free)> cells(
         bytes ? static_cast<Cell *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK)) : nullptr,
         aircannect::Memory::free);
@@ -1728,28 +1788,49 @@ bool build_reduced(const SdStorage::Session &session, const Job &job,
     for (size_t i = 0; i < bytes / sizeof(Cell); ++i) new (cells.get() + i) Cell;
     for (uint8_t kind = 0; kind < 3; ++kind) {
         if (!(entry.key.present & (1u << kind))) continue;
+        const size_t stride = out.fine_stride[kind];
         if (!input.open(session, entry, kind)) return false;
         int signals[CHART_CHANNEL_COUNT + 1];
         chart_signals(*input.header, kind, signals);
-        if (!input.scan_records(signals, CHART_CHANNEL_COUNT + 1, 0, input.header->records,
-            [&](size_t c, uint64_t first, const ReportEdf::RecordSamples &samples) {
-                const auto &channel = out.channels[c];
-                const double step = input.header->record_seconds * 1000 / samples.signal->samples_per_record;
-                const int64_t origin = input.header->start_seconds * 1000;
-                const double scale = chart_scale(c, *samples.signal);
-                for (uint32_t i = 0; i < samples.signal->samples_per_record; ++i) {
-                    const auto sample = samples[i];
-                    const int64_t begin = origin + llround((first + i) * step);
-                    const int64_t end = origin + llround((first + i + 1) * step);
-                    for (size_t n = 0; n < LEVEL_COUNT; ++n) {
-                        const auto &level = channel.levels[n];
-                        cell_sample(cells.get() + (level.offset - sizeof(out)) / sizeof(Cell),
-                                    level.count, level.start_ms, LEVEL_MS[n], begin, end,
-                                    sample.value * scale, sample.valid);
+        size_t fine_offsets[CHART_CHANNEL_COUNT + 1], fine_count = 0;
+        for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
+            fine_offsets[c] = fine_count;
+            if (signals[c] >= 0) fine_count += FINE_BLOCK_CELLS;
+        }
+        if (fine && fine_count != stride && input.header->records) return false;
+        const size_t fine_bytes = stride * sizeof(Cell);
+        std::unique_ptr<Cell, decltype(&aircannect::Memory::free)> fine_cells(
+            fine_bytes ? static_cast<Cell *>(aircannect::Memory::alloc_large(fine_bytes, fine_bytes <= INTERNAL_WORK)) : nullptr,
+            aircannect::Memory::free);
+        if (fine_bytes && !fine_cells) return false;
+        int64_t start = 0, end = 0;
+        if (!numeric_extent(*input.header, start, end)) return false;
+        const int64_t origin = input.header->start_seconds * 1000;
+        for (int64_t block = start / FINE_BLOCK_MS * FINE_BLOCK_MS; block < end; block += FINE_BLOCK_MS) {
+            for (size_t i = 0; i < stride; ++i) new (fine_cells.get() + i) Cell;
+            if (!input.scan_window(signals, CHART_CHANNEL_COUNT + 1, block, block + FINE_BLOCK_MS,
+                [&](size_t c, uint64_t base, uint64_t first, uint64_t last, const ReportEdf::RecordSamples &samples) {
+                    const auto &channel = out.channels[c];
+                    const double step = input.header->record_seconds * 1000 / samples.signal->samples_per_record;
+                    const double scale = chart_scale(c, *samples.signal);
+                    for (uint64_t i = first; i < last; ++i) {
+                        const auto sample = samples[i - base];
+                        const int64_t begin = std::max<int64_t>(block, origin + llround(i * step));
+                        const int64_t end = std::min<int64_t>(block + FINE_BLOCK_MS, origin + llround((i + 1) * step));
+                        if (fine)
+                            cell_sample(fine_cells.get() + fine_offsets[c], FINE_BLOCK_CELLS, block, LEVEL_MS[0],
+                                        begin, end, sample.value * scale, sample.valid);
+                        for (size_t n = 1; n < LEVEL_COUNT; ++n) {
+                            const auto &level = channel.levels[n];
+                            cell_sample(cells.get() + (level.offset - coarse_offset) / sizeof(Cell),
+                                        level.count, level.start_ms, LEVEL_MS[n], begin, end,
+                                        sample.value * scale, sample.valid);
+                        }
                     }
-                }
-                return true;
-            })) return false;
+                    return true;
+                })) return false;
+            if (!append_part(session, part, reinterpret_cast<const uint8_t *>(fine_cells.get()), fine_bytes)) return false;
+        }
         input.file.close();
     }
     if (!append_part(session, part, reinterpret_cast<const uint8_t *>(cells.get()), bytes)) return false;
@@ -1771,7 +1852,7 @@ struct Series {
         from_ms = request.from_ms;
         to_ms = request.to_ms;
         step_ms = (to_ms - from_ms + request.px - 1) / request.px;
-        if (step_ms >= 10000) {
+        if (step_ms >= LEVEL_MS[0]) {
             for (size_t n = 0; n < LEVEL_COUNT; ++n)
                 if (LEVEL_MS[n] <= step_ms) level_index = n;
             level_ms = LEVEL_MS[level_index];
@@ -1865,12 +1946,58 @@ void series_channel_json(Payload &out, const Series &series, size_t channel) {
 bool cached_series(const SdStorage::Session &session, const Job &job,
                    const IndexedSession &entry, Series &series) {
     ReducedHeader header;
-    if (!reduced_header(session, entry, header) && !build_reduced(session, job, entry, header))
-        return note_issue(job, "series_cache_build", entry.entry.file_prefix);
+    const bool fine = !series.level_index;
+    if (!reduced_header(session, entry, header) || (fine && !header.fine))
+        if (!build_reduced(session, job, entry, fine, header))
+            return note_issue(job, "series_cache_build", entry.entry.file_prefix);
     char path[96];
     cache_path(entry, "series", path);
     SdStorage::Reader reader;
     if (!reader.open(session, path)) return false;
+    auto add = [&](size_t c, int64_t begin, const Cell &cell) {
+        if (cell.covered_ms > series.level_ms ||
+            (cell.covered_ms && (!std::isfinite(cell.low) ||
+             !std::isfinite(cell.high) || cell.low > cell.high))) return false;
+        series.add(c, begin, begin + series.level_ms, cell.low, cell.high, cell.covered_ms);
+        return true;
+    };
+    if (!series.level_index) {
+        const size_t stride = *std::max_element(header.fine_stride, header.fine_stride + 3);
+        const size_t bytes = stride * sizeof(Cell);
+        std::unique_ptr<Cell, decltype(&aircannect::Memory::free)> cells(
+            bytes ? static_cast<Cell *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK)) : nullptr,
+            aircannect::Memory::free);
+        if (bytes && !cells) return false;
+        for (uint8_t kind = 0; kind < 3; ++kind) {
+            if (!header.fine_stride[kind]) continue;
+            size_t first_channel = 0;
+            while (chart_file(first_channel) != kind || !header.channels[first_channel].levels[0].count)
+                ++first_channel;
+            const auto &level = header.channels[first_channel].levels[0];
+            const uint32_t first = std::min<int64_t>(level.count / FINE_BLOCK_CELLS,
+                std::max<int64_t>(0, (series.from_ms - level.start_ms) / FINE_BLOCK_MS));
+            const uint32_t last = std::min<int64_t>(level.count / FINE_BLOCK_CELLS,
+                std::max<int64_t>(0, (series.to_ms - level.start_ms + FINE_BLOCK_MS - 1) / FINE_BLOCK_MS));
+            const size_t block_bytes = header.fine_stride[kind] * sizeof(Cell);
+            if (!reader.seek(level.offset + uint64_t(first) * block_bytes)) return false;
+            for (uint32_t n = first; n < last; ++n) {
+                if (aborted(&job, session) || reader.read(reinterpret_cast<uint8_t *>(cells.get()),
+                    block_bytes) != block_bytes) return false;
+                size_t at = 0;
+                const int64_t block = level.start_ms + int64_t(n) * FINE_BLOCK_MS;
+                for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
+                    if (chart_file(c) != kind || !header.channels[c].levels[0].count) continue;
+                    for (size_t i = 0; i < FINE_BLOCK_CELLS; ++i) {
+                        const int64_t begin = block + int64_t(i) * series.level_ms;
+                        if (begin >= series.from_ms && begin < series.to_ms &&
+                            !add(c, begin, cells.get()[at + i])) return false;
+                    }
+                    at += FINE_BLOCK_CELLS;
+                }
+            }
+        }
+        return true;
+    }
     Cell cells[64];
     for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
         const auto &channel = header.channels[c];
@@ -1888,11 +2015,7 @@ bool cached_series(const SdStorage::Session &session, const Job &job,
                 take * sizeof(Cell)) != take * sizeof(Cell)) return false;
             for (size_t i = 0; i < take; ++i) {
                 const int64_t begin = start + (n + i) * series.level_ms;
-                if (cells[i].covered_ms > series.level_ms ||
-                    (cells[i].covered_ms && (!std::isfinite(cells[i].low) ||
-                     !std::isfinite(cells[i].high) || cells[i].low > cells[i].high))) return false;
-                series.add(c, begin, begin + series.level_ms, cells[i].low,
-                           cells[i].high, cells[i].covered_ms);
+                if (!add(c, begin, cells[i])) return false;
             }
             n += take;
         }
@@ -1910,18 +2033,11 @@ bool window_series(const SdStorage::Session &session, const Job &job,
         chart_signals(*input.header, kind, signals);
         const int64_t origin = input.header->start_seconds * 1000;
         const double record_ms = input.header->record_seconds * 1000;
-        const uint32_t first = std::min<double>(input.header->records,
-            std::max<double>(0, std::floor((series.from_ms - origin) / record_ms)));
-        const uint32_t last = std::min<double>(input.header->records,
-            std::max<double>(0, std::ceil((series.to_ms - origin) / record_ms)));
-        if (!input.scan_records(signals, CHART_CHANNEL_COUNT + 1, first, last,
-            [&](size_t c, uint64_t base, const ReportEdf::RecordSamples &samples) {
+        if (!input.scan_window(signals, CHART_CHANNEL_COUNT + 1, series.from_ms, series.to_ms,
+            [&](size_t c, uint64_t base, uint64_t begin_sample, uint64_t end_sample,
+                const ReportEdf::RecordSamples &samples) {
                 const auto &spec = *samples.signal;
                 const double step = record_ms / spec.samples_per_record;
-                const uint64_t begin_sample = std::max<uint64_t>(base,
-                    std::max<double>(0, std::floor((series.from_ms - origin) / step)));
-                const uint64_t end_sample = std::min<uint64_t>(base + spec.samples_per_record,
-                    std::max<double>(0, std::ceil((series.to_ms - origin) / step)));
                 const double scale = chart_scale(c, spec);
                 for (uint64_t n = begin_sample; n < end_sample; ++n) {
                     const auto sample = samples[n - base];
