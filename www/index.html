@@ -507,7 +507,7 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
               </div>
             </div>
           </div>
-          <div class="btn-row"><button class="btn" id="reportLatest" onclick="loadReport(true)" title="Last saved day">Latest</button><button class="btn btn-accent" id="reportRefresh" onclick="loadReport()">Refresh</button></div>
+          <div class="btn-row"><button class="btn" id="reportLatest" onclick="loadReport(true)" title="Last saved day">Latest</button><button class="btn btn-accent" id="reportRefresh" onclick="loadReport(false,true)">Refresh</button></div>
           </div>
           <div class="msg" id="reportMsg" role="status"></div>
           <p class="report-note" id="reportAvailability" role="status"></p>
@@ -1368,12 +1368,28 @@ let reportController = null, reportRevision = null, reportEpoch = 0, reportPubli
 let reportDataRevision = null, reportDataEpoch = 0, reportLoading = false, reportDirty = false, reportRefreshQueued = false;
 const reportReads = {};
 const reportCalendar = {days:[], month:null, cache:null, epoch:0};
+class ReportCache extends Map {
+  constructor(limit, bytes) { super(); this.limit = limit; this.budget = bytes; this.sizes = new Map(); this.bytes = 0; }
+  delete(key) { this.bytes -= this.sizes.get(key) || 0; this.sizes.delete(key); return super.delete(key); }
+  clear() { super.clear(); this.sizes.clear(); this.bytes = 0; }
+  remember(key, data) {
+    // Conservative retained-object estimate: JSON strings plus array/object overhead.
+    const bytes = JSON.stringify(data).length*2 + 4096 + (data.events?.length || 0)*192
+      + (data.sessions?.length || 0)*256 + (data.channels || []).reduce((n,c) => n+(c.buckets?.length || 0)*64,0);
+    this.delete(key);
+    if (bytes > this.budget) return;
+    super.set(key,data); this.sizes.set(key,bytes); this.bytes += bytes;
+    while (this.size > this.limit || this.bytes > this.budget) this.delete(this.keys().next().value);
+  }
+}
+const reportSummaries = new ReportCache(64,8*1024*1024);
+function invalidateReportData() { reportSummaries.clear(); reportPlot.cache.clear(); }
 let reportDisplayedSource = null;
 const reportPlot = {summary:null, selection:null, full:null, view:null, fullSeries:null, series:null,
   history:null, historyMetric:null, historyPending:false,
   pending:null, flight:null, serial:0, cursor:null, frame:null, request:false, rows:[],
   axes:null, axesAllSessions:false, hiddenSessions:new Set(), excluded:'', pointers:new Map(), gesture:null,
-  cache:new Map(), hiddenChannels:new Set(), availableChannels:[]};
+  cache:new ReportCache(64,32*1024*1024), hiddenChannels:new Set(), availableChannels:[]};
 
 function reportSource() {
   if (lastStatus.report_source === 'edf') return document.getElementById('reportSourceChoice').value === 'device' ? 'device' : 'edf';
@@ -1384,11 +1400,11 @@ function applyReportStatus(d) {
   const source = reportSource();
   const changed = source !== reportPublishedSource;
   reportPublishedSource = source;
-  if (changed) { reportPlot.cache.clear(); invalidateReportDays(); }
+  if (changed) { invalidateReportData(); invalidateReportDays(); }
   if (d.report_data_revision !== undefined) {
     if (reportDataRevision !== null && d.report_data_revision !== reportDataRevision) {
       reportDataEpoch++;
-      reportPlot.cache.clear();
+      invalidateReportData();
       invalidateReportDays();
       if (source === 'edf' && (reportLoading || (reportPlot.summary && reportPlot.summary.data_revision !== d.report_data_revision))) queueReportRefresh();
     }
@@ -1417,6 +1433,9 @@ function queueReportRefresh() {
 }
 
 function reportReconnect() {
+  // Dataset revisions are boot-local. Reconnect cannot prove the device did not restart.
+  reportDataEpoch++;
+  invalidateReportData();
   invalidateReportDays();
   if (reportLoading) {
     reportDirty = true;
@@ -1645,15 +1664,16 @@ function renderReport(data) {
   if (!data.intervals.length) intervals.textContent = 'No recorded mask intervals';
 }
 
-async function loadReport(latest = false) {
+async function loadReport(latest = false, refresh = false) {
   const generation = ++reportGeneration;
   if (reportController) reportController.abort();
   reportController = new AbortController();
   reportPlot.pending = null; reportPlot.request = false;
   reportPlot.gesture = null; reportPlot.pointers.clear();
-  reportPlot.cache.clear();
   closeReportCalendar();
-  if (reportPublishedSource !== reportSource()) invalidateReportDays();
+  if (refresh || reportPublishedSource !== reportSource()) {
+    invalidateReportData(); invalidateReportDays();
+  }
   reportPublishedSource = reportSource();
   reportLoading = false; reportDirty = false;
   for (const id of ['reportMaskCard','reportChartsCard']) document.getElementById(id).inert = false;
@@ -1702,7 +1722,13 @@ async function loadReport(latest = false) {
       document.getElementById('reportDateButton').textContent = date.value || (dates.length ? date.max : 'No recordings');
       renderReportAvailability();
       const query = 'view=' + view + (day ? '&day=' : '&period=') + selection;
-      data = await edfReportRequest('summary', 'action=summary&' + query, generation, reportController.signal);
+      const key = query + '&revision=' + days.data_revision;
+      data = reportSummaries.get(key);
+      if (!data) {
+        data = await edfReportRequest('summary', 'action=summary&' + query, generation, reportController.signal);
+        // Building another day's cache may enrich an earlier incomplete history.
+        for (const [saved,value] of reportSummaries) if (value.history?.complete === false) reportSummaries.delete(saved);
+      }
       if (generation !== reportGeneration) return;
       if (daysEpoch !== reportCalendar.epoch || (dataEpoch !== reportDataEpoch && data.data_revision !== reportDataRevision)
           || (days.data_revision !== undefined && days.data_revision !== data.data_revision)) {
@@ -1711,6 +1737,7 @@ async function loadReport(latest = false) {
         return;
       }
       reportDirty = false;
+      if (data.partial === false && Number.isInteger(data.data_revision)) reportSummaries.remember(key,data);
       reportPlot.selection = 'view=' + view + '&day=' + data.day + (day ? '' : '&period=' + selection);
     } else {
       const query = '?' + (lastStatus.report_source === 'edf' ? 'source=device&' : '') + 'view=' + view + (day ? '&day=' : '&period=') + selection;
@@ -1880,6 +1907,11 @@ async function showReportHistory(id) {
     if (generation !== reportGeneration || reportPlot.summary !== summary) return;
     if (data.data_revision !== summary.data_revision) throw new Error('EDF data changed; refresh the report');
     reportPlot.history = data.history;
+    summary.history = data.history;
+    for (const [key,value] of [...reportSummaries]) {
+      if (value === summary) reportSummaries.remember(key,summary);
+      else if (value.history?.complete === false) reportSummaries.delete(key);
+    }
     renderReportMetrics(summary); renderReportHistory();
     document.getElementById('reportHistoryNote').textContent = data.history.complete ? '' : 'History incomplete';
   } catch(e) {
@@ -2001,7 +2033,6 @@ function clearReportPlots() {
   reportPlot.axes = null; reportPlot.axesAllSessions = false;
   reportPlot.hiddenSessions.clear(); reportPlot.excluded = '';
   reportPlot.pointers.clear();
-  reportPlot.cache.clear();
   reportPlot.rows = [];
   reportPlot.availableChannels = [];
   document.getElementById('reportSessions').replaceChildren();
@@ -2022,7 +2053,6 @@ function suspendReport() {
   for (const id of ['reportMaskCard','reportChartsCard']) document.getElementById(id).inert = false;
   invalidateReportDays();
   reportPlot.pointers.clear(); reportPlot.gesture = null;
-  reportPlot.cache.clear();
   document.getElementById('reportSpinner').style.display = 'none';
   document.getElementById('reportResult').setAttribute('aria-busy', 'false');
 }
@@ -2102,9 +2132,7 @@ async function drainReportSeries() {
     }
     if (request.serial !== reportPlot.serial) return;
     if (data.partial === false && !data.events_truncated) {
-      reportPlot.cache.delete(key);
-      reportPlot.cache.set(key,data);
-      if (reportPlot.cache.size > 64) reportPlot.cache.delete(reportPlot.cache.keys().next().value);
+      reportPlot.cache.remember(key,data);
     }
     reportPlot.series = data;
     note.textContent = allHidden ? 'No sessions selected'
