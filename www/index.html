@@ -1450,31 +1450,173 @@ async function reportStoreBinary(key,value) {
   });
 }
 
-async function reportArtifactBytes(dataset, artifact, document, signal, first = null, last = null) {
+function reportMergeRanges(ranges) {
+  const merged = [];
+  for (const range of [...ranges].sort((a,b) => a.first-b.first)) {
+    const previous = merged.at(-1);
+    if (previous && range.first <= previous.last+1) previous.last = Math.max(previous.last,range.last);
+    else merged.push({...range});
+  }
+  return merged;
+}
+
+function reportMissingRanges(ranges, parts) {
+  const covered = reportMergeRanges(parts), missing = [];
+  for (const range of ranges) {
+    let first = range.first;
+    for (const part of covered) {
+      if (part.last < first) continue;
+      if (part.first > range.last) break;
+      if (part.first > first) missing.push({first,last:part.first-1});
+      first = Math.max(first,part.last+1);
+    }
+    if (first <= range.last) missing.push({first,last:range.last});
+  }
+  return missing;
+}
+
+async function reportCachedArtifactParts(prefix, bytes, ranges) {
+  const parts = [];
+  const extent = key => {
+    if (!key.startsWith(prefix)) return null;
+    const suffix = key.slice(prefix.length), match = /^(\d+)-(\d+)$/.exec(suffix);
+    const range = suffix === 'all' ? {first:0,last:bytes-1}
+      : match ? {first:Number(match[1]),last:Number(match[2])} : null;
+    return range && Number.isSafeInteger(range.first) && Number.isSafeInteger(range.last)
+      && range.first >= 0 && range.last >= range.first && range.last < bytes ? range : null;
+  };
+  const needed = range => range && reportMissingRanges(ranges,parts)
+    .some(gap => gap.first <= range.last && gap.last >= range.first);
+  const add = (range, buffer) => {
+    if (buffer instanceof ArrayBuffer && buffer.byteLength === range.last-range.first+1)
+      parts.push({...range,buffer});
+  };
+  const cache = {parts, refresh() {
+    for (const [key,entry] of reportBinary.ram) {
+      const range = extent(key);
+      if (needed(range)) add(range,entry.value);
+    }
+  }};
+  cache.refresh();
+  if (!reportMissingRanges(ranges,parts).length) return cache;
+  const db = await reportDatabase();
+  if (!db) return cache;
+  // Discover legacy and merged extents by key, without loading unrelated tiles.
+  const keys = await new Promise(resolve => {
+    const found = [];
+    try {
+      const cursor = db.transaction('entries').objectStore('entries')
+        .openKeyCursor(IDBKeyRange.bound(prefix,prefix+'\uffff'));
+      cursor.onsuccess = () => {
+        const row = cursor.result;
+        if (!row) { resolve(found); return; }
+        found.push(row.primaryKey); row.continue();
+      };
+      cursor.onerror = () => resolve(found);
+    } catch { resolve(found); }
+  });
+  for (const key of keys) {
+    const range = extent(key);
+    if (needed(range)) add(range,await reportCachedBinary(key));
+  }
+  return cache;
+}
+
+function decodeReportRanges(response, buffer, ranges, bytes, full) {
+  if (ranges.length === 1) {
+    const {first,last} = ranges[0];
+    if (!full && response.headers.get('Content-Range') !== 'bytes '+first+'-'+last+'/'+bytes)
+      throw new Error('Invalid artifact range');
+    if (buffer.byteLength !== last-first+1) throw new Error('Incomplete artifact');
+    return [{first,last,buffer}];
+  }
+  const type = response.headers.get('Content-Type') || '';
+  const match = /^multipart\/byteranges;\s*boundary=(?:"([\w-]{1,70})"|([\w-]{1,70}))$/i.exec(type);
+  if (!match) throw new Error('Invalid artifact multipart type');
+  const boundary = match[1] || match[2], text = new TextDecoder(), parts = [];
+  let at = 0;
+  // Advance by declared binary lengths, never by searching inside sample data.
+  for (const {first,last} of ranges) {
+    const head = text.decode(new Uint8Array(buffer,at,Math.min(512,buffer.byteLength-at)));
+    const end = head.indexOf('\r\n\r\n');
+    if (end < 0 || !head.startsWith('--'+boundary+'\r\n') || /[^\x20-\x7e\r\n]/.test(head.slice(0,end)))
+      throw new Error('Incomplete artifact multipart header');
+    const lines = head.slice(0,end).split('\r\n');
+    const extent = lines.filter(line => /^content-range:/i.test(line));
+    if (extent.length !== 1 || extent[0].toLowerCase() !== 'content-range: bytes '+first+'-'+last+'/'+bytes)
+      throw new Error('Invalid artifact multipart range');
+    at += end+4;
+    const length = last-first+1;
+    if (at+length+2 > buffer.byteLength || text.decode(new Uint8Array(buffer,at+length,2)) !== '\r\n')
+      throw new Error('Incomplete artifact multipart data');
+    parts.push({first,last,buffer:buffer.slice(at,at+length)}); at += length+2;
+  }
+  if (text.decode(new Uint8Array(buffer,at)) !== '--'+boundary+'--\r\n')
+    throw new Error('Invalid artifact multipart end');
+  return parts;
+}
+
+async function reportArtifactRanges(dataset, artifact, document, signal, requested) {
   if (!/^[a-f0-9]{64}$/.test(artifact.digest) || !Number.isInteger(artifact.bytes) || artifact.bytes <= 0)
     throw new Error('Invalid artifact identity');
-  const key = 'bytes:'+dataset+':'+artifact.digest+':'+(first === null ? 'all' : first+'-'+last);
-  const cached = await reportCachedBinary(key);
-  if (cached) return cached;
-  if (signal?.aborted) throw new DOMException('Aborted','AbortError');
-  if (lastStatus.report_available === false) throw new Error('This range is not cached; SD is unavailable');
-  const prior = reportBinary.flights.get(key);
-  if (prior && !prior.signal?.aborted) return prior.promise;
-  const flight = (async () => {
-    const headers = first === null ? {} : {Range:'bytes='+first+'-'+last};
-    const response = await api('/api/report/artifact?day='+encodeURIComponent(artifact.day)
-      +'&hash='+artifact.digest+'&kind='+(document ? 'document' : 'tiles'),{signal,headers});
-    const expected = first === null ? artifact.bytes : last-first+1;
-    if (!response || response.status !== (first === null ? 200 : 206)) throw new Error('Artifact read failed ('+(response?.status || 'network')+')');
-    if (first !== null && response.headers.get('Content-Range') !== 'bytes '+first+'-'+last+'/'+artifact.bytes)
+  for (const {first,last} of requested) {
+    if (!Number.isSafeInteger(first) || !Number.isSafeInteger(last) || first < 0 || last < first || last >= artifact.bytes)
       throw new Error('Invalid artifact range');
-    const buffer = await response.arrayBuffer();
-    if (buffer.byteLength !== expected) throw new Error('Incomplete artifact');
-    await reportStoreBinary(key,buffer);
-    return buffer;
-  })();
-  reportBinary.flights.set(key,{promise:flight,signal});
-  try { return await flight; } finally { if (reportBinary.flights.get(key)?.promise === flight) reportBinary.flights.delete(key); }
+  }
+  const ranges = reportMergeRanges(requested), prefix = 'bytes:'+dataset+':'+artifact.digest+':';
+  const cache = await reportCachedArtifactParts(prefix,artifact.bytes,ranges), parts = cache.parts;
+  while (true) {
+    // Another read may have completed while IndexedDB was being inspected.
+    cache.refresh();
+    const missing = reportMissingRanges(ranges,parts);
+    if (!missing.length) break;
+    if (signal?.aborted) throw new DOMException('Aborted','AbortError');
+    if (lastStatus.report_available === false) throw new Error('This range is not cached; SD is unavailable');
+    const prior = [...reportBinary.flights.values()].find(flight => flight.prefix === prefix && !flight.signal?.aborted
+      && missing.some(gap => flight.ranges.some(part => part.first <= gap.last && part.last >= gap.first)));
+    if (prior) {
+      try { parts.push(...await prior.promise); }
+      catch (error) { if (error.name !== 'AbortError' || signal?.aborted) throw error; }
+      continue;
+    }
+    const batch = []; let budget = 256*1024;
+    for (const range of missing) {
+      const last = Math.min(range.last,range.first+budget-1);
+      batch.push({first:range.first,last}); budget -= last-range.first+1;
+      if (!budget || batch.length === 8) break;
+    }
+    const full = document && batch.length === 1 && batch[0].first === 0 && batch[0].last === artifact.bytes-1;
+    const key = prefix+batch.map(range => range.first+'-'+range.last).join(',');
+    const flight = (async () => {
+      const headers = full ? {} : {Range:'bytes='+batch.map(range => range.first+'-'+range.last).join(',')};
+      const response = await api('/api/report/artifact?day='+encodeURIComponent(artifact.day)
+        +'&hash='+artifact.digest+'&kind='+(document ? 'document' : 'tiles'),{signal,headers});
+      if (!response || response.status !== (full ? 200 : 206)) throw new Error('Artifact read failed ('+(response?.status || 'network')+')');
+      const fetched = decodeReportRanges(response,await response.arrayBuffer(),batch,artifact.bytes,full);
+      // A malformed/truncated multipart response publishes none of its parts.
+      for (const part of fetched) await reportStoreBinary(prefix+part.first+'-'+part.last,part.buffer);
+      return fetched;
+    })();
+    reportBinary.flights.set(key,{prefix,ranges:batch,promise:flight,signal});
+    try { parts.push(...await flight); }
+    finally { if (reportBinary.flights.get(key)?.promise === flight) reportBinary.flights.delete(key); }
+  }
+  return requested.map(({first,last}) => {
+    const whole = parts.find(part => part.first <= first && part.last >= last);
+    if (whole) return whole.first === first && whole.last === last ? whole.buffer : whole.buffer.slice(first-whole.first,last-whole.first+1);
+    const out = new Uint8Array(last-first+1);
+    for (const part of parts) {
+      const start = Math.max(first,part.first), end = Math.min(last,part.last);
+      if (start <= end) out.set(new Uint8Array(part.buffer,start-part.first,end-start+1),start-first);
+    }
+    return out.buffer;
+  });
+}
+
+async function reportArtifactBytes(dataset, artifact, document, signal, first = null, last = null) {
+  const buffers = await reportArtifactRanges(dataset,artifact,document,signal,
+    [{first:first ?? 0,last:first === null ? artifact.bytes-1 : last}]);
+  return buffers[0];
 }
 
 const reportSignalIds = ['Flow','Press','EprPress','MaskPress','Leak','MinVent','RespRate','TidVol','SpO2','Pulse','FlowLim','Snore','TgtVent','Ti','IERatio','AlvMinVent'];
@@ -1542,10 +1684,32 @@ function reportTrackLevel(track, view, px) {
   return level;
 }
 
-async function reportTrackSegment(manifest, artifact, track, range, px, signal) {
+function reportTrackPlan(track, range, px, adjacent = false) {
   const level = reportTrackLevel(track,range,px), step = track.step*level.factor;
   const first = Math.max(0,Math.floor((range[0]-track.origin)/step)-1);
   const last = Math.min(level.count,Math.ceil((range[1]-track.origin)/step)+1);
+  const groups = [], span = 512*16*step;
+  if (adjacent) groups.push(...new Set([Math.floor((range[0]-track.origin)/span)-1,Math.floor((range[1]-track.origin)/span)+1]));
+  else if (first < last) for (let group = Math.floor(first/8192); group <= Math.floor((last-1)/8192); group++) groups.push(group);
+  const ranges = [];
+  for (const group of groups) {
+    const from = level.offset+group*16*level.tile;
+    if (group < 0 || from >= level.offset+level.bytes) continue;
+    ranges.push({first:from,last:Math.min(level.offset+level.bytes,from+16*level.tile)-1});
+  }
+  return {track,level,step,first,last,ranges};
+}
+
+async function reportArtifactTrackBlocks(manifest, artifact, tracks, range, px, signal, adjacent = false) {
+  const plans = tracks.map(track => reportTrackPlan(track,range,px,adjacent));
+  const buffers = await reportArtifactRanges(manifest.dataset,artifact,false,signal,plans.flatMap(plan => plan.ranges));
+  let at = 0;
+  for (const plan of plans) { plan.blocks = buffers.slice(at,at+plan.ranges.length); at += plan.ranges.length; }
+  return plans;
+}
+
+function reportTrackSegment(plan) {
+  const {track,level,step,first,last} = plan;
   if (first >= last) return null;
   const segment = {from_ms:track.origin+first*step,step_ms:step,raw:level.factor === 1,
     end_ms:Math.min(track.origin+last*step,track.origin+track.samples*track.step),points:[]};
@@ -1553,8 +1717,7 @@ async function reportTrackSegment(manifest, artifact, track, range, px, signal) 
   for (let i = first; i < last; i++) {
     const tile = Math.floor(i/512), group = Math.floor(tile/16)*16;
     if (group !== blockIndex) {
-      const from = level.offset+group*level.tile, to = Math.min(level.offset+level.bytes,from+16*level.tile)-1;
-      block = new DataView(await reportArtifactBytes(manifest.dataset,artifact,false,signal,from,to));
+      block = new DataView(plan.blocks[Math.floor(i/8192)-Math.floor(first/8192)]);
       blockIndex = group;
     }
     const at = (tile-blockIndex)*level.tile, slot = i%512;
@@ -1584,8 +1747,8 @@ async function reportArtifactSeries(request, px, signal, publish) {
     for (const track of tracks) {
       if (!reportSignalIds.slice(0,12).includes(track.id)) continue;
       if (!channels.has(track.id)) channels.set(track.id,{id:track.id,label:track.label,unit:track.unit,segments:[]});
-      sources.push({artifact,track});
     }
+    sources.push({artifact,tracks:tracks.filter(track => reportSignalIds.slice(0,12).includes(track.id))});
   }
   data.channels = [...channels.values()]; publish(data);
   for (const group of manifest.event_groups || []) {
@@ -1594,12 +1757,14 @@ async function reportArtifactSeries(request, px, signal, publish) {
     data.events.push(...events.events);
   }
   publish(data);
-  for (const {artifact,track} of sources) {
+  for (const {artifact,tracks} of sources) {
     if (signal.aborted) throw new DOMException('Aborted','AbortError');
-    if (reportPlot.hiddenChannels.has(track.id)) continue;
-    const segment = await reportTrackSegment(manifest,artifact,track,request.view,px,signal);
-    if (segment) channels.get(track.id).segments.push(segment);
-    publish(data);
+    const plans = await reportArtifactTrackBlocks(manifest,artifact,tracks.filter(track => !reportPlot.hiddenChannels.has(track.id)),request.view,px,signal);
+    for (const plan of plans) {
+      const segment = reportTrackSegment(plan);
+      if (segment) channels.get(plan.track.id).segments.push(segment);
+      publish(data);
+    }
   }
   return data;
 }
@@ -2441,19 +2606,10 @@ async function prefetchReportPublications(request, parent) {
   // widened viewport which could silently select a different resolution.
   for (const artifact of current.artifacts) {
     if (reportPlot.hiddenSessions.has(artifact.session)) continue;
-    for (const track of await reportArtifactTracks(current,artifact,signal)) {
-      if (!reportSignalIds.slice(0,12).includes(track.id) || reportPlot.hiddenChannels.has(track.id)) continue;
-      const level = reportTrackLevel(track,request.view,request.px || 800);
-      const span = 512*16*track.step*level.factor;
-      const first = Math.floor((request.view[0]-track.origin)/span)-1;
-      const last = Math.floor((request.view[1]-track.origin)/span)+1;
-      for (const block of new Set([first,last])) {
-        if (signal.aborted || reportPlot.gesture || reportLoading) return;
-        const from = level.offset+block*16*level.tile;
-        if (block < 0 || from >= level.offset+level.bytes) continue;
-        await reportArtifactBytes(dataset,artifact,false,signal,from,Math.min(from+16*level.tile,level.offset+level.bytes)-1);
-      }
-    }
+    if (signal.aborted || reportPlot.gesture || reportLoading) return;
+    const tracks = (await reportArtifactTracks(current,artifact,signal))
+      .filter(track => reportSignalIds.slice(0,12).includes(track.id) && !reportPlot.hiddenChannels.has(track.id));
+    await reportArtifactTrackBlocks(current,artifact,tracks,request.view,request.px || 800,signal,true);
   }
   const day = reportPlot.summary.day;
   const days = [...reportCalendar.days].filter(d => d.publication && !d.stale && d.day !== day);
@@ -2472,10 +2628,9 @@ async function prefetchReportPublications(request, parent) {
     const range = [Math.min(...sessions.map(s => s.start_ms)),Math.max(...sessions.map(s => s.end_ms))];
     for (const artifact of manifest.artifacts) {
       if (signal.aborted || reportPlot.gesture) return;
-      for (const track of await reportArtifactTracks(manifest,artifact,signal)) {
-        if (!reportSignalIds.slice(0,12).includes(track.id) || reportPlot.hiddenChannels.has(track.id)) continue;
-        await reportTrackSegment(manifest,artifact,track,range,800,signal);
-      }
+      const tracks = (await reportArtifactTracks(manifest,artifact,signal))
+        .filter(track => reportSignalIds.slice(0,12).includes(track.id) && !reportPlot.hiddenChannels.has(track.id));
+      await reportArtifactTrackBlocks(manifest,artifact,tracks,range,800,signal);
     }
   }
 }
