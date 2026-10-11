@@ -354,6 +354,7 @@ const char *index_error = nullptr;
 size_t index_error_entry = SIZE_MAX;
 bool prune_cache(const SdStorage::Session &session, uint64_t needed = 0,
                  const char *keep = nullptr);
+void invalidate_str();
 
 bool retire_cache(const SdStorage::Session &session, const IndexedSession &entry) {
     bool removed = false;
@@ -493,7 +494,7 @@ bool refresh_index(const SdStorage::Session &session) {
         return true;
     const bool full = !index_ready || invalidated || !incremental || files != file_revision ||
         changes.catalog.entries < index_count;
-    if (full) invalidate_day();
+    if (full) { invalidate_day(); invalidate_str(); }
     const size_t old_count = index_count;
     index_error = "session_limit";
     if (changes.catalog.entries > MAX_SESSION_COUNT) return false;
@@ -565,6 +566,7 @@ bool refresh_index(const SdStorage::Session &session) {
         }
         index[i] = next;
     }
+    if (summary_changed) invalidate_str();
     catalog_generation = changes.catalog.generation;
     file_revision = files;
     indexed_invalidation = invalidation;
@@ -668,13 +670,47 @@ struct Input {
     }
 };
 
+struct StrLayoutCache {
+    ReportEdf::Layout layout;
+    ReportEdf::Signal *signals = nullptr;
+    uint64_t bytes = 0;
+
+    void reset() {
+        aircannect::Memory::free(signals);
+        signals = nullptr;
+        layout = {};
+        bytes = 0;
+    }
+    bool load(const ReportEdf::Reader &reader) {
+        if (signals && bytes == reader.size) return true;
+        reset();
+        if (!ReportEdf::read_layout(reader, layout) || layout.record_seconds != 86400 ||
+            layout.records > Air10StrTimeline::RECORD_LIMIT) return false;
+        const size_t size = layout.signal_count * sizeof(*signals);
+        signals = static_cast<ReportEdf::Signal *>(aircannect::Memory::alloc_large(size, size <= INTERNAL_WORK));
+        if (!signals || !ReportEdf::read_signals(reader, layout, signals, layout.signal_count, true) ||
+            layout.record_bytes > 4096) { reset(); return false; }
+        for (size_t i = 0; i < layout.signal_count; ++i) {
+            const auto &date = signals[i];
+            if (!strcmp(date.label, "Date") && date.samples_per_record == 1 && date.digital_min == 0 &&
+                date.physical_min == 0 && date.physical_max == date.digital_max) {
+                bytes = reader.size;
+                return true;
+            }
+        }
+        reset();
+        return false;
+    }
+} str_layout;
+
+void invalidate_str() { str_layout.reset(); }
+
 struct HistoricalStr {
     Input input;
-    ReportEdf::Signal *signals = nullptr;
+    const ReportEdf::Signal *signals = nullptr;
     bool present = false;
 
     HistoricalStr(const SdStorage::Session &session, const Job &job) : input(session, job) {}
-    ~HistoricalStr() { aircannect::Memory::free(signals); }
 
     const ReportEdf::Signal *find(const char *label) const {
         if (!signals || !input.header) return nullptr;
@@ -692,16 +728,12 @@ struct HistoricalStr {
         return signal->valid(digital) ? signal->physical(digital) * scale : NAN;
     }
     bool load(uint16_t day) {
-        if (!input.open_file("/STR.edf") || !ReportEdf::read_layout(input.reader, *input.header)) return false;
+        if (!input.open_file("/STR.edf") || !str_layout.load(input.reader)) return false;
         auto &header = *input.header;
-        if (header.record_seconds != 86400 || header.records > Air10StrTimeline::RECORD_LIMIT) return false;
-        const size_t bytes = header.signal_count * sizeof(*signals);
-        signals = static_cast<ReportEdf::Signal *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
-        if (!signals || !ReportEdf::read_signals(input.reader, header, signals, header.signal_count, true) ||
-            header.record_bytes > 4096 || !input.prepare_record()) return false;
+        static_cast<ReportEdf::Layout &>(header) = str_layout.layout;
+        signals = str_layout.signals;
+        if (!input.prepare_record()) return false;
         const auto *date = find("Date");
-        if (!date || date->samples_per_record != 1 || date->digital_min != 0 ||
-            date->physical_min != 0 || date->physical_max != date->digital_max) return false;
         const int64_t guessed = int64_t(day) - header.start_seconds / 86400;
         auto read = [&](uint32_t record) {
             uint8_t bytes[2];
