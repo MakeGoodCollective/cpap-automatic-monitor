@@ -20,6 +20,7 @@ bool valid(const Request &request) {
     if (request.action > Action::Reindex || uint8_t(request.action) == 2 || request.view > View::Period ||
         request.day == UINT16_MAX) return false;
     if (request.action == Action::History && request.view != View::Day) return false;
+    if (request.action == Action::Reindex && (request.view != View::Day || request.revision)) return false;
     if (request.view == View::Period && request.period != 1 && request.period != 7 &&
         request.period != 30 && request.period != 90 && request.period != 180 &&
         request.period != 365) return false;

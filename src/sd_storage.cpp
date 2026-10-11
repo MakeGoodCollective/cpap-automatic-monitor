@@ -825,17 +825,18 @@ void Reader::close() {
     size_ = offset_ = 0;
 }
 
-bool Writer::open(const Session &session, const char *path) {
+bool Writer::open(const Session &session, const char *path, uint64_t append_at) {
     close();
 #if AB_STORAGE_HAS_SDCARD
-    if (!path || !session.run([&](fs::FS &fs) {
+    if (!path || append_at > UINT32_MAX || !session.run([&](fs::FS &fs) {
         if (writer.id) return false;
-        fs::File file = fs.open(path, FILE_WRITE);
-        if (!file || file.isDirectory()) return false;
+        fs::File file = fs.open(path, append_at ? FILE_APPEND : FILE_WRITE);
+        if (!file || file.isDirectory() || (append_at && file.size() != append_at)) return false;
         handle_ = retain_file(writer, file);
         return true;
     })) return false;
     session_ = session;
+    size_ = append_at;
     return true;
 #else
     return false;
