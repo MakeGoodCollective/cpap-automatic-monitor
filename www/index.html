@@ -2205,7 +2205,8 @@ function renderReportChannelOptions() {
 
 function reportChannelColor(id) {
   return {flow:'#818cf8',press:'#22d3ee',pressure:'#22d3ee',eprpress:'#fb923c',maskpress:'#4ade80',
-    leak:'#fb923c',minvent:'#4ade80',resprate:'#22d3ee',tidvol:'#cbd5e1',spo2:'#4ade80',pulse:'#e94560'}[String(id).toLowerCase()] || '#22d3ee';
+    leak:'#fb923c',minvent:'#4ade80',resprate:'#22d3ee',tidvol:'#cbd5e1',spo2:'#4ade80',pulse:'#e94560',
+    flowlim:'#facc15',snore:'#f472b6'}[String(id).toLowerCase()] || '#22d3ee';
 }
 
 function normalizeReportSeries(data) {

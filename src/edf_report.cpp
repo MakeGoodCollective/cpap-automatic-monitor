@@ -80,7 +80,7 @@ Result::Result(Result &&other) noexcept
 namespace EdfReport {
 namespace {
 constexpr uint32_t STATS_CACHE_VERSION = 7;
-constexpr uint32_t SERIES_CACHE_VERSION = 5;
+constexpr uint32_t SERIES_CACHE_VERSION = 6;
 constexpr size_t MAX_BINS = 16384;
 constexpr size_t MAX_EVENTS = 4096;
 constexpr size_t MAX_DISK_EVENTS = 65536;
@@ -92,7 +92,7 @@ constexpr uint32_t RETAIN_MS = 6 * 60 * 60 * 1000;
 constexpr uint32_t DELIVERY_MS = 30000;
 constexpr size_t SLOT_COUNT = 2;
 constexpr size_t RETAINED_SLOTS = 32;
-constexpr size_t CHART_CHANNEL_COUNT = 9;
+constexpr size_t CHART_CHANNEL_COUNT = 11;
 constexpr double LEAK_THRESHOLD = 24;
 constexpr int64_t LEVEL_MS[] = {10000, 60000, 600000, 3600000};
 constexpr size_t LEVEL_COUNT = sizeof(LEVEL_MS) / sizeof(LEVEL_MS[0]);
