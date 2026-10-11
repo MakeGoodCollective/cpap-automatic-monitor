@@ -1924,8 +1924,7 @@ void series_channel_json(Payload &out, const Series &series, size_t channel) {
 }
 
 bool cached_series(const SdStorage::Session &session, const Job &job,
-                   const IndexedSession &entry, Series &series) {
-    ReducedHeader header;
+                   const IndexedSession &entry, Series &series, ReducedHeader &header) {
     const bool fine = !series.level_index;
     if (!reduced_header(session, entry, header) || (fine && !header.fine))
         if (!build_reduced(session, job, entry, fine, header))
@@ -2180,6 +2179,12 @@ bool window_events(const SdStorage::Session &session, const Job &job,
 
 bool series_json(const SdStorage::Session &session, Job &job, JobTiming &timing) {
     uint32_t started = timing.stamp();
+    // Inlining cache branches must not reserve their large headers on the raw
+    // zoom stack, which also needs room for EDF parsing and libc formatting.
+    struct Work { CacheHeader summary; ReducedHeader reduced; };
+    void *memory = aircannect::Memory::alloc_large(sizeof(Work), sizeof(Work) <= INTERNAL_WORK);
+    if (!memory) return note_issue(job, "series_work_alloc");
+    std::unique_ptr<Work, decltype(&aircannect::Memory::free)> work(new (memory) Work, aircannect::Memory::free);
     Series series(job.request);
     timing.numeric_us += timing.stamp() - started;
     if (!series.buckets) return false;
@@ -2196,7 +2201,7 @@ bool series_json(const SdStorage::Session &session, Job &job, JobTiming &timing)
         if (aborted(&job, session)) return false;
         if (!(entry.key.present & 7)) { series.partial = true; continue; }
         started = timing.stamp();
-        CacheHeader header;
+        auto &header = work->summary;
         if (!cached_summary_header(session, entry, header) && !build_summary_header(session, job, entry, header)) {
             timing.numeric_us += timing.stamp() - started;
             if (aborted(&job, session)) return false;
@@ -2213,7 +2218,7 @@ bool series_json(const SdStorage::Session &session, Job &job, JobTiming &timing)
         // source window. Their summaries remain reusable for later requests.
         const bool numeric_overlap = !entry.bounds_known ||
             (entry.end_ms > series.from_ms && entry.start_ms < series.to_ms);
-        const bool success = !numeric_overlap || (series.level_ms ? cached_series(session, job, entry, series)
+        const bool success = !numeric_overlap || (series.level_ms ? cached_series(session, job, entry, series, work->reduced)
                                                                   : window_series(session, job, entry, series));
         timing.numeric_us += timing.stamp() - started;
         if (!success) {
