@@ -280,6 +280,9 @@ struct Job {
     const char *error = nullptr;
     mutable const char *issue = nullptr;
     mutable char issue_path[96] = {};
+    mutable uint64_t source_bytes = 0;
+    mutable uint32_t source_reads = 0, source_us = 0, tiles_us = 0;
+    bool diagnostics = false;
     Payload body;
 };
 
@@ -299,7 +302,7 @@ void log_result(const Job &job) {
         "EDF job=%lu %s day=%u code=%d %s path=%s\n",
         (unsigned long)job.id, job.request.action == Action::Days ? "days" :
         job.request.action == Action::Summary ? "summary" : job.request.action == Action::History ? "history" :
-        job.request.action == Action::Prepare ? "prepare" : "series",
+        job.request.action == Action::Prepare ? "prepare" : "reindex",
         unsigned(job.request.day), job.code, reason ? reason : "complete",
         expected || !job.issue_path[0] ? "-" : job.issue_path);
 }
@@ -308,12 +311,19 @@ struct JobTiming {
     bool enabled;
     uint32_t id, started_us;
     Action action;
-    uint32_t index_us = 0, numeric_us = 0, events_us = 0, encode_us = 0;
+    uint32_t index_us = 0;
+    const Job *job;
 
-    explicit JobTiming(const Job *job)
+    explicit JobTiming(Job *job)
         : enabled(job && Log::get_cat_level(CAT_REPORT) >= LOG_DEBUG),
           id(job ? job->id : 0), started_us(stamp()),
-          action(job ? job->request.action : Action::Days) {}
+          action(job ? job->request.action : Action::Days), job(job) {
+        if (job) {
+            job->diagnostics = enabled;
+            job->source_bytes = 0;
+            job->source_reads = job->source_us = job->tiles_us = 0;
+        }
+    }
 
     uint32_t stamp() const { return enabled ? micros() : 0; }
 
@@ -321,13 +331,16 @@ struct JobTiming {
         if (!enabled) return;
         Log::logf(CAT_REPORT, LOG_DEBUG,
             "report job=%lu action=%s code=%d bytes=%u ms total=%lu "
-            "idx=%lu num=%lu evt=%lu enc=%lu\n",
+            "idx=%lu src=%lu tiles=%lu\n",
             static_cast<unsigned long>(id), action == Action::Days ? "days" :
                 action == Action::Summary ? "summary" : action == Action::History ? "history" :
-                action == Action::Prepare ? "prepare" : "series", code,
+                action == Action::Prepare ? "prepare" : "reindex", code,
             static_cast<unsigned>(bytes), static_cast<unsigned long>((stamp() - started_us) / 1000),
-            static_cast<unsigned long>(index_us / 1000), static_cast<unsigned long>(numeric_us / 1000),
-            static_cast<unsigned long>(events_us / 1000), static_cast<unsigned long>(encode_us / 1000));
+            static_cast<unsigned long>(index_us / 1000), static_cast<unsigned long>(job->source_us / 1000),
+            static_cast<unsigned long>(job->tiles_us / 1000));
+        if (job->source_reads) Log::logf(CAT_REPORT, LOG_DEBUG,
+            "report job=%lu source reads=%lu bytes=%llu\n", static_cast<unsigned long>(id),
+            static_cast<unsigned long>(job->source_reads), static_cast<unsigned long long>(job->source_bytes));
     }
 };
 
@@ -604,6 +617,16 @@ struct Input {
         aircannect::Memory::free(header);
         aircannect::Memory::free(record);
     }
+    size_t read_source(uint8_t *out, size_t bytes) {
+        const uint32_t started = job.diagnostics ? micros() : 0;
+        const size_t count = file.read(out, bytes);
+        if (job.diagnostics) {
+            job.source_us += uint32_t(micros() - started);
+            job.source_bytes += count;
+            ++job.source_reads;
+        }
+        return count;
+    }
     bool open(const SdStorage::Session &session, const IndexedSession &entry, uint8_t kind) {
         char source[96];
         source_path(entry, kind, "edf", source);
@@ -636,7 +659,7 @@ struct Input {
             size_t done = 0;
             while (done < count) {
                 const size_t take = std::min(count - done, SdStorage::READ_CHUNK_BYTES);
-                if (file.read(out + done, take) != take)
+                if (input.read_source(out + done, take) != take)
                     return note_issue(input.job, "source_read", input.path);
                 done += take;
             }
@@ -668,7 +691,7 @@ struct Input {
         for (size_t at = 0; at < header->record_bytes;) {
             if (aborted(&job, session)) return false;
             const size_t take = std::min<size_t>(header->record_bytes - at, SdStorage::READ_CHUNK_BYTES);
-            if (file.read(record + at, take) != take) return note_issue(job, "source_read", path);
+            if (read_source(record + at, take) != take) return note_issue(job, "source_read", path);
             at += take;
         }
         record_offset = base;
@@ -683,9 +706,13 @@ struct Input {
         if (!present) return true;
         for (uint32_t n = first; n < end; ++n) {
             if (!load_record(n)) return false;
-            if (artifact && !artifact->record(*header, record, header->record_bytes)) {
-                note_issue(job, artifact->error(), path);
-                artifact = nullptr;
+            if (artifact) {
+                const uint32_t started = job.diagnostics ? micros() : 0;
+                if (!artifact->record(*header, record, header->record_bytes)) {
+                    note_issue(job, artifact->error(), path);
+                    artifact = nullptr;
+                }
+                if (job.diagnostics) job.tiles_us += uint32_t(micros() - started);
             }
             for (size_t c = 0; c < count; ++c) {
                 if (signals[c] < 0) continue;
@@ -760,8 +787,10 @@ struct ArtifactBuild {
     void finish() {
         input.artifact = nullptr;
         ReportArtifact::Publication publication;
+        const uint32_t started = input.job.diagnostics ? micros() : 0;
         if (producer && !producer->finish(publication) && !aborted(&input.job, input.session))
             note_issue(input.job, producer->error(), input.path);
+        if (input.job.diagnostics) input.job.tiles_us += uint32_t(micros() - started);
     }
 };
 
@@ -2230,11 +2259,11 @@ bool work_once() {
                 job->completed_ms = millis();
                 const int code = job->code;
                 const size_t bytes = job->body.length();
+                timing.log(code, bytes);
                 xSemaphoreGive(mutex);
                 portENTER_CRITICAL(&status_mux);
                 ++status.revision;
                 portEXIT_CRITICAL(&status_mux);
-                timing.log(code, bytes);
             }
             publish(State::Error, "index_unavailable");
             return job != nullptr;
@@ -2313,12 +2342,12 @@ bool work_once() {
     const int code = job->code;
     const size_t bytes = job->body.length();
     log_result(*job);
+    timing.log(code, bytes);
     xSemaphoreGive(mutex);
     portENTER_CRITICAL(&status_mux);
     ++status.revision;
     portEXIT_CRITICAL(&status_mux);
     publish(State::Ready);
-    timing.log(code, bytes);
     return true;
 }
 
