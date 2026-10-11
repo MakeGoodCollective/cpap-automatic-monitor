@@ -42,11 +42,12 @@ bool reference_path(const char *prefix, const uint8_t key[32], char (&out)[PATH_
     return aircannect::hex_encode(key, 32, text, sizeof(text), aircannect::HexCase::Lower) &&
         snprintf(out, sizeof(out), "%s.%s.ref", prefix, text) < int(sizeof(out));
 }
-bool content_path(const char *prefix, const uint8_t hash[32], char (&out)[PATH_BYTES]) {
+bool content_path(const char *prefix, const uint8_t hash[32], char (&out)[PATH_BYTES], bool document = false) {
     char text[65];
     const char *end = strrchr(prefix, '/');
     if (!end || !aircannect::hex_encode(hash, 32, text, sizeof(text), aircannect::HexCase::Lower)) return false;
-    return snprintf(out, sizeof(out), "%.*s/%s.abt", int(end - prefix), prefix, text) < int(sizeof(out));
+    return snprintf(out, sizeof(out), "%.*s/%.*s%s%s.%s", int(end - prefix), prefix,
+        document ? 2 : 0, text, document ? "/" : "", text, document ? "abp" : "abt") < int(sizeof(out));
 }
 
 bool exact_read(SdStorage::Reader &reader, uint64_t offset, uint8_t *out, size_t count) {
@@ -104,9 +105,7 @@ Lookup lookup(const SdStorage::Session &session, const char *prefix,
 
 namespace {
 bool document_path(const char *prefix, const uint8_t hash[32], char (&out)[PATH_BYTES]) {
-    if (!content_path(prefix, hash, out)) return false;
-    memcpy(out + strlen(out) - 3, "abp", 3);
-    return true;
+    return content_path(prefix, hash, out, true);
 }
 
 bool document_content(const SdStorage::Session &session, const char *prefix,
@@ -194,6 +193,9 @@ bool document_publish(const SdStorage::Session &session, const char *prefix,
             (!fs.exists("/airbridge/report") && !fs.mkdir("/airbridge/report"))) return false;
         char directory[PATH_BYTES];
         snprintf(directory, sizeof(directory), "%s", prefix);
+        *strrchr(directory, '/') = 0;
+        if (!fs.exists(directory) && !fs.mkdir(directory)) return false;
+        snprintf(directory, sizeof(directory), "%s", path);
         *strrchr(directory, '/') = 0;
         if (!fs.exists(directory) && !fs.mkdir(directory)) return false;
         exists = fs.exists(path);

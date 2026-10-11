@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <memory>
 #include <utility>
@@ -1359,8 +1360,7 @@ uint16_t last_day(const Request &request) {
     if (request.day) return request.day;
     uint16_t day = 0;
     for (size_t i = 0; i < index_count; ++i)
-        if ((index[i].entry.flags & EdfCatalog::ENTRY_LIVE_COMPLETE) &&
-            (index[i].key.present || (index[i].entry.flags & EdfCatalog::ENTRY_STR_READY)))
+        if (index[i].entry.flags & EdfCatalog::ENTRY_LIVE_COMPLETE)
             day = std::max(day, index[i].day);
     return day;
 }
@@ -1408,14 +1408,18 @@ bool dataset(const SdStorage::Session &session) {
         dataset_id, sizeof(dataset_id), aircannect::HexCase::Lower);
 }
 
-void publication_prefix(uint16_t day, char (&path)[96]) {
-    // The manifest is a small day index, separate from session/block directories.
-    snprintf(path, sizeof(path), "%s/day-%u", CACHE_DIR, unsigned(day));
+void publication_prefix(uint16_t day, char (&path)[96], uint16_t period = 0) {
+    const time_t civil = int64_t(day) * 86400;
+    tm date = {};
+    gmtime_r(&civil, &date);
+    char directory[9];
+    strftime(directory, sizeof(directory), "%Y%m%d", &date);
+    if (period) snprintf(path, sizeof(path), "%s/%s/period-%u", CACHE_DIR, directory, unsigned(period));
+    else snprintf(path, sizeof(path), "%s/%s/day", CACHE_DIR, directory);
 }
 
 void period_prefix(const Request &request, char (&path)[96]) {
-    snprintf(path, sizeof(path), "%s/period-%u-%u", CACHE_DIR,
-             unsigned(last_day(request)), unsigned(request.period));
+    publication_prefix(last_day(request), path, request.period);
 }
 
 bool publication_key(const Request &request, uint8_t (&key)[32]) {
@@ -1666,7 +1670,7 @@ bool days_json(const SdStorage::Session &session, Job &job) {
     bool partial = false;
     for (size_t i = 0; i < index_count; ++i) {
         if (!(index[i].entry.flags & EdfCatalog::ENTRY_LIVE_COMPLETE)) continue;
-        if ((index[i].key.present & 7) || (index[i].entry.flags & EdfCatalog::ENTRY_STR_READY)) days[count++] = index[i].day;
+        days[count++] = index[i].day;
         if (index[i].key.present != 31 || index[i].key.checksums != 31) partial = true;
     }
     if (count) std::sort(days, days + count, std::greater<uint16_t>());
@@ -1687,8 +1691,8 @@ bool days_json(const SdStorage::Session &session, Job &job) {
             char digest[65], identity[65];
             aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
             aircannect::hex_encode(document.key, 32, identity, sizeof(identity), aircannect::HexCase::Lower);
-            job.body.print(",\"publication\":{\"day\":\"index\",\"digest\":\"%s\",\"bytes\":%u},\"identity\":\"%s\",\"stale\":%s",
-                digest, document.bytes, identity, memcmp(key, document.key, 32) ? "true" : "false");
+            job.body.print(",\"publication\":{\"day\":\"%.8s\",\"digest\":\"%s\",\"bytes\":%u},\"identity\":\"%s\",\"stale\":%s",
+                prefix + strlen(CACHE_DIR) + 1, digest, document.bytes, identity, memcmp(key, document.key, 32) ? "true" : "false");
         }
         job.body.print("}");
         n = end;
@@ -1704,8 +1708,9 @@ bool days_json(const SdStorage::Session &session, Job &job) {
             != ReportArtifact::Lookup::Ready) continue;
         char digest[65];
         aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
-        job.body.print("%s{\"period\":%u,\"day\":\"index\",\"digest\":\"%s\",\"bytes\":%u,\"stale\":%s}",
-            period_comma ? "," : "", period, digest, document.bytes, memcmp(key, document.key, 32) ? "true" : "false");
+        job.body.print("%s{\"period\":%u,\"day\":\"%.8s\",\"digest\":\"%s\",\"bytes\":%u,\"stale\":%s}",
+            period_comma ? "," : "", period, prefix + strlen(CACHE_DIR) + 1,
+            digest, document.bytes, memcmp(key, document.key, 32) ? "true" : "false");
         period_comma = true;
     }
     job.body.print("]}");
@@ -2315,7 +2320,8 @@ bool work_once() {
         if (job->request.view == View::Period) ++backfill_period;
         else backfill_before = job->request.day;
         if (!success && job->issue && (!strcmp(job->issue, "partial_source") ||
-            !strcmp(job->issue, "source_header") || !strcmp(job->issue, "artifact_lookup"))) {
+            !strcmp(job->issue, "source_header") || !strcmp(job->issue, "artifact_lookup") ||
+            !strcmp(job->issue, "numeric_files_missing"))) {
             char prefix[96]; uint8_t key[32]; ReportArtifact::Document refused;
             if (job->request.view == View::Period) period_prefix(job->request, prefix);
             else publication_prefix(job->request.day, prefix);
@@ -2559,8 +2565,9 @@ StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
     __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
     operation.kind = StorageBrowser::Kind::Immutable;
     operation.selection[0] = 0;
-    snprintf(operation.path, sizeof(operation.path), "%s/%s%s%s.%s", CACHE_DIR,
-        root ? "" : day, root ? "" : "/", digest, document ? "abp" : "abt");
+    snprintf(operation.path, sizeof(operation.path), "%s/%s%s%.*s%s%s.%s", CACHE_DIR,
+        root ? "" : day, root ? "" : "/", document ? 2 : 0, digest,
+        document ? "/" : "", digest, document ? "abp" : "abt");
     return StorageBrowser::start(operation, std::move(ready), active);
 }
 
