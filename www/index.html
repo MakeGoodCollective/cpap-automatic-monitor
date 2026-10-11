@@ -1773,7 +1773,7 @@ let reportDisplayedSource = null;
 const reportPlot = {summary:null, selection:null, full:null, view:null, fullSeries:null, series:null,
   history:null, historyMetric:null, historyPending:false,
   pending:null, flight:null, serial:0, cursor:null, frame:null, request:false, rows:[],
-  axes:null, axesAllSessions:false, hiddenSessions:new Set(), excluded:'', pointers:new Map(), gesture:null,
+  axes:null, hiddenSessions:new Set(), excluded:'', pointers:new Map(), gesture:null,
   hiddenChannels:new Set(), availableChannels:[]};
 
 function reportSource() {
@@ -2428,7 +2428,7 @@ function clearReportPlots() {
   document.getElementById('reportHistoryNote').textContent = '';
   reportPlot.summary = reportPlot.selection = reportPlot.full = reportPlot.view = null;
   reportPlot.fullSeries = reportPlot.series = reportPlot.pending = reportPlot.cursor = reportPlot.gesture = null;
-  reportPlot.axes = null; reportPlot.axesAllSessions = false;
+  reportPlot.axes = null;
   reportPlot.hiddenSessions.clear(); reportPlot.excluded = '';
   reportPlot.pointers.clear();
   reportPlot.rows = [];
@@ -2525,12 +2525,6 @@ async function drainReportSeries() {
     if (!current()) return;
     if (request.view[0] === full[0] && request.view[1] === full[1]) {
       reportPlot.fullSeries = data;
-      // Only a full, unfiltered range establishes the final selection scale.
-      const measured = data.channels.filter(channel => channel.segments.some(segment => segment.points.some(reportBucket)));
-      const axes = reportAxes(measured);
-      if (!reportPlot.axesAllSessions) reportPlot.axes = axes;
-      else for (const [id,axis] of Object.entries(axes)) if (!reportPlot.axes[id]) reportPlot.axes[id] = axis;
-      if (!request.excluded) reportPlot.axesAllSessions = true;
     }
     if (request.serial !== reportPlot.serial) return;
     reportPlot.series = data;
@@ -2663,15 +2657,32 @@ function reportBucket(bucket) {
   return Array.isArray(bucket) && Number.isFinite(bucket[0]) && Number.isFinite(bucket[1]) && bucket[0] <= bucket[1];
 }
 
-function reportAxes(channels) {
+function reportAxes(channels, view) {
   const axes = {};
   const pressure = channels.filter(c => c.unit === 'cmH2O');
   for (const channel of channels) {
     let low = Infinity, high = -Infinity;
     const group = channel.unit === 'cmH2O' ? pressure : [channel];
-    for (const member of group) for (const segment of member.segments || []) for (const bucket of segment.points) {
-      if (!reportBucket(bucket)) continue;
-      low = Math.min(low,bucket[0]); high = Math.max(high,bucket[1]);
+    for (const member of group) for (const segment of member.segments || []) {
+      const {points,from_ms:origin,step_ms:step} = segment;
+      const first = view ? Math.max(0,Math.floor((view[0]-origin)/step)) : 0;
+      const last = view ? Math.min(points.length-1,Math.ceil((view[1]-origin)/step)) : points.length-1;
+      for (let i = first; i <= last; i++) {
+        const bucket = points[i], time = origin+i*step;
+        if (!reportBucket(bucket)) continue;
+        let bottom = bucket[0], top = bucket[1];
+        if (view && segment.raw && (time < view[0] || time > view[1])) {
+          // Include only the visible part of a real line crossing the edge.
+          // A missing neighbor must not manufacture an interpolated sample.
+          const next = time < view[0] ? i+1 : i-1;
+          const edge = time < view[0] ? view[0] : view[1];
+          const fraction = (edge-time)/((next-i)*step);
+          if (!reportBucket(points[next]) || fraction < 0 || fraction > 1) continue;
+          bottom = top = bucket[0]+(points[next][0]-bucket[0])*fraction;
+        } else if (view && !segment.raw && (time >= view[1]
+            || Math.min(time+step,segment.end_ms ?? Infinity) <= view[0])) continue;
+        low = Math.min(low,bottom); high = Math.max(high,top);
+      }
     }
     const id = channel.id.toLowerCase();
     const minimum = channel.unit === 'cmH2O' ? 2 : channel.unit === '%' ? 5
@@ -2819,7 +2830,7 @@ function drawEdfChart(canvas, channel, data, color, cursor = reportPlot.cursor) 
   const view = reportPlot.view;
   const x = time => pad.l + (time-view[0])/(view[1]-view[0])*gw;
   const {low,high,step} = reportPlot.axes?.[firstChannel?.id]
-    || reportAxes(data?.channels || [])[firstChannel?.id] || {low:0,high:1,step:0.25};
+    || reportAxes(data?.channels || [],view)[firstChannel?.id] || {low:0,high:1,step:0.25};
   const y = value => pad.t + gh*(1-(value-low)/(high-low));
   ctx.clearRect(0,0,W,H); ctx.fillStyle = '#08081a'; ctx.fillRect(0,0,W,H);
   ctx.font = '10px sans-serif'; ctx.lineWidth = 1;
@@ -2864,6 +2875,7 @@ function drawReportPlots() {
   const fullSeries = reportPlot.fullSeries;
   const current = reportPlot.series, view = reportPlot.view;
   const data = current && fullSeries && (view[0] < current.from_ms || view[1] > current.to_ms) ? fullSeries : current;
+  reportPlot.axes = reportAxes((data?.channels || []).filter(channel => !reportPlot.hiddenChannels.has(channel.id)),view);
   const cursor = reportPlot.cursor !== null && reportPlot.summary.sessions.some(s => !reportPlot.hiddenSessions.has(s.id)
     && reportPlot.cursor >= s.start_ms && reportPlot.cursor < s.end_ms) ? reportPlot.cursor : null;
   drawEdfChart(document.getElementById('reportEventStrip'),null,data,'#22d3ee',cursor);
