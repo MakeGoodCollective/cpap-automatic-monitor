@@ -1594,10 +1594,11 @@ bool days_json(const SdStorage::Session &session, Job &job) {
         ReportArtifact::Document document;
         if (publication_key(request, key) &&
             ReportArtifact::document_lookup(session, prefix, nullptr, document) == ReportArtifact::Lookup::Ready) {
-            char digest[65];
+            char digest[65], identity[65];
             aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
-            job.body.print(",\"publication\":{\"day\":\"index\",\"digest\":\"%s\",\"bytes\":%u},\"stale\":%s",
-                digest, document.bytes, memcmp(key, document.key, 32) ? "true" : "false");
+            aircannect::hex_encode(document.key, 32, identity, sizeof(identity), aircannect::HexCase::Lower);
+            job.body.print(",\"publication\":{\"day\":\"index\",\"digest\":\"%s\",\"bytes\":%u},\"identity\":\"%s\",\"stale\":%s",
+                digest, document.bytes, identity, memcmp(key, document.key, 32) ? "true" : "false");
         }
         job.body.print("}");
         n = end;

@@ -1365,7 +1365,7 @@ async function timeAction(action) {
 
 let reportGeneration = 0;
 let reportController = null, reportRevision = null, reportEpoch = 0, reportPublishedSource = null;
-let reportDataRevision = null, reportDataEpoch = 0, reportLoading = false, reportDirty = false, reportRefreshQueued = false;
+let reportDataRevision = null, reportArtifactRevision = null, reportDataEpoch = 0, reportLoading = false, reportDirty = false, reportRefreshQueued = false;
 const reportReads = {};
 const reportCalendar = {days:[], month:null, cache:null, epoch:0};
 class ReportCache extends Map {
@@ -1383,6 +1383,241 @@ class ReportCache extends Map {
   }
 }
 const reportSummaries = new ReportCache(64,8*1024*1024);
+// Origin-local therapy data. Failure/denial of IndexedDB only loses persistence,
+// never access to the live API or the bounded RAM cache.
+const reportBinary = {ram:new Map(), bytes:0, db:null, opening:null, flights:new Map()};
+async function reportDatabase() {
+  if (reportBinary.opening) return reportBinary.opening;
+  reportBinary.opening = new Promise(resolve => {
+    try {
+      const request = indexedDB.open('airbridge-report-artifacts-v1',1);
+      request.onupgradeneeded = () => {
+        const store = request.result.createObjectStore('entries',{keyPath:'key'});
+        store.createIndex('updated','updated');
+        request.result.createObjectStore('accounting');
+      };
+      request.onsuccess = () => {
+        reportBinary.db = request.result;
+        reportBinary.db.onversionchange = () => { reportBinary.db.close(); reportBinary.db = null; };
+        resolve(reportBinary.db);
+      };
+      request.onerror = request.onblocked = () => resolve(null);
+    } catch { resolve(null); }
+  });
+  return reportBinary.opening;
+}
+
+function reportRememberBinary(key,value) {
+  const bytes = value instanceof ArrayBuffer ? value.byteLength : JSON.stringify(value).length*2;
+  const previous = reportBinary.ram.get(key);
+  reportBinary.bytes -= previous?.bytes || 0;
+  reportBinary.ram.delete(key);
+  if (bytes <= 32*1024*1024) {
+    reportBinary.ram.set(key,{value,bytes}); reportBinary.bytes += bytes;
+  }
+  while (reportBinary.bytes > 32*1024*1024 || reportBinary.ram.size > 2048) {
+    const oldest = reportBinary.ram.keys().next().value;
+    reportBinary.bytes -= reportBinary.ram.get(oldest).bytes; reportBinary.ram.delete(oldest);
+  }
+  return bytes;
+}
+
+async function reportCachedBinary(key) {
+  if (reportBinary.ram.has(key)) return reportBinary.ram.get(key).value;
+  const db = await reportDatabase();
+  if (!db) return null;
+  const value = await new Promise(resolve => {
+    try {
+      const request = db.transaction('entries').objectStore('entries').get(key);
+      request.onsuccess = () => resolve(request.result?.value ?? null);
+      request.onerror = () => resolve(null);
+    } catch { resolve(null); }
+  });
+  if (value !== null) reportRememberBinary(key,value);
+  return value;
+}
+
+async function reportStoreBinary(key,value) {
+  const bytes = reportRememberBinary(key,value), db = await reportDatabase();
+  if (!db || bytes > 256*1024*1024) return;
+  await new Promise(resolve => {
+    try {
+      const tx = db.transaction(['entries','accounting'],'readwrite'), entries = tx.objectStore('entries');
+      tx.oncomplete = tx.onabort = tx.onerror = () => resolve();
+      const old = entries.get(key);
+      old.onsuccess = () => {
+        const accounting = tx.objectStore('accounting'), request = accounting.get('size');
+        request.onsuccess = () => {
+          let total = (request.result?.bytes || 0) - (old.result?.bytes || 0) + bytes;
+          let count = (request.result?.count || 0) + (old.result ? 0 : 1);
+          entries.put({key,value,bytes,updated:Date.now()});
+          const cursor = entries.index('updated').openCursor();
+          cursor.onsuccess = () => {
+            const row = cursor.result;
+            if (row && (total > 256*1024*1024 || count > 16384)) {
+              if (row.value.key !== key) { total -= row.value.bytes; count--; row.delete(); }
+              row.continue();
+            } else accounting.put({bytes:total,count},'size');
+          };
+        };
+      };
+    } catch { resolve(); }
+  });
+}
+
+async function reportArtifactBytes(dataset, artifact, document, signal, first = null, last = null) {
+  if (!/^[a-f0-9]{64}$/.test(artifact.digest) || !Number.isInteger(artifact.bytes) || artifact.bytes <= 0)
+    throw new Error('Invalid artifact identity');
+  const key = 'bytes:'+dataset+':'+artifact.digest+':'+(first === null ? 'all' : first+'-'+last);
+  const cached = await reportCachedBinary(key);
+  if (cached) return cached;
+  if (signal?.aborted) throw new DOMException('Aborted','AbortError');
+  if (lastStatus.report_available === false) throw new Error('This range is not cached; SD is unavailable');
+  const prior = reportBinary.flights.get(key);
+  if (prior && !prior.signal?.aborted) return prior.promise;
+  const flight = (async () => {
+    const headers = first === null ? {} : {Range:'bytes='+first+'-'+last};
+    const response = await api('/api/report/artifact?day='+encodeURIComponent(artifact.day)
+      +'&hash='+artifact.digest+'&kind='+(document ? 'document' : 'tiles'),{signal,headers});
+    const expected = first === null ? artifact.bytes : last-first+1;
+    if (!response || response.status !== (first === null ? 200 : 206)) throw new Error('Artifact read failed ('+(response?.status || 'network')+')');
+    if (first !== null && response.headers.get('Content-Range') !== 'bytes '+first+'-'+last+'/'+artifact.bytes)
+      throw new Error('Invalid artifact range');
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength !== expected) throw new Error('Incomplete artifact');
+    await reportStoreBinary(key,buffer);
+    return buffer;
+  })();
+  reportBinary.flights.set(key,{promise:flight,signal});
+  try { return await flight; } finally { if (reportBinary.flights.get(key)?.promise === flight) reportBinary.flights.delete(key); }
+}
+
+const reportSignalIds = ['Flow','Press','EprPress','MaskPress','Leak','MinVent','RespRate','TidVol','SpO2','Pulse','FlowLim','Snore','TgtVent','Ti','IERatio','AlvMinVent'];
+function decodeReportMetadata(buffer, bytes) {
+  const view = new DataView(buffer), text = new TextDecoder();
+  if (buffer.byteLength < 64 || text.decode(new Uint8Array(buffer,0,8)) !== 'ABTILE01'
+      || view.getUint16(8,true) !== 1 || view.getUint32(12,true) !== bytes || view.getUint16(18,true) !== 512)
+    throw new Error('Unsupported artifact');
+  const length = view.getUint16(10,true), count = view.getUint16(16,true);
+  if (length > 4672 || length > buffer.byteLength || length < 64 || !count || count > 16) throw new Error('Invalid artifact header');
+  let crc = 0xffffffff;
+  for (let i = 0; i < length; i++) {
+    crc ^= i >= 60 && i < 64 ? 0 : view.getUint8(i);
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+  }
+  if (((crc ^ 0xffffffff) >>> 0) !== view.getUint32(60,true)) throw new Error('Artifact metadata checksum');
+  const tracks = [], ids = new Set(); let at = 64, offset = length;
+  const string = (offset,length) => {
+    const data = new Uint8Array(buffer,offset,length), end = data.indexOf(0);
+    if (end < 0) throw new Error('Invalid artifact string');
+    return text.decode(data.subarray(0,end));
+  };
+  for (let c = 0; c < count; c++) {
+    if (at+96 > length) throw new Error('Truncated track');
+    const id = view.getUint16(at,true), levels = view.getUint16(at+2,true), samples = view.getUint32(at+4,true);
+    const origin = Number(view.getBigInt64(at+8,true)), record = Number(view.getBigUint64(at+16,true));
+    const spr = view.getUint32(at+24,true), dmin = view.getInt32(at+28,true), dmax = view.getInt32(at+32,true);
+    const pmin = view.getFloat64(at+40,true), pmax = view.getFloat64(at+48,true);
+    if (!reportSignalIds[id] || ids.has(id) || !spr || !levels || levels > 12
+        || !Number.isSafeInteger(origin) || !Number.isSafeInteger(record) || record <= 0
+        || dmin >= dmax || dmin < -32768 || dmax > 32767 || !Number.isFinite(pmin) || !Number.isFinite(pmax) || pmin >= pmax)
+      throw new Error('Invalid track');
+    ids.add(id);
+    const track = {id:reportSignalIds[id],unit:string(at+56,16),label:string(at+72,24),samples,origin,
+      step:record/spr/1000,scale:(pmax-pmin)/(dmax-dmin),bias:pmin-dmin*(pmax-pmin)/(dmax-dmin),levels:[]};
+    if (track.step < 1 || samples*track.step > 86400000) throw new Error('Invalid track axis');
+    at += 96; let factor = 1;
+    for (let l = 0; l < levels; l++,factor *= 4) {
+      if (at+16 > length) throw new Error('Truncated level');
+      const size = Math.ceil(samples/factor), tile = l ? 4096 : 1088, total = Math.ceil(size/512)*tile;
+      if (view.getUint32(at,true) !== factor || view.getUint32(at+4,true) !== size
+          || view.getUint32(at+8,true) !== offset || view.getUint32(at+12,true) !== total || offset+total > bytes)
+        throw new Error('Invalid level layout');
+      track.levels.push({factor,count:size,offset,bytes:total,tile}); offset += total; at += 16;
+    }
+    if (track.levels.at(-1).count > 512 || (levels > 1 && track.levels.at(-2).count <= 512)) throw new Error('Invalid pyramid');
+    tracks.push(track);
+  }
+  if (at !== length || offset !== bytes) throw new Error('Invalid artifact length');
+  return tracks;
+}
+
+async function reportArtifactTracks(manifest, artifact, signal) {
+  const first = await reportArtifactBytes(manifest.dataset,artifact,false,signal,0,Math.min(artifact.bytes,4672)-1);
+  return decodeReportMetadata(first,artifact.bytes);
+}
+
+function reportTrackLevel(track, view, px) {
+  // Choose detail from the viewport, before aligning reusable transport blocks.
+  if (track.step >= 1000 && track.levels[0].bytes <= 64*1024) return track.levels[0];
+  const visible = Math.max(0,Math.min(view[1],track.origin+track.samples*track.step)-Math.max(view[0],track.origin))/track.step;
+  let level = track.levels[0];
+  for (const next of track.levels.slice(1)) { if (visible/next.factor < px) break; level = next; }
+  return level;
+}
+
+async function reportTrackSegment(manifest, artifact, track, range, px, signal) {
+  const level = reportTrackLevel(track,range,px), step = track.step*level.factor;
+  const first = Math.max(0,Math.floor((range[0]-track.origin)/step)-1);
+  const last = Math.min(level.count,Math.ceil((range[1]-track.origin)/step)+1);
+  if (first >= last) return null;
+  const segment = {from_ms:track.origin+first*step,step_ms:step,raw:level.factor === 1,
+    end_ms:Math.min(track.origin+last*step,track.origin+track.samples*track.step),points:[]};
+  let block = null, blockIndex = -1;
+  for (let i = first; i < last; i++) {
+    const tile = Math.floor(i/512), group = Math.floor(tile/16)*16;
+    if (group !== blockIndex) {
+      const from = level.offset+group*level.tile, to = Math.min(level.offset+level.bytes,from+16*level.tile)-1;
+      block = new DataView(await reportArtifactBytes(manifest.dataset,artifact,false,signal,from,to));
+      blockIndex = group;
+    }
+    const at = (tile-blockIndex)*level.tile, slot = i%512;
+    let low, high, count;
+    if (segment.raw) {
+      count = (block.getUint8(at+1024+Math.floor(slot/8)) >>> (slot%8)) & 1;
+      low = high = block.getInt16(at+slot*2,true);
+    } else {
+      low = block.getInt16(at+slot*8,true); high = block.getInt16(at+slot*8+2,true);
+      count = block.getUint32(at+slot*8+4,true);
+    }
+    const expected = Math.min(level.factor,track.samples-i*level.factor);
+    if (count > expected || (count && low > high)) throw new Error('Invalid artifact cell');
+    segment.points.push(count ? [low*track.scale+track.bias,high*track.scale+track.bias,count,expected] : null);
+  }
+  return segment;
+}
+
+async function reportArtifactSeries(request, px, signal, publish) {
+  const manifest = reportPlot.summary.artifact_manifest;
+  const data = {from_ms:request.view[0],to_ms:request.view[1],requested_from_ms:request.view[0],requested_to_ms:request.view[1],
+    channels:[],events:[],partial:false,events_truncated:false,excluded:request.excluded,data_revision:reportPlot.summary.data_revision};
+  const channels = new Map(), sources = [];
+  for (const artifact of manifest.artifacts) {
+    if (reportPlot.hiddenSessions.has(artifact.session)) continue;
+    const tracks = await reportArtifactTracks(manifest,artifact,signal);
+    for (const track of tracks) {
+      if (!reportSignalIds.slice(0,12).includes(track.id)) continue;
+      if (!channels.has(track.id)) channels.set(track.id,{id:track.id,label:track.label,unit:track.unit,segments:[]});
+      sources.push({artifact,track});
+    }
+  }
+  data.channels = [...channels.values()]; publish(data);
+  for (const group of manifest.event_groups || []) {
+    if (reportPlot.hiddenSessions.has(group.session)) continue;
+    const events = JSON.parse(new TextDecoder().decode(await reportArtifactBytes(manifest.dataset,group,true,signal)));
+    data.events.push(...events.events);
+  }
+  publish(data);
+  for (const {artifact,track} of sources) {
+    if (signal.aborted) throw new DOMException('Aborted','AbortError');
+    if (reportPlot.hiddenChannels.has(track.id)) continue;
+    const segment = await reportTrackSegment(manifest,artifact,track,request.view,px,signal);
+    if (segment) channels.get(track.id).segments.push(segment);
+    publish(data);
+  }
+  return data;
+}
+
 function invalidateReportData() { reportSummaries.clear(); reportPlot.cache.clear(); }
 let reportDisplayedSource = null;
 const reportPlot = {summary:null, selection:null, full:null, view:null, fullSeries:null, series:null,
@@ -1415,6 +1650,11 @@ function applyReportStatus(d) {
     reportRevision = d.report_revision;
     reportEpoch++;
     Object.values(reportReads).forEach(read => read.wake());
+  }
+  if (d.report_artifact_revision !== undefined && d.report_artifact_revision !== reportArtifactRevision) {
+    reportArtifactRevision = d.report_artifact_revision;
+    // Completion changes the index, not the identity of downloaded blocks.
+    reportCalendar.cache = null;
   }
   renderReportAvailability();
   if (changed && document.getElementById('p-report').classList.contains('active')) loadReport();
@@ -1524,13 +1764,14 @@ function renderReportAvailability() {
   const blocked = !source || (source === 'edf' ? lastStatus.report_available !== true
     : lastStatus.system !== 'IDLE' || lastStatus.rop !== 0);
   const busy = document.getElementById('reportResult').getAttribute('aria-busy') === 'true';
+  const navigationBlocked = blocked && source !== 'edf';
   for (const id of ['reportView', 'reportDay', 'reportLatest', 'reportRefresh']) {
-    document.getElementById(id).disabled = blocked || (id === 'reportRefresh' && busy);
+    document.getElementById(id).disabled = navigationBlocked || (id === 'reportRefresh' && busy);
   }
-  document.getElementById('reportDateButton').disabled = blocked || !reportCalendar.days.length;
+  document.getElementById('reportDateButton').disabled = navigationBlocked || !reportCalendar.days.length;
   const selected = document.getElementById('reportDay').value;
-  document.getElementById('reportDayPrevious').disabled = blocked || !reportCalendar.days.some(d => reportDate(d.day) < selected);
-  document.getElementById('reportDayNext').disabled = blocked || !reportCalendar.days.some(d => reportDate(d.day) > selected);
+  document.getElementById('reportDayPrevious').disabled = navigationBlocked || !reportCalendar.days.some(d => reportDate(d.day) < selected);
+  document.getElementById('reportDayNext').disabled = navigationBlocked || !reportCalendar.days.some(d => reportDate(d.day) > selected);
   document.getElementById('reportAvailability').textContent = !source ? 'Waiting for report availability.'
     : source === 'device' ? (blocked ? 'Available in standby.' : '')
     : lastStatus.report_error === 'usb_storage' ? 'SD card is shared via USB.'
@@ -1664,6 +1905,66 @@ function renderReport(data) {
   if (!data.intervals.length) intervals.textContent = 'No recorded mask intervals';
 }
 
+async function loadArtifactReport(view, selection, generation, signal) {
+  const epoch = reportDataEpoch;
+  const offline = lastStatus.report_available !== true;
+  let days = reportCalendar.cache;
+  if (!days) {
+    if (offline) days = await reportCachedBinary('current-index');
+    else {
+      days = await edfReportRequest('days','action=days',generation,signal);
+      await reportStoreBinary('current-index',days);
+    }
+  }
+  if (!days?.dataset) throw new Error('No cached report index; local storage is unavailable');
+  if (signal.aborted || generation !== reportGeneration || epoch !== reportDataEpoch) throw new DOMException('Aborted','AbortError');
+  reportCalendar.cache = days;
+  const dates = (days.days || []).filter(d => Number.isInteger(d.day) && d.day > 0).sort((a,b) => a.day-b.day);
+  reportCalendar.days = dates;
+  const date = document.getElementById('reportDay');
+  date.min = dates.length ? reportDate(dates[0].day) : '';
+  date.max = dates.length ? reportDate(dates.at(-1).day) : '';
+  renderReportAvailability();
+  if (view !== 'day') {
+    const key = 'period:'+days.dataset+':'+selection;
+    if (offline) {
+      const saved = await reportCachedBinary(key);
+      if (!saved) throw new Error('This period is not cached');
+      return {...saved,stale:true};
+    }
+    const data = await edfReportRequest('summary','action=summary&view=period&period='+selection,generation,signal);
+    await reportStoreBinary(key,data);
+    return data;
+  }
+  const chosen = dates.find(d => d.day === (selection || dates.at(-1)?.day));
+  const day = chosen?.day || selection || 0;
+  let manifest = null, stale = !!chosen?.stale || offline;
+  const saved = await reportCachedBinary('day:'+days.dataset+':'+day);
+  if (saved && (offline || saved.identity === chosen?.identity)) manifest = saved;
+  if (!manifest && chosen?.publication) {
+    try {
+      const bytes = await reportArtifactBytes(days.dataset,chosen.publication,true,signal);
+      manifest = JSON.parse(new TextDecoder().decode(bytes));
+    } catch (error) {
+      if (error.name === 'AbortError') throw error;
+      manifest = saved; stale = true;
+    }
+  }
+  if ((!manifest || chosen?.stale) && !offline) {
+    try {
+      manifest = await edfReportRequest('summary','action=prepare&day='+day,generation,signal);
+      stale = false;
+      // The new head is discovered through the owner index, never synthesized.
+      reportCalendar.cache = null;
+    } catch (error) { if (!manifest || error.name === 'AbortError') throw error; }
+  }
+  if (!manifest || manifest.dataset !== days.dataset || !Array.isArray(manifest.artifacts)) throw new Error('Report publication unavailable');
+  if (signal.aborted || generation !== reportGeneration || epoch !== reportDataEpoch) throw new DOMException('Aborted','AbortError');
+  await reportStoreBinary('day:'+manifest.dataset+':'+manifest.day,manifest);
+  reportPlot.selection = 'view=day&day='+manifest.day;
+  return {...manifest.summary,data_revision:days.data_revision,artifact_manifest:manifest,stale};
+}
+
 async function loadReport(latest = false, refresh = false) {
   const generation = ++reportGeneration;
   if (reportController) reportController.abort();
@@ -1677,7 +1978,7 @@ async function loadReport(latest = false, refresh = false) {
   reportPublishedSource = reportSource();
   reportLoading = false; reportDirty = false;
   for (const id of ['reportMaskCard','reportChartsCard']) document.getElementById(id).inert = false;
-  if (renderReportAvailability()) {
+  if (renderReportAvailability() && reportSource() !== 'edf') {
     document.getElementById('reportLoadState').textContent = reportDisplayedSource ? 'Previous report' : '';
     document.getElementById('reportSpinner').style.display = 'none';
     document.getElementById('reportResult').setAttribute('aria-busy', 'false');
@@ -1686,7 +1987,6 @@ async function loadReport(latest = false, refresh = false) {
   const source = reportSource();
   reportLoading = true;
   const dataEpoch = reportDataEpoch;
-  const daysEpoch = reportCalendar.epoch;
   const selected = document.getElementById('reportView').value;
   const day = selected === 'day';
   const view = day ? 'day' : 'period';
@@ -1708,37 +2008,9 @@ async function loadReport(latest = false, refresh = false) {
     if (!Number.isInteger(selection)) throw new Error('Choose a valid date');
     let data;
     if (source === 'edf') {
-      const days = reportCalendar.cache || await edfReportRequest('days', 'action=days', generation, reportController.signal);
-      if (generation !== reportGeneration) return;
-      if (daysEpoch !== reportCalendar.epoch || (dataEpoch !== reportDataEpoch && days.data_revision !== reportDataRevision)) {
-        reportDirty = true; return;
-      }
-      if (days.partial !== true && Number.isInteger(days.data_revision)
-          && (reportDataRevision === null || days.data_revision === reportDataRevision)) reportCalendar.cache = days;
-      const dates = (days.days || []).filter(d => Number.isInteger(d.day) && d.day > 0).sort((a,b) => a.day-b.day);
-      reportCalendar.days = dates;
-      date.min = dates.length ? reportDate(Math.min(...dates.map(d => d.day))) : '';
-      date.max = dates.length ? reportDate(Math.max(...dates.map(d => d.day))) : '';
-      document.getElementById('reportDateButton').textContent = date.value || (dates.length ? date.max : 'No recordings');
-      renderReportAvailability();
-      const query = 'view=' + view + (day ? '&day=' : '&period=') + selection;
-      const key = query + '&revision=' + days.data_revision;
-      data = reportSummaries.get(key);
-      if (!data) {
-        data = await edfReportRequest('summary', 'action=summary&' + query, generation, reportController.signal);
-        // Building another day's cache may enrich an earlier incomplete history.
-        for (const [saved,value] of reportSummaries) if (value.history?.complete === false) reportSummaries.delete(saved);
-      }
-      if (generation !== reportGeneration) return;
-      if (daysEpoch !== reportCalendar.epoch || (dataEpoch !== reportDataEpoch && data.data_revision !== reportDataRevision)
-          || (days.data_revision !== undefined && days.data_revision !== data.data_revision)) {
-        invalidateReportDays();
-        reportDirty = true;
-        return;
-      }
+      data = await loadArtifactReport(view,selection,generation,reportController.signal);
+      if (dataEpoch !== reportDataEpoch) { reportDirty = true; return; }
       reportDirty = false;
-      if (data.partial === false && Number.isInteger(data.data_revision)) reportSummaries.remember(key,data);
-      reportPlot.selection = 'view=' + view + '&day=' + data.day + (day ? '' : '&period=' + selection);
     } else {
       const query = '?' + (lastStatus.report_source === 'edf' ? 'source=device&' : '') + 'view=' + view + (day ? '&day=' : '&period=') + selection;
       data = await settingsRequest(day ? undefined : {method:'POST'}, '/api/report', query);
@@ -1938,7 +2210,7 @@ function renderEdfReport(data) {
     ? data.day > 0 ? reportDate(data.day) : selectedDate
     : data.first_day > 0 && data.last_day > 0 ? reportDate(data.first_day) + ' to ' + reportDate(data.last_day) : '';
   document.getElementById('reportNote').textContent = !data.present ? 'No saved EDF data for this selection.'
-    : data.partial ? 'Incomplete report' : '';
+    : data.stale ? 'Last prepared report' : data.partial ? 'Incomplete report' : '';
   document.getElementById('reportGrid').hidden = true;
   renderReportMetrics(data);
   const totals = document.createDocumentFragment();
@@ -2023,6 +2295,8 @@ function toggleReportSession(id) {
 }
 
 function clearReportPlots() {
+  reportPlot.prefetch?.abort();
+  reportPlot.flight?.controller?.abort();
   reportPlot.serial++;
   if (reportReads.history) reportReads.history.cancel();
   reportPlot.history = reportPlot.historyMetric = null; reportPlot.historyPending = false;
@@ -2065,6 +2339,8 @@ function setReportViewport(from, to) {
   if (reportPlot.view && reportPlot.view[0] === from && reportPlot.view[1] === from+width) return;
   reportPlot.view = [from,from+width];
   reportPlot.serial++;
+  reportPlot.flight?.controller?.abort();
+  reportPlot.prefetch?.abort();
   if (reportReads.series?.job) reportReads.series.cancel();
 }
 
@@ -2084,6 +2360,7 @@ function resetReportViewport() {
 }
 
 function scheduleReportDraw(request = false) {
+  if (request) reportPlot.prefetch?.abort();
   reportPlot.request ||= request;
   if (reportPlot.frame !== null) return;
   reportPlot.frame = requestAnimationFrame(() => {
@@ -2107,36 +2384,49 @@ async function drainReportSeries() {
   const allHidden = reportSessions().every(s => reportPlot.hiddenSessions.has(s.id));
   const note = document.getElementById('reportSeriesNote'); note.textContent = allHidden ? 'No sessions selected' : 'Loading chart data...';
   try {
-    const dataEpoch = reportDataEpoch, selection = reportPlot.selection, signal = reportController.signal;
+    request.controller = new AbortController();
+    const signal = AbortSignal.any([reportController.signal,request.controller.signal]);
     // All plot cards share this box geometry, including before channels mount.
     const plotStyle = getComputedStyle(document.getElementById('reportEventCard'));
     const inset = ['paddingLeft','paddingRight','borderLeftWidth','borderRightWidth']
       .reduce((width,key) => width+parseFloat(plotStyle[key]),0);
     const px = Math.max(1, Math.min(1200, Math.floor(document.getElementById('reportPlots').clientWidth - inset - 52)));
-    const query = 'action=series&' + selection + '&from_ms=' + Math.floor(request.view[0])
-      + '&to_ms=' + Math.ceil(request.view[1]) + '&px=' + px + '&revision=' + reportPlot.summary.data_revision
-      + (request.excluded ? '&exclude=' + request.excluded : '');
-    const key = 'source=edf&' + query, cached = reportPlot.cache.get(key);
-    const data = cached || await edfReportRequest('series', query, request.generation, signal);
-    if (request.generation !== reportGeneration || signal.aborted || dataEpoch !== reportDataEpoch
-        || selection !== reportPlot.selection || reportSource() !== 'edf') return;
-    if (request.excluded !== reportPlot.excluded) return;
-    if (data.data_revision !== reportPlot.summary.data_revision) throw new Error('EDF data changed; refresh the report');
-    if (data.excluded !== request.excluded) throw new Error('Session selection changed; refresh the report');
-    if (!cached) normalizeReportSeries(data);
+    request.px = px;
+    const current = () => request.generation === reportGeneration && request.serial === reportPlot.serial
+      && request.excluded === reportPlot.excluded && !signal.aborted;
+    const data = await reportArtifactSeries(request,px,signal,data => {
+      if (!current()) return;
+      reportPlot.series = data;
+      presentReportChannels(data);
+    });
+    if (!current()) return;
     if (request.view[0] === full[0] && request.view[1] === full[1]) {
       reportPlot.fullSeries = data;
       // Only a full, unfiltered range establishes the final selection scale.
-      if (!reportPlot.axesAllSessions) reportPlot.axes = reportAxes(data.channels);
+      const measured = data.channels.filter(channel => channel.segments.some(segment => segment.points.some(reportBucket)));
+      const axes = reportAxes(measured);
+      if (!reportPlot.axesAllSessions) reportPlot.axes = axes;
+      else for (const [id,axis] of Object.entries(axes)) if (!reportPlot.axes[id]) reportPlot.axes[id] = axis;
       if (!request.excluded) reportPlot.axesAllSessions = true;
     }
     if (request.serial !== reportPlot.serial) return;
-    if (data.partial === false && !data.events_truncated) {
-      reportPlot.cache.remember(key,data);
-    }
     reportPlot.series = data;
     note.textContent = allHidden ? 'No sessions selected'
       : [data.partial ? 'Incomplete chart data.' : '', data.events_truncated ? 'Zoom for more events.' : ''].filter(Boolean).join(' ');
+    presentReportChannels(data);
+    prefetchReportPublications(request,signal).catch(() => {});
+  } catch(e) {
+    if (request.generation === reportGeneration && request.serial === reportPlot.serial && e.name !== 'AbortError') {
+      reportPlot.pending = null;
+      note.textContent = 'EDF chart unavailable: ' + e.message + '. Refresh to retry.';
+    }
+  } finally {
+    if (reportPlot.flight === request) reportPlot.flight = null;
+    drainReportSeries();
+  }
+}
+
+function presentReportChannels(data) {
     const plots = document.getElementById('reportPlots');
     const channels = [...(data.channels || [])];
     if (channels.some(channel => channel.id === 'MinVent')) {
@@ -2181,14 +2471,54 @@ async function drainReportSeries() {
       }
     }
     scheduleReportDraw();
-  } catch(e) {
-    if (request.generation === reportGeneration && request.serial === reportPlot.serial && e.name !== 'AbortError') {
-      reportPlot.pending = null;
-      note.textContent = 'EDF chart unavailable: ' + e.message + '. Refresh to retry.';
+}
+
+async function prefetchReportPublications(request, parent) {
+  reportPlot.prefetch?.abort();
+  const controller = new AbortController(); reportPlot.prefetch = controller;
+  const signal = AbortSignal.any([parent,controller.signal]);
+  const dataset = reportPlot.summary.artifact_manifest.dataset;
+  const current = reportPlot.summary.artifact_manifest;
+  // Adjacent blocks precede other days, using the visible LOD rather than a
+  // widened viewport which could silently select a different resolution.
+  for (const artifact of current.artifacts) {
+    if (reportPlot.hiddenSessions.has(artifact.session)) continue;
+    for (const track of await reportArtifactTracks(current,artifact,signal)) {
+      if (!reportSignalIds.slice(0,12).includes(track.id) || reportPlot.hiddenChannels.has(track.id)) continue;
+      const level = reportTrackLevel(track,request.view,request.px || 800);
+      const span = 512*16*track.step*level.factor;
+      const first = Math.floor((request.view[0]-track.origin)/span)-1;
+      const last = Math.floor((request.view[1]-track.origin)/span)+1;
+      for (const block of new Set([first,last])) {
+        if (signal.aborted || reportPlot.gesture || reportLoading) return;
+        const from = level.offset+block*16*level.tile;
+        if (block < 0 || from >= level.offset+level.bytes) continue;
+        await reportArtifactBytes(dataset,artifact,false,signal,from,Math.min(from+16*level.tile,level.offset+level.bytes)-1);
+      }
     }
-  } finally {
-    if (reportPlot.flight === request) reportPlot.flight = null;
-    drainReportSeries();
+  }
+  const day = reportPlot.summary.day;
+  const days = [...reportCalendar.days].filter(d => d.publication && !d.stale && d.day !== day);
+  const previous = days.filter(d => d.day < day).at(-1), next = days.find(d => d.day > day);
+  const selected = [...new Set([previous,next,...days.slice(-14).reverse()].filter(Boolean))];
+  for (const item of selected) {
+    if (signal.aborted || request.generation !== reportGeneration || request.serial !== reportPlot.serial
+        || reportPlot.gesture || reportLoading || lastStatus.report_available !== true) return;
+    const buffer = await reportArtifactBytes(dataset,item.publication,true,signal);
+    const manifest = JSON.parse(new TextDecoder().decode(buffer));
+    if (manifest.dataset !== dataset) return;
+    await reportStoreBinary('day:'+dataset+':'+manifest.day,manifest);
+    for (const group of manifest.event_groups || []) await reportArtifactBytes(dataset,group,true,signal);
+    const sessions = manifest.summary.sessions.filter(s => Number.isFinite(s.start_ms) && Number.isFinite(s.end_ms));
+    if (!sessions.length) continue;
+    const range = [Math.min(...sessions.map(s => s.start_ms)),Math.max(...sessions.map(s => s.end_ms))];
+    for (const artifact of manifest.artifacts) {
+      if (signal.aborted || reportPlot.gesture) return;
+      for (const track of await reportArtifactTracks(manifest,artifact,signal)) {
+        if (!reportSignalIds.slice(0,12).includes(track.id) || reportPlot.hiddenChannels.has(track.id)) continue;
+        await reportTrackSegment(manifest,artifact,track,range,800,signal);
+      }
+    }
   }
 }
 
@@ -2202,7 +2532,9 @@ function renderReportChannelOptions() {
       if (reportPlot.hiddenChannels.has(channel.id)) reportPlot.hiddenChannels.delete(channel.id);
       else reportPlot.hiddenChannels.add(channel.id);
       button.setAttribute('aria-pressed',String(!reportPlot.hiddenChannels.has(channel.id)));
-      scheduleReportDraw();
+      reportPlot.serial++;
+      reportPlot.flight?.controller?.abort();
+      scheduleReportDraw(true);
     });
     options.append(button);
   }
@@ -2249,7 +2581,7 @@ function reportAxes(channels) {
   for (const channel of channels) {
     let low = Infinity, high = -Infinity;
     const group = channel.unit === 'cmH2O' ? pressure : [channel];
-    for (const member of group) for (const bucket of member.buckets || []) {
+    for (const member of group) for (const segment of member.segments || [{points:member.buckets || []}]) for (const bucket of segment.points) {
       if (!reportBucket(bucket)) continue;
       low = Math.min(low,bucket[0]); high = Math.max(high,bucket[1]);
     }
@@ -2326,6 +2658,71 @@ function prepareReportCanvas(canvas) {
   return {ctx,W,H};
 }
 
+function drawArtifactSegment(ctx, segment, x, y) {
+  const points = segment.points;
+  if (segment.raw) {
+    let group = [], pixel = null, connected = false, runCount = 0, lastPoint = null;
+    const endRun = () => {
+      if (runCount === 1) ctx.lineTo(lastPoint[0]+0.5,lastPoint[1]);
+      connected = false; runCount = 0;
+    };
+    const flush = () => {
+      if (!group.length) return;
+      let low = group[0], high = low;
+      for (const point of group) { if (point[1] < low[1]) low = point; if (point[1] > high[1]) high = point; }
+      const selected = [...new Set([group[0],low,high,group.at(-1)])].sort((a,b) => a[0]-b[0]);
+      for (const point of selected) {
+        const xx = x(segment.from_ms+point[0]*segment.step_ms), yy = y(point[1]);
+        if (connected) ctx.lineTo(xx,yy); else { ctx.moveTo(xx,yy); connected = true; }
+        runCount++; lastPoint = [xx,yy];
+      }
+      group = [];
+    };
+    ctx.beginPath();
+    for (let i = 0; i < points.length; i++) {
+      if (!reportBucket(points[i])) { flush(); endRun(); pixel = null; continue; }
+      const at = Math.floor(x(segment.from_ms+i*segment.step_ms));
+      if (pixel !== at) { flush(); pixel = at; }
+      group.push([i,points[i][0]]);
+    }
+    flush(); endRun(); ctx.stroke();
+    return;
+  }
+  const complete = i => reportBucket(points[i]) && points[i][2] === points[i][3];
+  const xx = i => x((segment.from_ms+i*segment.step_ms
+    + Math.min(segment.from_ms+(i+1)*segment.step_ms,segment.end_ms ?? Infinity))/2);
+  for (let first = 0; first < points.length;) {
+    if (!reportBucket(points[first])) { first++; continue; }
+    let last = first;
+    if (complete(first)) while (last+1 < points.length && complete(last+1)) last++;
+    ctx.beginPath();
+    if (last > first) {
+      ctx.globalAlpha = 0.18; ctx.moveTo(xx(first),y(points[first][0]));
+      for (let i = first+1; i <= last; i++) ctx.lineTo(xx(i),y(points[i][0]));
+      for (let i = last; i >= first; i--) ctx.lineTo(xx(i),y(points[i][1]));
+      ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1; ctx.beginPath();
+      for (const edge of [0,1]) {
+        ctx.moveTo(xx(first),y(points[first][edge]));
+        for (let i = first+1; i <= last; i++) ctx.lineTo(xx(i),y(points[i][edge]));
+      }
+    } else {
+      ctx.globalAlpha = complete(first) ? 1 : 0.45;
+      const low = y(points[first][0]), high = y(points[first][1]);
+      ctx.moveTo(xx(first)-(low === high ? 0.5 : 0),low);
+      ctx.lineTo(xx(first)+(low === high ? 0.5 : 0),high);
+    }
+    ctx.stroke(); ctx.globalAlpha = 1; first = last+1;
+  }
+}
+
+function reportArtifactValue(channel, time) {
+  for (const segment of channel?.segments || []) {
+    const i = Math.floor((time-segment.from_ms)/segment.step_ms);
+    if (i >= 0 && i < segment.points.length) return segment.points[i];
+  }
+  return null;
+}
+
 function drawEdfChart(canvas, channel, data, color, cursor = reportPlot.cursor) {
   const {ctx,W,H} = prepareReportCanvas(canvas);
   const members = (Array.isArray(channel) ? channel : [channel]).filter(Boolean);
@@ -2351,6 +2748,10 @@ function drawEdfChart(canvas, channel, data, color, cursor = reportPlot.cursor) 
   for (const member of members) if (data) {
     const memberColor = members.length > 1 ? reportChannelColor(member.id) : color;
     ctx.strokeStyle = memberColor; ctx.fillStyle = memberColor; ctx.lineWidth = 1.2;
+    if (member.segments) {
+      for (const segment of member.segments) drawArtifactSegment(ctx,segment,x,y);
+      continue;
+    }
     const buckets = member.buckets || [];
     const xx = i => x(data.from_ms+(i+0.5)*data.bucket_ms);
     const complete = i => {
@@ -2432,7 +2833,7 @@ function drawReportPlots() {
     row.title.style.color = members.length > 1 ? '' : reportChannelColor(shown[0].id);
     const index = cursor !== null && data ? Math.floor((cursor-data.from_ms)/data.bucket_ms) : -1;
     shown.forEach((member,i) => {
-      const bucket = channels[i].buckets?.[index];
+      const bucket = channels[i].segments ? reportArtifactValue(channels[i],cursor) : channels[i].buckets?.[index];
       const low = reportBucket(bucket) ? reportNumber(bucket[0]) : '--';
       const high = reportBucket(bucket) ? reportNumber(bucket[1]) : '--';
       const text = cursor === null ? '' : low === high ? low : low + '..' + high;
