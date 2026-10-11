@@ -966,8 +966,7 @@ static void handleReport(AsyncWebServerRequest *request) {
     if (!reportNumber(request, "day", UINT16_MAX, day) ||
         !reportNumber(request, "period", 5, period) ||
         !reportNumber(request, "revision", UINT32_MAX, revision) ||
-        (!period_view && request->hasParam("period")) ||
-        (local.action == EdfReport::Action::Reindex && request->method() != HTTP_POST)) {
+        (!period_view && request->hasParam("period"))) {
         invalid(); return;
     }
     local.day = static_cast<uint16_t>(day);
@@ -992,7 +991,9 @@ static void handleReport(AsyncWebServerRequest *request) {
     }
 
     if (request->method() != (local.action == EdfReport::Action::Reindex ? HTTP_POST : HTTP_GET)) {
-        request->send(405, "application/json", "{\"error\":\"report_edf_requires_GET\"}");
+        request->send(405, "application/json", local.action == EdfReport::Action::Reindex
+            ? "{\"error\":\"report_reindex_requires_POST\"}"
+            : "{\"error\":\"report_edf_requires_GET\"}");
         return;
     }
     if (!EdfReport::valid(local)) { invalid(); return; }

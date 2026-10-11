@@ -1491,6 +1491,7 @@ function decodeReportMetadata(buffer, bytes) {
     for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
   }
   if (((crc ^ 0xffffffff) >>> 0) !== view.getUint32(60,true)) throw new Error('Artifact metadata checksum');
+  if (view.getBigUint64(52,true) !== 0n) throw new Error('Unsupported artifact flags');
   const tracks = [], ids = new Set(); let at = 64, offset = length;
   const string = (offset,length) => {
     const data = new Uint8Array(buffer,offset,length), end = data.indexOf(0);
@@ -1503,7 +1504,7 @@ function decodeReportMetadata(buffer, bytes) {
     const origin = Number(view.getBigInt64(at+8,true)), record = Number(view.getBigUint64(at+16,true));
     const spr = view.getUint32(at+24,true), dmin = view.getInt32(at+28,true), dmax = view.getInt32(at+32,true);
     const pmin = view.getFloat64(at+40,true), pmax = view.getFloat64(at+48,true);
-    if (!reportSignalIds[id] || ids.has(id) || !spr || !levels || levels > 12
+    if (!reportSignalIds[id] || ids.has(id) || !spr || !levels || levels > 12 || view.getUint32(at+36,true)
         || !Number.isSafeInteger(origin) || !Number.isSafeInteger(record) || record <= 0
         || dmin >= dmax || dmin < -32768 || dmax > 32767 || !Number.isFinite(pmin) || !Number.isFinite(pmax) || pmin >= pmax)
       throw new Error('Invalid track');
@@ -1722,10 +1723,6 @@ function edfReportRequest(slot, query, generation, signal) {
         }
         if ((!read.job && !data.job) || (read.job && data.job && data.job !== read.job)) throw new Error('Invalid EDF report job');
         if (data.job) read.job = data.job;
-        if (slot === 'series' && reportPlot.flight && reportPlot.flight.serial !== reportPlot.serial) {
-          controller.abort();
-          return;
-        }
         read.epoch = epoch;
       } catch(e) { finish(e); return; }
       finally { read.busy = false; }
@@ -2248,13 +2245,11 @@ function toggleReportSession(id) {
     reportPlot.full = full;
     reportPlot.view = [...full];
   }
-  const bytes = new Uint8Array(Math.floor(Math.max(-1,...reportPlot.hiddenSessions)/8)+1);
-  for (const hidden of reportPlot.hiddenSessions) bytes[Math.floor(hidden/8)] |= 1 << (hidden%8);
-  reportPlot.excluded = Array.from(bytes, byte => byte.toString(16).padStart(2,'0')).join('');
+  reportPlot.excluded = [...reportPlot.hiddenSessions].sort((a,b) => a-b).join(',');
   reportPlot.serial++;
-  // Merged envelopes cannot be separated in the browser; discard the old mask.
+  // Reject in-flight display results; immutable per-session bytes remain reusable.
   reportPlot.fullSeries = reportPlot.series = reportPlot.cursor = reportPlot.pending = null;
-  if (reportReads.series) reportReads.series.cancel();
+  reportPlot.flight?.controller?.abort();
   renderReportSessions(id);
   scheduleReportDraw(true);
 }
@@ -2263,7 +2258,6 @@ function clearReportPlots() {
   reportPlot.prefetch?.abort();
   reportPlot.flight?.controller?.abort();
   reportPlot.serial++;
-  if (reportReads.history) reportReads.history.cancel();
   reportPlot.history = reportPlot.historyMetric = null; reportPlot.historyPending = false;
   document.getElementById('reportHistory').hidden = true;
   document.getElementById('reportHistoryNote').textContent = '';
@@ -2306,7 +2300,6 @@ function setReportViewport(from, to) {
   reportPlot.serial++;
   reportPlot.flight?.controller?.abort();
   reportPlot.prefetch?.abort();
-  if (reportReads.series?.job) reportReads.series.cancel();
 }
 
 function zoomReportViewport(factor) {
