@@ -92,10 +92,6 @@ constexpr uint32_t RETAIN_MS = 6 * 60 * 60 * 1000;
 constexpr uint32_t DELIVERY_MS = 30000;
 constexpr size_t SLOT_COUNT = 2;
 constexpr size_t RETAINED_SLOTS = 32;
-// Eight maximum responses on larger boards; leave one build's realloc peak
-// (old/new JSON, series cells, histograms) available on the 2 MiB GEEK too.
-constexpr size_t RETAINED_BYTES = 8 * MAX_BODY;
-constexpr size_t BUILD_RESERVE = 3 * MAX_BODY;
 constexpr size_t CHART_CHANNEL_COUNT = 9;
 constexpr double LEAK_THRESHOLD = 24;
 constexpr int64_t LEVEL_MS[] = {10000, 60000, 600000, 3600000};
@@ -336,7 +332,6 @@ struct JobPool {
     Job *begin() { return data; }
     Job *end() { return data + count; }
 } jobs;
-size_t retention_budget = SLOT_COUNT * INTERNAL_BODY;
 SemaphoreHandle_t mutex = nullptr, wake = nullptr;
 TaskHandle_t worker_task = nullptr;
 portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -402,23 +397,18 @@ bool evictable(const Job &job) {
     return job.state == JobState::Complete && !job.readers &&
         (job.deliveries >= job.consumers || uint32_t(millis() - job.completed_ms) >= DELIVERY_MS);
 }
-void trim_results(bool building) {
-    while (true) {
-        size_t bytes = 0;
-        Job *oldest = nullptr;
-        for (auto &job : jobs) {
-            if (job.state != JobState::Complete) continue;
-            bytes += job.body.capacity();
-            if (evictable(job) && (!oldest || int32_t(job.completed_ms - oldest->completed_ms) < 0))
-                oldest = &job;
-        }
-        const auto memory = aircannect::Memory::status();
-        const bool pressure = memory.psram_available &&
-            (memory.psram_free < (building ? BUILD_RESERVE : MAX_BODY) ||
-             (building && memory.psram_max_alloc < MAX_BODY + 1));
-        if (!oldest || (bytes <= retention_budget && !pressure)) return;
-        reset_job(*oldest);
+bool reclaim_result() {
+    // Called by Memory in any allocating task, including error serialization
+    // with this mutex already held. Do not wait or touch SD here.
+    if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return false;
+    Job *oldest = nullptr;
+    for (auto &job : jobs) {
+        if (evictable(job) && job.body.capacity() &&
+            (!oldest || int32_t(job.completed_ms - oldest->completed_ms) < 0)) oldest = &job;
     }
+    if (oldest) reset_job(*oldest);
+    xSemaphoreGive(mutex);
+    return oldest != nullptr;
 }
 bool aborted(const Job *job, const SdStorage::Session &session) {
     return (job && __atomic_load_n(&job->cancelled, __ATOMIC_ACQUIRE)) ||
@@ -2193,7 +2183,6 @@ bool work_once() {
             (!job || int32_t(candidate.id - job->id) < 0)) job = &candidate;
     }
     if (job) job->state = JobState::Running;
-    trim_results(true);
     xSemaphoreGive(mutex);
     if (!AirSenseState::local_background_allowed()) {
         defer_job(job); publish(State::Blocked, "not_idle"); return false;
@@ -2292,7 +2281,6 @@ bool work_once() {
     const int code = job->code;
     const size_t bytes = job->body.length();
     log_result(*job);
-    trim_results(false);
     xSemaphoreGive(mutex);
     portENTER_CRITICAL(&status_mux);
     ++status.revision;
@@ -2323,8 +2311,6 @@ void init() {
             for (size_t i = 0; i < RETAINED_SLOTS; ++i) new (&storage[i]) Job;
             jobs.data = storage;
             jobs.count = RETAINED_SLOTS;
-            retention_budget = std::min(RETAINED_BYTES,
-                memory.psram_total > BUILD_RESERVE ? memory.psram_total - BUILD_RESERVE : size_t(0));
         }
     }
     mutex = xSemaphoreCreateMutex();
@@ -2339,6 +2325,7 @@ void init() {
         publish(State::Error, "worker_unavailable");
         return;
     }
+    aircannect::Memory::set_reclaimer(reclaim_result);
     BaseType_t created = pdFAIL;
     if (aircannect::Memory::psram_available())
         created = xTaskCreatePinnedToCoreWithCaps(worker, "edf_report", 8192, nullptr, 1,

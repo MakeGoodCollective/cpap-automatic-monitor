@@ -11,14 +11,24 @@
 namespace aircannect {
 namespace Memory {
 namespace {
+Reclaimer cache_reclaimer = nullptr;
 
 #ifdef ARDUINO
 bool detect_psram() {
     return psramFound() && ESP.getPsramSize() > 0;
 }
+
+bool reclaim() {
+    const auto callback = __atomic_load_n(&cache_reclaimer, __ATOMIC_ACQUIRE);
+    return callback && callback();
+}
 #endif
 
 }  // namespace
+
+void set_reclaimer(Reclaimer reclaimer) {
+    __atomic_store_n(&cache_reclaimer, reclaimer, __ATOMIC_RELEASE);
+}
 
 MemoryStatus status() {
 #ifdef ARDUINO
@@ -55,9 +65,11 @@ void *alloc_large(size_t size, bool allow_internal_fallback) {
     if (size == 0) return nullptr;
 
     if (detect_psram()) {
-        void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM |
-                                           MALLOC_CAP_8BIT);
-        if (ptr) return ptr;
+        do {
+            void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM |
+                                               MALLOC_CAP_8BIT);
+            if (ptr) return ptr;
+        } while (reclaim());
     }
 
     if (!allow_internal_fallback) return nullptr;
@@ -79,11 +91,11 @@ void *realloc_large(void *ptr,
     }
 
     if (detect_psram()) {
-        void *next = heap_caps_realloc(ptr,
-                                       size,
-                                       MALLOC_CAP_SPIRAM |
-                                           MALLOC_CAP_8BIT);
-        if (next) return next;
+        do {
+            void *next = heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM |
+                                                       MALLOC_CAP_8BIT);
+            if (next) return next;
+        } while (reclaim());
     }
 
     if (!allow_internal_fallback) return nullptr;
