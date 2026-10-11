@@ -2138,7 +2138,12 @@ async function drainReportSeries() {
     note.textContent = allHidden ? 'No sessions selected'
       : [data.partial ? 'Incomplete chart data.' : '', data.events_truncated ? 'Zoom for more events.' : ''].filter(Boolean).join(' ');
     const plots = document.getElementById('reportPlots');
-    const channels = data.channels || [];
+    const channels = [...(data.channels || [])];
+    if (channels.some(channel => channel.id === 'MinVent')) {
+      const beforeVent = channels.filter(channel => channel.id === 'FlowLim' || channel.id === 'Snore');
+      for (const channel of beforeVent) channels.splice(channels.indexOf(channel),1);
+      channels.splice(channels.findIndex(channel => channel.id === 'MinVent'),0,...beforeVent);
+    }
     if (reportPlot.availableChannels.map(c => c.id).join('|') !== channels.map(channel => channel.id).join('|')) {
       reportPlot.availableChannels = channels.map(({id,label,unit}) => ({id,label,unit}));
       renderReportChannelOptions();
