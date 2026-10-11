@@ -278,7 +278,8 @@ bool retire_cache(const SdStorage::Session &session, const IndexedSession &entry
     const bool success = session.run([&](fs::FS &fs) {
         for (const char *suffix : {"stats", "series", "stats.part", "series.part"}) {
             char path[96];
-            snprintf(path, sizeof(path), "%s/%s.%s", CACHE_DIR, entry.entry.file_prefix, suffix);
+            snprintf(path, sizeof(path), "%s/%s/%s.%s", CACHE_DIR,
+                     entry.entry.therapy_day, entry.entry.file_prefix, suffix);
             if (fs.exists(path)) {
                 if (!fs.remove(path)) return false;
                 removed = true;
@@ -320,7 +321,8 @@ void source_path(const IndexedSession &entry, uint8_t file, const char *ext,
              entry.entry.file_prefix, SUFFIXES[file], ext);
 }
 void cache_path(const IndexedSession &entry, const char *ext, char (&out)[96]) {
-    snprintf(out, sizeof(out), "%s/%s.%s", CACHE_DIR, entry.entry.file_prefix, ext);
+    snprintf(out, sizeof(out), "%s/%s/%s.%s", CACHE_DIR,
+             entry.entry.therapy_day, entry.entry.file_prefix, ext);
 }
 
 bool catalog_day(const char *text, uint16_t &out) {
@@ -1334,6 +1336,10 @@ bool start_part(const SdStorage::Session &session, const char *path,
     return session.run([&](fs::FS &fs) {
         if ((!fs.exists("/airbridge") && !fs.mkdir("/airbridge")) ||
             (!fs.exists(CACHE_DIR) && !fs.mkdir(CACHE_DIR))) return false;
+        char directory[96];
+        snprintf(directory, sizeof(directory), "%s", path);
+        *strrchr(directory, '/') = 0;
+        if (!fs.exists(directory) && !fs.mkdir(directory)) return false;
         if (fs.exists(path) && !fs.remove(path)) return false;
         fs::File file = fs.open(path, FILE_WRITE);
         const bool success = file && SdStorage::write_exact(file, header, bytes);
@@ -1373,7 +1379,7 @@ bool finish_part(const SdStorage::Session &session, const char *part,
     return success;
 }
 
-bool cache_name(const char *input, char (&path)[96], const char *&base) {
+bool cache_name(const char *input, const char *&base) {
     base = strrchr(input, '/');
     base = base ? base + 1 : input;
     if (strlen(base) < 21 || strlen(base) > 32) return false;
@@ -1381,13 +1387,40 @@ bool cache_name(const char *input, char (&path)[96], const char *&base) {
         if (n == 8 ? base[n] != '_' : base[n] < '0' || base[n] > '9') return false;
     if (strcmp(base + 15, ".stats") && strcmp(base + 15, ".series") &&
         strcmp(base + 15, ".stats.part") && strcmp(base + 15, ".series.part")) return false;
-    snprintf(path, sizeof(path), "%s/%s", CACHE_DIR, base);
+    return true;
+}
+
+bool migrate_cache(const SdStorage::Session &session) {
+    SdStorage::Reader directory;
+    if (!directory.open(session, CACHE_DIR, true))
+        return session.run([&](fs::FS &fs) { return !fs.exists(CACHE_DIR); });
+    bool end = false;
+    SdStorage::Reader::Entry file;
+    while (!end) {
+        if (!directory.next(file, end)) return false;
+        const char *base = nullptr;
+        if (end || file.directory || !cache_name(file.name, base) || strstr(base, ".part")) continue;
+        for (size_t i = 0; i < index_count; ++i) {
+            const auto &entry = index[i];
+            if (strncmp(base, entry.entry.file_prefix, 15)) continue;
+            char old[96], path[96], parent[96];
+            snprintf(old, sizeof(old), "%s/%s", CACHE_DIR, base);
+            cache_path(entry, base + 16, path);
+            snprintf(parent, sizeof(parent), "%s/%s", CACHE_DIR, entry.entry.therapy_day);
+            // A rename is restart-safe. Never overwrite an independently existing copy.
+            if (!session.run([&](fs::FS &fs) {
+                return fs.exists(path) || ((!fs.exists(parent) ? fs.mkdir(parent) : true) && fs.rename(old, path));
+            })) return false;
+            break;
+        }
+    }
     return true;
 }
 
 bool prune_cache(const SdStorage::Session &session, uint64_t needed, const char *keep) {
     if (needed > MAX_SD_CACHE) return false;
     if (cache_usage_known && cache_bytes + needed <= MAX_SD_CACHE) return true;
+    if (!migrate_cache(session)) return false;
     while (true) {
         SdStorage::Reader directory;
         if (!directory.open(session, CACHE_DIR, true)) {
@@ -1398,28 +1431,47 @@ bool prune_cache(const SdStorage::Session &session, uint64_t needed, const char 
         }
         uint64_t total = 0, oldest_bytes = 0;
         char oldest[96] = {};
+        auto visit = [&](const char *parent, const SdStorage::Reader::Entry &file) {
+            char path[96];
+            const char *base = nullptr;
+            if (!cache_name(file.name, base)) return true;
+            snprintf(path, sizeof(path), "%s/%s", parent, base);
+            bool rebuildable = false;
+            for (size_t i = 0; i < index_count; ++i)
+                if (index[i].key.present == 31 && !strncmp(base, index[i].entry.file_prefix, 15)) {
+                    rebuildable = true;
+                    break;
+                }
+            if (strstr(base, ".part"))
+                return session.run([&](fs::FS &fs) { return fs.remove(path); });
+            total += file.size;
+            if (rebuildable && (!keep || strcmp(path, keep)) && (!oldest[0] || strcmp(path, oldest) < 0)) {
+                snprintf(oldest, sizeof(oldest), "%s", path);
+                oldest_bytes = file.size;
+            }
+            return true;
+        };
         bool end = false;
         SdStorage::Reader::Entry file;
         while (!end) {
             if (!directory.next(file, end)) return false;
-            if (end || file.directory) continue;
-            char path[96];
-            const char *base = nullptr;
-            if (!cache_name(file.name, path, base)) continue;
-            bool live = false;
-            for (size_t i = 0; i < index_count; ++i)
-                if (index[i].key.present && !strncmp(base, index[i].entry.file_prefix, 15)) {
-                    live = true;
-                    break;
-                }
-            if (!live || strstr(base, ".part")) {
-                if (!session.run([&](fs::FS &fs) { return fs.remove(path); })) return false;
+            if (end) break;
+            if (!file.directory) {
+                if (!visit(CACHE_DIR, file)) return false;
                 continue;
             }
-            total += file.size;
-            if ((!keep || strcmp(path, keep)) && (!oldest[0] || strcmp(path, oldest) < 0)) {
-                snprintf(oldest, sizeof(oldest), "%s", path);
-                oldest_bytes = file.size;
+            const char *name = strrchr(file.name, '/');
+            name = name ? name + 1 : file.name;
+            uint16_t day = 0;
+            if (!catalog_day(name, day)) continue;
+            char parent[96];
+            snprintf(parent, sizeof(parent), "%s/%s", CACHE_DIR, name);
+            SdStorage::Reader children;
+            if (!children.open(session, parent, true)) return false;
+            bool last = false;
+            while (!last) {
+                if (!children.next(file, last)) return false;
+                if (!last && !file.directory && !visit(parent, file)) return false;
             }
         }
         directory.close();
