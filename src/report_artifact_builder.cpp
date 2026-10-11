@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <new>
 
 namespace ReportArtifact {
@@ -104,19 +105,27 @@ Lookup lookup(const SdStorage::Session &session, const char *prefix,
 }
 
 namespace {
+struct DocumentScratch {
+    char path[PATH_BYTES], part[PATH_BYTES];
+    uint8_t block[1024];
+};
+static_assert(sizeof(DocumentScratch) <= 2048, "bounded document scratch fallback");
+
 bool document_path(const char *prefix, const uint8_t hash[32], char (&out)[PATH_BYTES]) {
     return content_path(prefix, hash, out, true);
 }
 
 bool document_content(const SdStorage::Session &session, const char *prefix,
-                      const Document &document, aircannect::LargeTextBuffer *out) {
-    char path[PATH_BYTES];
+                      const Document &document, aircannect::LargeTextBuffer *out,
+                      DocumentScratch &scratch) {
+    auto &path = scratch.path;
+    auto &bytes = scratch.block;
     SdStorage::Reader reader;
     if (!document_path(prefix, document.digest, path) || !reader.open(session, path) ||
         reader.size() != document.bytes || (out && !out->reserve(document.bytes))) return false;
     if (out) out->clear();
     Digest digest;
-    uint8_t bytes[1024], hash[32];
+    uint8_t hash[32];
     for (size_t at = 0; at < document.bytes;) {
         const size_t count = std::min(sizeof(bytes), size_t(document.bytes - at));
         if (reader.read(bytes, count) != count || !digest.add(bytes, count) ||
@@ -131,8 +140,9 @@ bool document_content(const SdStorage::Session &session, const char *prefix,
     return valid;
 }
 
-Lookup document_head(const SdStorage::Session &session, const char *prefix, unsigned slot, Document &out) {
-    char path[PATH_BYTES];
+Lookup document_head(const SdStorage::Session &session, const char *prefix, unsigned slot,
+                     Document &out, DocumentScratch &scratch) {
+    auto &path = scratch.path;
     snprintf(path, sizeof(path), "%s.head%u", prefix, slot);
     bool exists = false;
     if (!session.run([&](fs::FS &fs) { exists = fs.exists(path); return true; })) return Lookup::Failed;
@@ -147,15 +157,14 @@ Lookup document_head(const SdStorage::Session &session, const char *prefix, unsi
     memcpy(out.key, bytes + 16, 32);
     memcpy(out.digest, bytes + 48, 32);
     reader.close();
-    return document_content(session, prefix, out, nullptr) ? Lookup::Ready : Lookup::Invalid;
+    return document_content(session, prefix, out, nullptr, scratch) ? Lookup::Ready : Lookup::Invalid;
 }
-}  // namespace
 
-Lookup document_lookup(const SdStorage::Session &session, const char *prefix,
-                       const uint8_t *key, Document &out) {
+Lookup lookup_document(const SdStorage::Session &session, const char *prefix,
+                       const uint8_t *key, Document &out, DocumentScratch &scratch) {
     Document heads[2];
-    const Lookup a = document_head(session, prefix, 0, heads[0]);
-    const Lookup b = document_head(session, prefix, 1, heads[1]);
+    const Lookup a = document_head(session, prefix, 0, heads[0], scratch);
+    const Lookup b = document_head(session, prefix, 1, heads[1], scratch);
     int chosen = -1;
     for (unsigned i = 0; i < 2; ++i) {
         if ((i ? b : a) != Lookup::Ready || (key && memcmp(key, heads[i].key, 32))) continue;
@@ -166,17 +175,37 @@ Lookup document_lookup(const SdStorage::Session &session, const char *prefix,
     if (a == Lookup::Invalid || b == Lookup::Invalid) return Lookup::Invalid;
     return Lookup::Missing;
 }
+}  // namespace
+
+Lookup document_lookup(const SdStorage::Session &session, const char *prefix,
+                       const uint8_t *key, Document &out) {
+    void *memory = aircannect::Memory::alloc_large(sizeof(DocumentScratch));
+    if (!memory) return Lookup::Failed;
+    std::unique_ptr<DocumentScratch, decltype(&aircannect::Memory::free)> scratch(
+        new (memory) DocumentScratch, aircannect::Memory::free);
+    return lookup_document(session, prefix, key, out, *scratch);
+}
 
 bool document_read(const SdStorage::Session &session, const char *prefix,
                    const Document &document, aircannect::LargeTextBuffer &out) {
-    return document_content(session, prefix, document, &out);
+    void *memory = aircannect::Memory::alloc_large(sizeof(DocumentScratch));
+    if (!memory) return false;
+    std::unique_ptr<DocumentScratch, decltype(&aircannect::Memory::free)> scratch(
+        new (memory) DocumentScratch, aircannect::Memory::free);
+    return document_content(session, prefix, document, &out, *scratch);
 }
 
 bool document_publish(const SdStorage::Session &session, const char *prefix,
                       const uint8_t key[32], const uint8_t *data, size_t length, Document &out) {
     if (!length || length > UINT32_MAX) return false;
+    void *memory = aircannect::Memory::alloc_large(sizeof(DocumentScratch));
+    if (!memory) return false;
+    std::unique_ptr<DocumentScratch, decltype(&aircannect::Memory::free)> scratch(
+        new (memory) DocumentScratch, aircannect::Memory::free);
+    // Publication verifies previous heads before writing. Share one workspace
+    // through that nested chain instead of accumulating I/O buffers on stack.
     Document previous;
-    const Lookup old = document_lookup(session, prefix, nullptr, previous);
+    const Lookup old = lookup_document(session, prefix, nullptr, previous, *scratch);
     if (old == Lookup::Failed || old == Lookup::Invalid) return false;
     out = {};
     out.bytes = length;
@@ -185,7 +214,8 @@ bool document_publish(const SdStorage::Session &session, const char *prefix,
     if (!fingerprint(data, length, out.digest)) return false;
     if (old == Lookup::Ready && !memcmp(previous.digest, out.digest, 32) &&
         !memcmp(previous.key, key, 32)) { out = previous; return true; }
-    char path[PATH_BYTES], part[PATH_BYTES];
+    auto &path = scratch->path;
+    auto &part = scratch->part;
     if (!document_path(prefix, out.digest, path) || !named_path(prefix, "document.part", part)) return false;
     bool exists = false;
     if (!session.run([&](fs::FS &fs) {
@@ -208,7 +238,7 @@ bool document_publish(const SdStorage::Session &session, const char *prefix,
     // Verify persisted bytes before publishing a head, including reused content.
     SdStorage::Reader reader;
     if (!reader.open(session, exists ? path : part) || reader.size() != length) return false;
-    uint8_t block[1024];
+    auto &block = scratch->block;
     for (size_t at = 0; at < length;) {
         const size_t count = std::min(sizeof(block), length - at);
         if (reader.read(block, count) != count || memcmp(block, data + at, count)) return false;
