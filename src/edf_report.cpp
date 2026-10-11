@@ -73,6 +73,7 @@ Result::Result(Result &&other) noexcept
 #include <Arduino.h>
 #include <FS.h>
 #include <esp_heap_caps.h>
+#include <esp_random.h>
 #include <freertos/semphr.h>
 #include <cstdarg>
 #include <cstdio>
@@ -101,6 +102,7 @@ constexpr int64_t FINE_BLOCK_MS = 60000;
 constexpr size_t FINE_BLOCK_CELLS = FINE_BLOCK_MS / LEVEL_MS[0];
 constexpr const char *CACHE_DIR = "/airbridge/report";
 constexpr const char *SUFFIXES[] = {"BRP", "PLD", "SAD", "EVE", "CSL"};
+char dataset_id[65] = {};
 
 struct ChannelSpec {
     const char *id, *label, *unit, *signal;
@@ -1366,10 +1368,85 @@ void start_json(Payload &body, uint32_t publication, uint32_t dataset) {
                publication, dataset);
 }
 
+bool summary_json(const SdStorage::Session &session, Job &job);
+bool history_json(const SdStorage::Session &session, Job &job, bool build);
+bool window_events(const SdStorage::Session &session, const Job &job,
+                   const IndexedSession &entry, const CacheHeader &header,
+                   int64_t from, int64_t to, Payload &out, bool &comma, bool &truncated);
+
+bool dataset(const SdStorage::Session &session) {
+    if (*dataset_id) return true;
+    constexpr const char *prefix = "/airbridge/report/dataset";
+    ReportArtifact::Document document;
+    Payload bytes;
+    const auto found = ReportArtifact::document_lookup(session, prefix, nullptr, document);
+    if (found == ReportArtifact::Lookup::Missing) {
+        uint8_t id[32], key[32] = {};
+        esp_fill_random(id, sizeof(id));
+        if (!ReportArtifact::document_publish(session, prefix, key, id, sizeof(id), document)) return false;
+    } else if (found != ReportArtifact::Lookup::Ready) return false;
+    if (!ReportArtifact::document_read(session, prefix, document, bytes) || bytes.length() != 32) return false;
+    return aircannect::hex_encode(reinterpret_cast<const uint8_t *>(bytes.c_str()), 32,
+        dataset_id, sizeof(dataset_id), aircannect::HexCase::Lower);
+}
+
+void publication_prefix(uint16_t day, char (&path)[96]) {
+    // The manifest is a small day index, separate from session/block directories.
+    snprintf(path, sizeof(path), "%s/day-%u", CACHE_DIR, unsigned(day));
+}
+
+bool publication_key(const Request &request, uint8_t (&key)[32]) {
+    Payload identity;
+    const uint16_t last = last_day(request);
+    const uint16_t first = request.view == View::Day ? (last > 13 ? last - 13 : 0) : first_day(request, last);
+    identity.print("publication-1:%s:%u:%u:%u", dataset_id, first, last, request.period);
+    for (size_t i = 0; i < index_count; ++i) {
+        const auto &entry = index[i];
+        if (!selected(entry, first, last)) continue;
+        identity.print("/%u:%s:%s:%u:%u:%u:%u", unsigned(i), entry.entry.therapy_day,
+            entry.entry.file_prefix, entry.entry.flags, entry.entry.str_revision,
+            entry.key.present, entry.key.checksums);
+        for (size_t k = 0; k < 5; ++k) {
+            identity.print(":%llu:", static_cast<unsigned long long>(entry.key.sizes[k]));
+            identity.append(reinterpret_cast<const char *>(entry.key.sidecars[k]), 8);
+        }
+    }
+    return identity.good() && ReportArtifact::fingerprint(
+        reinterpret_cast<const uint8_t *>(identity.c_str()), identity.length(), key);
+}
+
 bool prepare_json(const SdStorage::Session &session, Job &job) {
     const uint16_t day = last_day(job.request);
+    if (!dataset(session)) return note_issue(job, "dataset_identity");
+    char manifest[96], identity[65]; uint8_t manifest_key[32];
+    publication_prefix(day, manifest);
+    if (!publication_key(job.request, manifest_key)) return note_issue(job, "publication_key");
+    ReportArtifact::Document saved;
+    const auto known = ReportArtifact::document_lookup(session, manifest, manifest_key, saved);
+    if (known == ReportArtifact::Lookup::Ready) {
+        // A retained document cannot hide a damaged source reference after an
+        // explicit storage change. This reads references/headers, never EDF.
+        for (size_t i = 0; i < index_count; ++i) {
+            const auto &entry = index[i];
+            if (!selected(entry, day, day)) continue;
+            for (uint8_t kind = 0; kind < 3; ++kind) {
+                if (!(entry.key.present & (1u << kind))) continue;
+                char prefix[96]; uint8_t key[32];
+                ReportArtifact::Publication publication;
+                if (!artifact_identity(entry, kind, prefix, key) ||
+                    ReportArtifact::lookup(session, prefix, key, publication) != ReportArtifact::Lookup::Ready)
+                    return note_issue(job, "artifact_lookup", entry.entry.file_prefix);
+            }
+        }
+        if (ReportArtifact::document_read(session, manifest, saved, job.body)) return true;
+        return note_issue(job, "publication_read", manifest);
+    }
+    if (known == ReportArtifact::Lookup::Failed || known == ReportArtifact::Lookup::Invalid)
+        return note_issue(job, "publication_read", manifest);
+    job.body.clear();
+    aircannect::hex_encode(manifest_key, 32, identity, sizeof(identity), aircannect::HexCase::Lower);
     start_json(job.body, revision() + 1, job.data_revision);
-    job.body.print("\"day\":%u,\"artifacts\":[", day);
+    job.body.print("\"dataset\":\"%s\",\"identity\":\"%s\",\"day\":%u,\"artifacts\":[", dataset_id, identity, day);
     bool comma = false;
     for (size_t i = 0; i < index_count; ++i) {
         const auto &entry = index[i];
@@ -1401,13 +1478,54 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
                 ReportArtifact::lookup(session, prefix, key, publication) != ReportArtifact::Lookup::Ready)
                 return note_issue(job, "artifact_unavailable", entry.entry.file_prefix);
             aircannect::hex_encode(publication.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
-            job.body.print("%s{\"session\":%u,\"kind\":\"%s\",\"digest\":\"%s\",\"bytes\":%u}",
-                           comma ? "," : "", unsigned(i), SUFFIXES[kind], digest, publication.bytes);
+            job.body.print("%s{\"session\":%u,\"day\":\"%s\",\"kind\":\"%s\",\"digest\":\"%s\",\"bytes\":%u}",
+                           comma ? "," : "", unsigned(i), entry.entry.therapy_day, SUFFIXES[kind], digest, publication.bytes);
             comma = true;
         }
     }
-    job.body.print("]}");
-    return job.body.good();
+    job.body.print("],\"event_groups\":[");
+    comma = false;
+    for (size_t i = 0; i < index_count; ++i) {
+        const auto &entry = index[i];
+        if (!selected(entry, day, day)) continue;
+        SessionData data;
+        if (!session_data(session, job, entry, data)) return false;
+        Payload events;
+        bool event_comma = false, truncated = false;
+        events.print("{\"events\":[");
+        if (!window_events(session, job, entry, data.header, 0, INT64_MAX,
+                           events, event_comma, truncated) || truncated) return note_issue(job, "event_limit");
+        events.print("]}");
+        char prefix[96], digest[65];
+        cache_path(entry, "events", prefix);
+        uint8_t event_key[32];
+        ReportArtifact::Document publication;
+        if (!events.good() || !ReportArtifact::fingerprint(reinterpret_cast<const uint8_t *>(events.c_str()), events.length(), event_key) ||
+            !ReportArtifact::document_publish(session, prefix, event_key,
+                reinterpret_cast<const uint8_t *>(events.c_str()), events.length(), publication)) return note_issue(job, "events_publish");
+        aircannect::hex_encode(publication.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+        job.body.print("%s{\"session\":%u,\"day\":\"%s\",\"digest\":\"%s\",\"bytes\":%u}",
+            comma ? "," : "", unsigned(i), entry.entry.therapy_day, digest, publication.bytes);
+        comma = true;
+    }
+    job.body.print("],\"summary\":");
+    Payload envelope;
+    envelope.swap(job.body);
+    // History uses the same exact session statistics, never browser aggregates.
+    if (!history_json(session, job, true)) return false;
+    job.body.clear();
+    if (!summary_json(session, job)) return false;
+    envelope.append(job.body.c_str(), job.body.length());
+    envelope.print("}");
+    job.body.swap(envelope);
+    if (!job.body.good() || job.issue || aborted(&job, session)) return false;
+    // A catalog/STR update during production must not become the current head.
+    EdfCatalog::Status current;
+    EdfCatalog::get_status(current);
+    if (current.generation != catalog_generation || SdStorage::files_revision() != file_revision) return false;
+    return ReportArtifact::document_publish(session, manifest, manifest_key,
+        reinterpret_cast<const uint8_t *>(job.body.c_str()), job.body.length(), saved) ||
+        note_issue(job, "publication_write", manifest);
 }
 void append_event(Payload &body, const Event &event, bool &comma, const char *type = nullptr) {
     body.print("%s{\"time_ms\":%lld,\"duration_ms\":%lld,\"type\":\"%s\"}",

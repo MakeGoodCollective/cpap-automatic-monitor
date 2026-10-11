@@ -3,6 +3,7 @@
 #include "report_artifact.h"
 #include "report_edf.h"
 #include "sd_storage.h"
+#include "large_text_buffer.h"
 
 namespace ReportArtifact {
 
@@ -27,6 +28,21 @@ enum class Lookup : uint8_t { Missing, Ready, Invalid, Failed };
 Lookup lookup(const SdStorage::Session &session, const char *prefix,
               const uint8_t fingerprint[32], Publication &out);
 bool fingerprint(const uint8_t *bytes, size_t length, uint8_t out[32]);
+
+struct Document {
+    uint8_t digest[32] = {}, key[32] = {};
+    uint32_t bytes = 0, generation = 0;
+};
+
+// Small publications share the numeric producer's immutable, verified storage
+// path. Two heads retain the previous generation; content is never overwritten.
+Lookup document_lookup(const SdStorage::Session &session, const char *prefix,
+                       const uint8_t *key, Document &out);
+bool document_read(const SdStorage::Session &session, const char *prefix,
+                   const Document &document, aircannect::LargeTextBuffer &out);
+bool document_publish(const SdStorage::Session &session, const char *prefix,
+                      const uint8_t key[32], const uint8_t *data, size_t length,
+                      Document &out);
 
 // One source, one record traversal, all selected tracks. Scratch lives in PSRAM
 // and is independent of duration. Base transposition and x4 passes read the
