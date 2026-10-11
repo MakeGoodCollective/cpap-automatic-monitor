@@ -183,6 +183,74 @@ struct SessionData {
     }
 };
 
+struct DailyValues {
+    uint64_t count[4] = {}, events = 0;
+    double sum[4] = {}, seconds = 0;
+    bool present = false, ready = true, usage = true, event_count = true;
+
+    double value(size_t metric) const {
+        if (!present || !ready) return NAN;
+        if (!metric) return usage && seconds > 0 ? seconds : NAN;
+        if (metric == 1) return usage && event_count && seconds > 0 ? events * 3600.0 / seconds : NAN;
+        return count[metric - 2] ? sum[metric - 2] / count[metric - 2] : NAN;
+    }
+};
+struct CachedDay {
+    DailyValues values;
+    uint32_t updated = 0;
+    uint16_t day = 0;
+};
+// Two annual selections; lazy growth, no per-day SD files or internal bulk fallback.
+constexpr size_t MAX_CACHED_DAYS = 2 * 366;
+CachedDay *daily_cache = nullptr;
+size_t daily_capacity = 0;
+uint32_t daily_update = 0;
+
+void invalidate_day(uint16_t day = 0) {
+    if (!day) {
+        aircannect::Memory::free(daily_cache);
+        daily_cache = nullptr;
+        daily_capacity = 0;
+        return;
+    }
+    for (size_t i = 0; i < daily_capacity; ++i)
+        if (daily_cache[i].day == day) daily_cache[i].day = 0;
+}
+bool cached_day(uint16_t day, DailyValues &out, bool build) {
+    if (!day) return false;
+    for (size_t i = 0; i < daily_capacity; ++i) {
+        auto &entry = daily_cache[i];
+        if (entry.day != day || (build && !entry.values.ready)) continue;
+        out = entry.values;
+        entry.updated = ++daily_update;
+        return true;
+    }
+    return false;
+}
+void remember_day(uint16_t day, const DailyValues &values) {
+    if (!day) return;
+    size_t slot = daily_capacity;
+    for (size_t i = 0; i < daily_capacity; ++i)
+        if (!daily_cache[i].day || daily_cache[i].day == day) { slot = i; break; }
+    if (slot == daily_capacity && daily_capacity < MAX_CACHED_DAYS) {
+        const size_t capacity = std::min(MAX_CACHED_DAYS, std::max(size_t(16), daily_capacity * 2));
+        auto *grown = static_cast<CachedDay *>(aircannect::Memory::realloc_large(
+            daily_cache, capacity * sizeof(CachedDay), false));
+        if (grown) {
+            daily_cache = grown;
+            for (size_t i = daily_capacity; i < capacity; ++i) new (&daily_cache[i]) CachedDay;
+            daily_capacity = capacity;
+        }
+    }
+    if (!daily_capacity) return; // Cache allocation failure does not fail a report.
+    if (slot == daily_capacity) {
+        slot = 0;
+        for (size_t i = 1; i < daily_capacity; ++i)
+            if (int32_t(daily_cache[i].updated - daily_cache[slot].updated) < 0) slot = i;
+    }
+    daily_cache[slot] = {values, ++daily_update, day};
+}
+
 struct Payload : aircannect::LargeTextBuffer {
     Payload() : LargeTextBuffer(MAX_BODY, INTERNAL_BODY) {}
     bool format_error = false;
@@ -425,6 +493,7 @@ bool refresh_index(const SdStorage::Session &session) {
         return true;
     const bool full = !index_ready || invalidated || !incremental || files != file_revision ||
         changes.catalog.entries < index_count;
+    if (full) invalidate_day();
     const size_t old_count = index_count;
     index_error = "session_limit";
     if (changes.catalog.entries > MAX_SESSION_COUNT) return false;
@@ -471,6 +540,10 @@ bool refresh_index(const SdStorage::Session &session) {
             index_error = "source_fingerprint";
             if (!fingerprint(session, next)) { index_ready = false; return false; }
             const bool key_changed = !(index[i].key == next.key);
+            if (changed || key_changed) {
+                if (index[i].day) invalidate_day(index[i].day);
+                invalidate_day(next.day);
+            }
             index_error = "cache_retire";
             if (index[i].entry.file_prefix[0] && index[i].key.present && (changed || key_changed) &&
                 !retire_cache(session, index[i])) { index_ready = false; return false; }
@@ -839,7 +912,10 @@ bool store_cache(const SdStorage::Session &session, const Job &job, const Indexe
             reinterpret_cast<uint8_t *>(block), used * sizeof(Event))) return false;
     }
     part_guard.complete = finish_part(session, part, path, data.header.bytes);
-    if (part_guard.complete) __atomic_add_fetch(&cache_generation, 1, __ATOMIC_RELEASE);
+    if (part_guard.complete) {
+        invalidate_day(entry.day);
+        __atomic_add_fetch(&cache_generation, 1, __ATOMIC_RELEASE);
+    }
     return part_guard.complete;
 }
 
@@ -1850,26 +1926,20 @@ bool history_json(const SdStorage::Session &session, Job &job, bool build) {
     constexpr size_t DAYS = 14, METRICS = 6;
     constexpr size_t channels[] = {0, 3, 6, 4};
     constexpr const char *names[] = {"usage", "ahi", "pressure", "leak", "vt", "mv"};
-    struct Day {
-        uint64_t count[4] = {}, events = 0;
-        double sum[4] = {}, seconds = 0;
-        bool present = false, ready = true, usage = true, event_count = true;
-        double value(size_t metric) const {
-            if (!present || !ready) return NAN;
-            if (!metric) return usage && seconds > 0 ? seconds : NAN;
-            if (metric == 1) return usage && event_count && seconds > 0 ? events * 3600.0 / seconds : NAN;
-            return count[metric - 2] ? sum[metric - 2] / count[metric - 2] : NAN;
-        }
-    };
-    struct Work { Day days[DAYS]; CacheHeader header; };
+    struct Work { DailyValues days[DAYS]; bool cached[DAYS] = {}; CacheHeader header; };
     void *memory = aircannect::Memory::alloc_large(sizeof(Work), sizeof(Work) <= INTERNAL_WORK);
     if (!memory) return false;
     std::unique_ptr<Work, decltype(&aircannect::Memory::free)> work(new (memory) Work, aircannect::Memory::free);
     const uint16_t last = last_day(job.request), first = last > DAYS - 1 ? last - DAYS + 1 : 0;
     bool complete = true;
+    for (size_t d = 0; d < DAYS; ++d) {
+        work->cached[d] = cached_day(first + d, work->days[d], build);
+        complete &= work->days[d].ready;
+    }
     for (size_t i = 0; i < index_count; ++i) {
         const auto &entry = index[i];
         if (!selected(entry, first, last) || entry.day - first >= DAYS) continue;
+        if (work->cached[entry.day - first]) continue;
         if (aborted(&job, session)) return false;
         auto &day = work->days[entry.day - first];
         day.present = true;
@@ -1888,6 +1958,9 @@ bool history_json(const SdStorage::Session &session, Job &job, bool build) {
             day.sum[c] += header.channels[channels[c]].sum;
         }
     }
+    if (aborted(&job, session)) return false;
+    for (size_t d = 0; d < DAYS; ++d)
+        if (!work->cached[d]) remember_day(first + d, work->days[d]);
     job.body.print(",\"history\":{\"first_day\":%u,\"last_day\":%u,\"complete\":%s,\"metrics\":[",
                    first, last, complete ? "true" : "false");
     for (size_t m = 0; m < METRICS; ++m) {
