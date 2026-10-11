@@ -40,8 +40,9 @@ struct MutationStatus {
     char error[48];
 };
 
-// One browser operation, including its response lifetime. Ready runs outside
-// the SD executor. Size zero for archives denotes HTTP chunked transfer.
+// One SD operation. Immutable reads admit one bounded waiting successor while
+// the previous response is being released. Ready runs outside the SD executor.
+// Size zero for archives denotes HTTP chunked transfer.
 // Mutations return no Transfer; completion is also retained for the CLI.
 StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active);
 void mutation_status(MutationStatus &out);

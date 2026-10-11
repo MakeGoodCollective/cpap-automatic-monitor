@@ -25,7 +25,7 @@ constexpr size_t INTERNAL_RING_BYTES = 4096;
 constexpr size_t INTERNAL_COPY_BYTES = 1024;
 static_assert(SdStorage::READ_CHUNK_BYTES <= UINT16_MAX, "ZIP stored block length");
 constexpr uint32_t CONSUMER_TIMEOUT_MS = 30000;
-std::atomic<bool> busy{false};
+std::atomic<unsigned> active_operations{0};
 MutationStatus mutation = {};
 portMUX_TYPE mutation_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -121,6 +121,7 @@ public:
     size_t copy_capacity = 0;
     std::atomic<uint32_t> produced{0}, consumed{0};
     std::atomic<bool> cancelled{false}, done{false}, error{false};
+    bool registered = false;
     uint32_t started_ms = millis();
     const char *failure = nullptr;
     log_level_t failure_level = LOG_WARN;
@@ -138,7 +139,7 @@ public:
         free(entries);
         free(ring);
         free(copy_buffer);
-        busy.store(false);
+        if (registered) active_operations.fetch_sub(1);
     }
 
     bool failed() const override { return error.load(); }
@@ -489,6 +490,9 @@ void produce(void *context) {
         vTaskDelay(pdMS_TO_TICKS(10));
         admitted = job->session.begin();
     }
+    if (admitted && job->request.kind == Kind::Immutable)
+        Log::logf(CAT_STORAGE, LOG_DEBUG, "artifact admitted wait=%ums path=%s\n",
+            unsigned(uint32_t(millis() - job->started_ms)), job->request.path);
     if (mutating(job->request.kind)) {
         uint32_t changed = 0;
         const char *error = admitted ? mutate(*job, changed) : "storage_busy";
@@ -551,21 +555,29 @@ void produce(void *context) {
 StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active) {
     if (!valid_request(request)) return StartResult::BadRequest;
     if (!SdStorage::local_access_allowed() || !SdStorage::mounted()) return StartResult::Unavailable;
-    bool expected = false;
-    if (!busy.compare_exchange_strong(expected, true)) {
-        Log::logf(CAT_STORAGE, LOG_DEBUG, "%s storage_busy path=%s\n", kind_name(request.kind), request.path);
-        return StartResult::Busy;
+    // The preceding response can outlive its last byte or an aborted fetch.
+    // Admit one bounded successor; its worker waits for the exclusive SD
+    // session. Other browser operations retain their single-operation limit.
+    const unsigned limit = request.kind == Kind::Immutable ? 2 : 1;
+    unsigned active_count = active_operations.load();
+    for (;;) {
+        if (active_count >= limit) {
+            Log::logf(CAT_STORAGE, LOG_DEBUG, "%s storage_busy path=%s\n", kind_name(request.kind), request.path);
+            return StartResult::Busy;
+        }
+        if (active_operations.compare_exchange_weak(active_count, active_count + 1)) break;
     }
     void *memory = aircannect::Memory::alloc_large(sizeof(Job));
     if (!memory) {
         Log::logf(CAT_STORAGE, LOG_WARN, "%s job_no_memory path=%s\n", kind_name(request.kind), request.path);
-        busy.store(false);
+        active_operations.fetch_sub(1);
         return StartResult::Unavailable;
     }
     auto job = std::shared_ptr<Job>(new(memory) Job, [](Job *value) {
         value->~Job();
         free(value);
     });
+    job->registered = true;
     job->request = request;
     active = job;
     job->ready = std::move(ready);
