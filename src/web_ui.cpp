@@ -900,6 +900,22 @@ static bool reportJob(AsyncWebServerRequest *request, SleepReport::Source &sourc
     return true;
 }
 
+static void sendReportResult(AsyncWebServerRequest *request, SleepReport::Source source,
+                             uint32_t id, bool pending = false) {
+    SleepReport::Result result;
+    const int code = SleepReport::poll(id, result);
+    if (result.available()) {
+        auto *response = new (std::nothrow) ReportResponse(code, std::move(result));
+        if (response) request->send(response);
+        else request->send(503, "application/json", "{\"error\":\"report_allocation_failed\"}");
+    } else if (code == 202 || (!pending && code == 503)) {
+        // Admission succeeded; a contended result lock is still an accepted job.
+        sendReportJob(request, source, id, pending);
+    } else {
+        request->send(code, "application/json", "{\"error\":\"report_job_unavailable\"}");
+    }
+}
+
 static void handleReport(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
     auto invalid = [&]() {
@@ -939,20 +955,7 @@ static void handleReport(AsyncWebServerRequest *request) {
             handleClinicalJob(request, ClinicalJobs::Kind::Report, {}, id);
             return;
         }
-        SleepReport::Result result;
-        int code = SleepReport::poll(id, result);
-        if (result.available()) {
-            auto *response = new (std::nothrow) ReportResponse(code, std::move(result));
-            if (!response) {
-                request->send(503, "application/json", "{\"error\":\"report_allocation_failed\"}");
-                return;
-            }
-            request->send(response);
-        } else if (code == 202) {
-            sendReportJob(request, source, id, true);
-        } else {
-            request->send(code, "application/json", "{\"error\":\"report_job_unavailable\"}");
-        }
+        sendReportResult(request, source, id, true);
         return;
     }
 
@@ -1024,7 +1027,7 @@ static void handleReport(AsyncWebServerRequest *request) {
         request->send(code, "application/json", body);
         return;
     }
-    sendReportJob(request, source, id);
+    sendReportResult(request, source, id);
 }
 
 

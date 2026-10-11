@@ -46,7 +46,7 @@ uint32_t revision();
 const char *state_name(State state);
 bool valid(const Request &request);
 
-// Two slots, coalesced identical requests, bounded retained payloads. Admission
+// Two active jobs, coalesced identical requests, bounded PSRAM result retention. Admission
 // and polling do no SD work. Completion changes status.revision only; source
 // invalidation also changes status.data_revision. JSON carries both revisions.
 bool submit(const Request &request, uint32_t &id, const char **error = nullptr);

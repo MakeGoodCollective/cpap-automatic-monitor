@@ -88,8 +88,14 @@ constexpr size_t MAX_BODY = 512 * 1024;
 constexpr size_t INTERNAL_BODY = 16 * 1024;
 constexpr size_t INTERNAL_WORK = 8 * 1024;
 constexpr uint64_t MAX_SD_CACHE = 128ull * 1024 * 1024;
-constexpr uint32_t RETAIN_MS = 30000;
+constexpr uint32_t RETAIN_MS = 6 * 60 * 60 * 1000;
+constexpr uint32_t DELIVERY_MS = 30000;
 constexpr size_t SLOT_COUNT = 2;
+constexpr size_t RETAINED_SLOTS = 32;
+// Eight maximum responses on larger boards; leave one build's realloc peak
+// (old/new JSON, series cells, histograms) available on the 2 MiB GEEK too.
+constexpr size_t RETAINED_BYTES = 8 * MAX_BODY;
+constexpr size_t BUILD_RESERVE = 3 * MAX_BODY;
 constexpr size_t CHART_CHANNEL_COUNT = 9;
 constexpr double LEAK_THRESHOLD = 24;
 constexpr int64_t LEVEL_MS[] = {10000, 60000, 600000, 3600000};
@@ -196,7 +202,7 @@ enum class JobState : uint8_t { Free, Queued, Running, Complete };
 struct Job {
     Request request;
     JobState state = JobState::Free;
-    uint32_t id = 0, completed_ms = 0, data_revision = 0;
+    uint32_t id = 0, completed_ms = 0, data_revision = 0, cache_generation = 0;
     uint16_t readers = 0;
     uint16_t consumers = 1, deliveries = 0;
     bool delivered = false, cancelled = false, shared = false;
@@ -253,7 +259,14 @@ struct JobTiming {
     }
 };
 
-Job jobs[SLOT_COUNT];
+struct JobPool {
+    Job fallback[SLOT_COUNT];
+    Job *data = fallback;
+    size_t count = SLOT_COUNT;
+    Job *begin() { return data; }
+    Job *end() { return data + count; }
+} jobs;
+size_t retention_budget = SLOT_COUNT * INTERNAL_BODY;
 SemaphoreHandle_t mutex = nullptr, wake = nullptr;
 TaskHandle_t worker_task = nullptr;
 portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -266,6 +279,7 @@ uint32_t invalidation_generation = 0, indexed_invalidation = 0;
 bool index_ready = false;
 bool cache_usage_known = false;
 uint64_t cache_bytes = 0;
+uint32_t cache_generation = 0;
 enum class IndexFailure : uint8_t { Error, WaitingCatalog, Preempted };
 IndexFailure index_failure = IndexFailure::Error;
 const char *index_error = nullptr;
@@ -304,11 +318,36 @@ void publish(State state, const char *error = "") {
 bool reusable(const Job &job) {
     return job.state == JobState::Free || (job.state == JobState::Complete &&
         !job.readers && (job.cancelled || uint32_t(millis() - job.completed_ms) >=
-            RETAIN_MS));
+            (job.code == 200 && !job.issue ? RETAIN_MS : DELIVERY_MS)));
 }
 void reset_job(Job &job) {
     job.~Job();
     new (&job) Job;
+}
+
+// Caller holds mutex. Undelivered results get the existing delivery grace;
+// active HTTP leases are never candidates, even under memory pressure.
+bool evictable(const Job &job) {
+    return job.state == JobState::Complete && !job.readers &&
+        (job.deliveries >= job.consumers || uint32_t(millis() - job.completed_ms) >= DELIVERY_MS);
+}
+void trim_results(bool building) {
+    while (true) {
+        size_t bytes = 0;
+        Job *oldest = nullptr;
+        for (auto &job : jobs) {
+            if (job.state != JobState::Complete) continue;
+            bytes += job.body.capacity();
+            if (evictable(job) && (!oldest || int32_t(job.completed_ms - oldest->completed_ms) < 0))
+                oldest = &job;
+        }
+        const auto memory = aircannect::Memory::status();
+        const bool pressure = memory.psram_available &&
+            (memory.psram_free < (building ? BUILD_RESERVE : MAX_BODY) ||
+             (building && memory.psram_max_alloc < MAX_BODY + 1));
+        if (!oldest || (bytes <= retention_budget && !pressure)) return;
+        reset_job(*oldest);
+    }
 }
 bool aborted(const Job *job, const SdStorage::Session &session) {
     return (job && __atomic_load_n(&job->cancelled, __ATOMIC_ACQUIRE)) ||
@@ -800,6 +839,7 @@ bool store_cache(const SdStorage::Session &session, const Job &job, const Indexe
             reinterpret_cast<uint8_t *>(block), used * sizeof(Event))) return false;
     }
     part_guard.complete = finish_part(session, part, path, data.header.bytes);
+    if (part_guard.complete) __atomic_add_fetch(&cache_generation, 1, __ATOMIC_RELEASE);
     return part_guard.complete;
 }
 
@@ -2039,11 +2079,12 @@ bool work_once() {
     Job *job = nullptr;
     xSemaphoreTake(mutex, portMAX_DELAY);
     for (auto &candidate : jobs) {
-        if (reusable(candidate)) reset_job(candidate);
+        if (candidate.state != JobState::Free && reusable(candidate)) reset_job(candidate);
         if (candidate.state == JobState::Queued &&
             (!job || int32_t(candidate.id - job->id) < 0)) job = &candidate;
     }
     if (job) job->state = JobState::Running;
+    trim_results(true);
     xSemaphoreGive(mutex);
     if (!AirSenseState::local_background_allowed()) {
         defer_job(job); publish(State::Blocked, "not_idle"); return false;
@@ -2138,9 +2179,11 @@ bool work_once() {
     } else if (!success && !job->code) error_body(*job, 503, "report_build_failed");
     job->state = JobState::Complete;
     job->completed_ms = millis();
+    job->cache_generation = __atomic_load_n(&cache_generation, __ATOMIC_ACQUIRE);
     const int code = job->code;
     const size_t bytes = job->body.length();
     log_result(*job);
+    trim_results(false);
     xSemaphoreGive(mutex);
     portENTER_CRITICAL(&status_mux);
     ++status.revision;
@@ -2164,6 +2207,17 @@ void worker(void *) {
 
 void init() {
     if (mutex) return;
+    const auto memory = aircannect::Memory::status();
+    if (memory.psram_available) {
+        auto *storage = static_cast<Job *>(aircannect::Memory::alloc_large(RETAINED_SLOTS * sizeof(Job), false));
+        if (storage) {
+            for (size_t i = 0; i < RETAINED_SLOTS; ++i) new (&storage[i]) Job;
+            jobs.data = storage;
+            jobs.count = RETAINED_SLOTS;
+            retention_budget = std::min(RETAINED_BYTES,
+                memory.psram_total > BUILD_RESERVE ? memory.psram_total - BUILD_RESERVE : size_t(0));
+        }
+    }
     mutex = xSemaphoreCreateMutex();
     wake = xSemaphoreCreateBinary();
     portENTER_CRITICAL(&status_mux);
@@ -2221,7 +2275,7 @@ void tick() {
         xSemaphoreGive(wake);
     }
     if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return;
-    for (auto &job : jobs) if (reusable(job)) reset_job(job);
+    for (auto &job : jobs) if (job.state != JobState::Free && reusable(job)) reset_job(job);
     xSemaphoreGive(mutex);
 }
 
@@ -2253,9 +2307,12 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
         catalog.generation == publication.catalog_generation &&
         SdStorage::files_revision() == publication.files_revision;
     Job *slot = nullptr, *delivered = nullptr;
+    size_t active = 0;
     for (auto &job : jobs) {
-        if (current_index && !job.cancelled && job.state == JobState::Complete && job.code == 200 &&
+        if (current_index && !job.cancelled && !job.issue && job.state == JobState::Complete && job.code == 200 &&
             job.data_revision == publication.data_revision && job.request == request &&
+            ((request.action != Action::Summary && request.action != Action::History) ||
+             job.cache_generation == __atomic_load_n(&cache_generation, __ATOMIC_ACQUIRE)) &&
             uint32_t(millis() - job.completed_ms) < RETAIN_MS) {
             if (job.consumers == UINT16_MAX) { xSemaphoreGive(mutex); return reject("busy"); }
             ++job.consumers;
@@ -2277,17 +2334,17 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
             xSemaphoreGive(mutex);
             return true;
         }
+        if (job.state == JobState::Queued || job.state == JobState::Running) ++active;
         if (reusable(job)) slot = &job;
         if (job.state == JobState::Complete && !job.readers && job.data_revision != publication.data_revision)
             slot = &job;
-        if (job.state == JobState::Complete && !job.readers && job.delivered &&
-            job.deliveries >= job.consumers && (!delivered ||
-            int32_t(job.id - delivered->id) < 0)) delivered = &job;
+        if (evictable(job) && (!delivered ||
+            int32_t(job.completed_ms - delivered->completed_ms) < 0)) delivered = &job;
     }
     // Retention is opportunistic: routine days->summary->series and repeated
     // zooms can reclaim delivered/unpinned slots without a browser delay timer.
     if (!slot) slot = delivered;
-    if (!slot) { xSemaphoreGive(mutex); return reject("busy"); }
+    if (!slot || active >= SLOT_COUNT) { xSemaphoreGive(mutex); return reject("busy"); }
     reset_job(*slot);
     slot->request = request;
     slot->id = next_id++;
