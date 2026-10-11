@@ -169,6 +169,12 @@ struct SessionData {
     CacheHeader header;
     uint64_t *bins = nullptr;
     Event *events = nullptr;
+    // Summaries and history nest during preparation; keep their headers off
+    // the worker stack along with the separately allocated samples/events.
+    static void *operator new(size_t size, const std::nothrow_t &) noexcept {
+        return aircannect::Memory::alloc_large(size, size <= INTERNAL_WORK);
+    }
+    static void operator delete(void *memory) noexcept { aircannect::Memory::free(memory); }
     ~SessionData() {
         aircannect::Memory::free(bins);
         aircannect::Memory::free(events);
@@ -1309,7 +1315,7 @@ bool session_data(const SdStorage::Session &session, const Job &job,
         return true;
     }
     out.~SessionData();
-    new (&out) SessionData;
+    ::new (&out) SessionData;
     if (!build_session(session, job, entry, out, artifacts))
         return note_issue(job, "session_build", entry.entry.file_prefix);
     if (out.header.partial) note_issue(job, "partial_source", entry.entry.file_prefix);
@@ -1535,13 +1541,9 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
             else if (found != ReportArtifact::Lookup::Ready) return note_issue(job, "artifact_lookup", prefix);
         }
         if (missing) {
-            void *memory = aircannect::Memory::alloc_large(sizeof(SessionData), sizeof(SessionData) <= INTERNAL_WORK);
-            if (!memory) return note_issue(job, "artifact_alloc");
-            auto *data = new (memory) SessionData;
-            const bool built = session_data(session, job, entry, *data, true);
-            data->~SessionData();
-            aircannect::Memory::free(data);
-            if (!built) return false;
+            std::unique_ptr<SessionData> data(new (std::nothrow) SessionData);
+            if (!data) return note_issue(job, "artifact_alloc");
+            if (!session_data(session, job, entry, *data, true)) return false;
         }
         for (uint8_t kind = 0; kind < 3; ++kind) {
             if (!(entry.key.present & (1u << kind))) continue;
@@ -1561,7 +1563,9 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
     for (size_t i = 0; i < index_count; ++i) {
         const auto &entry = index[i];
         if (!selected(entry, day, day)) continue;
-        SessionData data;
+        std::unique_ptr<SessionData> storage(new (std::nothrow) SessionData);
+        if (!storage) return note_issue(job, "session_alloc");
+        auto &data = *storage;
         if (!session_data(session, job, entry, data)) return false;
         ReportArtifact::Document histogram;
         if (!publish_histograms(session, entry, data, histogram)) return note_issue(job, "histogram_publish");
@@ -1761,7 +1765,9 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
             usage_known = events_known = csr_known = false;
             continue;
         }
-        SessionData data;
+        std::unique_ptr<SessionData> storage(new (std::nothrow) SessionData);
+        if (!storage) return note_issue(job, "session_alloc");
+        auto &data = *storage;
         if (!session_data(session, job, entry, data)) {
             if (aborted(&job, session)) return false;
             partial = true;
@@ -1938,9 +1944,10 @@ bool cached_summary_header(const SdStorage::Session &session, const IndexedSessi
 }
 bool build_summary_header(const SdStorage::Session &session, const Job &job,
                           const IndexedSession &entry, CacheHeader &header) {
-    SessionData data;
-    if (!session_data(session, job, entry, data)) return false;
-    header = data.header;
+    std::unique_ptr<SessionData> data(new (std::nothrow) SessionData);
+    if (!data) return note_issue(job, "session_alloc");
+    if (!session_data(session, job, entry, *data)) return false;
+    header = data->header;
     return true;
 }
 
