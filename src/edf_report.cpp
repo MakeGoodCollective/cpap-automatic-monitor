@@ -230,8 +230,10 @@ bool cached_day(uint16_t day, DailyValues &out, bool build) {
 void remember_day(uint16_t day, const DailyValues &values) {
     if (!day) return;
     size_t slot = daily_capacity;
-    for (size_t i = 0; i < daily_capacity; ++i)
-        if (!daily_cache[i].day || daily_cache[i].day == day) { slot = i; break; }
+    for (size_t i = 0; i < daily_capacity; ++i) {
+        if (daily_cache[i].day == day) { slot = i; break; }
+        if (!daily_cache[i].day && slot == daily_capacity) slot = i;
+    }
     if (slot == daily_capacity && daily_capacity < MAX_CACHED_DAYS) {
         const size_t capacity = std::min(MAX_CACHED_DAYS, std::max(size_t(16), daily_capacity * 2));
         auto *grown = static_cast<CachedDay *>(aircannect::Memory::realloc_large(
@@ -692,11 +694,13 @@ struct StrLayoutCache {
             layout.record_bytes > 4096) { reset(); return false; }
         for (size_t i = 0; i < layout.signal_count; ++i) {
             const auto &date = signals[i];
-            if (!strcmp(date.label, "Date") && date.samples_per_record == 1 && date.digital_min == 0 &&
+            if (strcmp(date.label, "Date")) continue;
+            if (date.samples_per_record == 1 && date.digital_min == 0 &&
                 date.physical_min == 0 && date.physical_max == date.digital_max) {
                 bytes = reader.size;
                 return true;
             }
+            break;
         }
         reset();
         return false;
