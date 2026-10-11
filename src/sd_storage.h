@@ -12,6 +12,7 @@ class File;
 namespace SdStorage {
 
 constexpr size_t READ_CHUNK_BYTES = 4096;
+constexpr size_t WRITE_CHUNK_BYTES = 4096;
 
 enum class Mode : uint8_t { Local, ToUsb, Usb, ToLocal };
 
@@ -90,7 +91,7 @@ void release();
 class Session {
 public:
     // One auxiliary operation at a time. Copies borrow the token; the owner
-    // must end it after closing its Readers. Recorder acquisition revokes it.
+    // must end it after closing its Readers/Writer. Recorder acquisition revokes it.
     bool begin();
     void end();
     bool valid() const;
@@ -137,6 +138,27 @@ private:
     uint64_t size_ = 0;
     int64_t modified_ = 0;
     uint64_t offset_ = 0;
+};
+
+// One sequential output alongside the two readers, all held by the SD worker.
+// For replaceable files: create/truncate a temporary path, finish, then publish
+// via Session::run. Revocation closes it before recorder/USB access begins.
+class Writer {
+public:
+    Writer() = default;
+    ~Writer() { close(); }
+    Writer(const Writer &) = delete;
+    Writer &operator=(const Writer &) = delete;
+    bool open(const Session &session, const char *path);
+    bool write(const uint8_t *data, size_t length);
+    // Flush, check the complete length and close, including on failure.
+    bool finish(uint64_t expected_size);
+    void close();
+
+private:
+    Session session_;
+    uint32_t handle_ = 0;
+    uint64_t size_ = 0;
 };
 
 }  // namespace SdStorage

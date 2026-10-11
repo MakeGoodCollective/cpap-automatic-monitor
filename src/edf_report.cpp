@@ -918,10 +918,6 @@ bool load_cache(const SdStorage::Session &session, const IndexedSession &entry,
     return true;
 }
 
-bool start_part(const SdStorage::Session &, const char *, const uint8_t *, size_t);
-bool append_part(const SdStorage::Session &, const char *, const uint8_t *, size_t);
-bool finish_part(const SdStorage::Session &, const char *, const char *, uint64_t);
-
 bool read_event(Input &input, uint32_t record, Event &event) {
     ReportEdf::Annotation annotation;
     if (!ReportEdf::read_annotation(input.reader, *input.header, record, annotation))
@@ -935,13 +931,18 @@ bool read_event(Input &input, uint32_t record, Event &event) {
 struct PartGuard {
     const SdStorage::Session &session;
     const char *path;
+    SdStorage::Writer writer;
     bool complete = false;
     ~PartGuard() {
+        writer.close();
         if (complete) return;
         cache_usage_known = false;
         (void)session.run([&](fs::FS &fs) { return !fs.exists(path) || fs.remove(path); });
     }
 };
+
+bool start_part(PartGuard &, const uint8_t *, size_t);
+bool finish_part(PartGuard &, const char *, uint64_t);
 
 bool store_cache(const SdStorage::Session &session, const Job &job, const IndexedSession &entry,
                  SessionData &data) {
@@ -953,12 +954,12 @@ bool store_cache(const SdStorage::Session &session, const Job &job, const Indexe
         data.header.events * sizeof(Event);
     if (!prune_cache(session, data.header.bytes, path)) return false;
     PartGuard part_guard{session, part};
-    if (!start_part(session, part, reinterpret_cast<const uint8_t *>(&data.header), sizeof(data.header)) ||
-        !append_part(session, part, reinterpret_cast<const uint8_t *>(data.bins),
-                     total_bins(data.header) * sizeof(uint64_t))) return false;
+    if (!start_part(part_guard, reinterpret_cast<const uint8_t *>(&data.header), sizeof(data.header)) ||
+        !part_guard.writer.write(reinterpret_cast<const uint8_t *>(data.bins),
+                                 total_bins(data.header) * sizeof(uint64_t))) return false;
     if (data.header.events <= MAX_EVENTS) {
-        if (!append_part(session, part, reinterpret_cast<const uint8_t *>(data.events),
-                         data.header.events * sizeof(Event))) return false;
+        if (!part_guard.writer.write(reinterpret_cast<const uint8_t *>(data.events),
+                                     data.header.events * sizeof(Event))) return false;
     } else {
         // Persist all events with a bounded block, not just the in-RAM prefix.
         Input input(session, job);
@@ -975,16 +976,16 @@ bool store_cache(const SdStorage::Session &session, const Job &job, const Indexe
                 block[used++] = event;
                 ++events;
                 if (used == 32) {
-                    if (!append_part(session, part, reinterpret_cast<uint8_t *>(block), sizeof(block))) return false;
+                    if (!part_guard.writer.write(reinterpret_cast<uint8_t *>(block), sizeof(block))) return false;
                     used = 0;
                 }
             }
             input.file.close();
         }
-        if (events != data.header.events || !append_part(session, part,
+        if (events != data.header.events || !part_guard.writer.write(
             reinterpret_cast<uint8_t *>(block), used * sizeof(Event))) return false;
     }
-    part_guard.complete = finish_part(session, part, path, data.header.bytes);
+    part_guard.complete = finish_part(part_guard, path, data.header.bytes);
     if (part_guard.complete) {
         invalidate_day(entry.day);
         __atomic_add_fetch(&cache_generation, 1, __ATOMIC_RELEASE);
@@ -1513,48 +1514,27 @@ void chart_signals(const ReportEdf::Header &header, uint8_t kind,
         signals[c] = chart_file(c) == kind ? ReportEdf::find_signal(header, chart_signal(c)) : -1;
 }
 
-bool start_part(const SdStorage::Session &session, const char *path,
-                const uint8_t *header, size_t bytes) {
-    return session.run([&](fs::FS &fs) {
+bool start_part(PartGuard &part, const uint8_t *header, size_t bytes) {
+    if (!part.session.run([&](fs::FS &fs) {
         if ((!fs.exists("/airbridge") && !fs.mkdir("/airbridge")) ||
             (!fs.exists(CACHE_DIR) && !fs.mkdir(CACHE_DIR))) return false;
         char directory[96];
-        snprintf(directory, sizeof(directory), "%s", path);
+        snprintf(directory, sizeof(directory), "%s", part.path);
         *strrchr(directory, '/') = 0;
         if (!fs.exists(directory) && !fs.mkdir(directory)) return false;
-        if (fs.exists(path) && !fs.remove(path)) return false;
-        fs::File file = fs.open(path, FILE_WRITE);
-        const bool success = file && SdStorage::write_exact(file, header, bytes);
-        file.close();
-        return success;
-    });
+        return !fs.exists(part.path) || fs.remove(part.path);
+    })) return false;
+    return part.writer.open(part.session, part.path) && part.writer.write(header, bytes);
 }
-bool append_part(const SdStorage::Session &session, const char *path,
-                 const uint8_t *data, size_t bytes) {
-    for (size_t at = 0; at < bytes;) {
-        const size_t take = std::min(bytes - at, SdStorage::READ_CHUNK_BYTES);
-        if (!session.run([&](fs::FS &fs) {
-            fs::File file = fs.open(path, FILE_APPEND);
-            const bool success = file && SdStorage::write_exact(file, data + at, take);
-            file.close();
-            return success;
-        })) return false;
-        at += take;
-    }
-    return true;
-}
-bool finish_part(const SdStorage::Session &session, const char *part,
-                 const char *path, uint64_t bytes) {
+
+bool finish_part(PartGuard &part, const char *path, uint64_t bytes) {
+    if (!part.writer.finish(bytes)) return false;
     uint64_t old_bytes = 0;
-    const bool success = session.run([&](fs::FS &fs) {
-        fs::File file = fs.open(part, FILE_APPEND);
-        if (!file || file.size() != bytes) return false;
-        file.flush();
-        file.close();
+    const bool success = part.session.run([&](fs::FS &fs) {
         fs::File old = fs.open(path, FILE_READ);
         if (old) old_bytes = old.size();
         old.close();
-        return (!fs.exists(path) || fs.remove(path)) && fs.rename(part, path);
+        return (!fs.exists(path) || fs.remove(path)) && fs.rename(part.path, path);
     });
     if (success && cache_usage_known) cache_bytes = cache_bytes - std::min(cache_bytes, old_bytes) + bytes;
     else cache_usage_known = false;
@@ -1776,7 +1756,7 @@ bool build_reduced(const SdStorage::Session &session, const Job &job,
     cache_path(entry, "series.part", part);
     if (!prune_cache(session, out.bytes, path)) return false;
     PartGuard part_guard{session, part};
-    if (!start_part(session, part, reinterpret_cast<const uint8_t *>(&out), sizeof(out))) return false;
+    if (!start_part(part_guard, reinterpret_cast<const uint8_t *>(&out), sizeof(out))) return false;
     // Keep only the coarse levels (under 1.5 MB for 24 h x 12 channels).
     // Fine cells are appended one minute at a time, not retained for the day.
     const uint64_t coarse_offset = out.channels[0].levels[1].offset;
@@ -1829,12 +1809,12 @@ bool build_reduced(const SdStorage::Session &session, const Job &job,
                     }
                     return true;
                 })) return false;
-            if (!append_part(session, part, reinterpret_cast<const uint8_t *>(fine_cells.get()), fine_bytes)) return false;
+            if (!part_guard.writer.write(reinterpret_cast<const uint8_t *>(fine_cells.get()), fine_bytes)) return false;
         }
         input.file.close();
     }
-    if (!append_part(session, part, reinterpret_cast<const uint8_t *>(cells.get()), bytes)) return false;
-    part_guard.complete = finish_part(session, part, path, out.bytes);
+    if (!part_guard.writer.write(reinterpret_cast<const uint8_t *>(cells.get()), bytes)) return false;
+    part_guard.complete = finish_part(part_guard, path, out.bytes);
     return part_guard.complete;
 }
 

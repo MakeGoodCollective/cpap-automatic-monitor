@@ -51,7 +51,7 @@ struct Request {
     SemaphoreHandle_t done;
     bool success;
     TaskHandle_t caller;
-    uint32_t reader_id;
+    uint32_t file_id;
 };
 
 void mount_card();
@@ -100,21 +100,28 @@ void configure_host(sdmmc_host_t &host, sdmmc_slot_config_t &slot) {
 struct OpenFile {
     fs::File file;
     uint32_t id = 0;
+    void close() { file.close(); id = 0; }
 };
 OpenFile readers[2];
-uint32_t next_reader = 0;
+OpenFile writer;
+uint32_t next_file = 0;
 
-void close_readers() {
-    for (OpenFile &reader : readers) {
-        reader.file.close();
-        reader.id = 0;
-    }
+void close_files() {
+    for (OpenFile &reader : readers) reader.close();
+    writer.close();
 }
 
-OpenFile *find_reader(uint32_t id) {
+OpenFile *find_file(uint32_t id) {
     for (OpenFile &reader : readers)
         if (reader.id == id) return &reader;
-    return nullptr;
+    return writer.id == id ? &writer : nullptr;
+}
+
+uint32_t retain_file(OpenFile &slot, const fs::File &file) {
+    if (++next_file == 0) ++next_file;
+    slot.id = next_file;
+    slot.file = file;
+    return slot.id;
 }
 
 bool background_allowed() {
@@ -160,21 +167,21 @@ void process_request(Request &value) {
         }
     } else if (request->kind == Request::End) {
         if (active_session == request->generation) {
-            close_readers();
+            close_files();
             __atomic_store_n(&active_session, 0, __ATOMIC_RELEASE);
         }
         request->success = true;
     } else if (request->kind == Request::Acquire || request->kind == Request::TryAcquire) {
         if (local_access_allowed() && mounted() && !direct_owner &&
             (request->kind == Request::Acquire || !active_session)) {
-            close_readers();
+            close_files();
             __atomic_store_n(&active_session, 0, __ATOMIC_RELEASE);
             __atomic_store_n(&direct_owner, request->caller, __ATOMIC_RELEASE);
             request->success = true;
         }
     } else if (request->kind == Request::Close) {
-        OpenFile *reader = find_reader(request->reader_id);
-        if (reader) { reader->file.close(); reader->id = 0; }
+        OpenFile *file = find_file(request->file_id);
+        if (file) file->close();
         request->success = true;
     } else if (request->kind == Request::Release) {
         if (direct_owner == request->caller) {
@@ -213,7 +220,7 @@ bool init_worker() {
 }
 
 bool direct_request(Request &request) {
-    // No executor means no auxiliary readers; keep the same ownership token.
+    // No executor means no auxiliary handles; keep the same ownership token.
     if (request.kind == Request::Acquire || request.kind == Request::TryAcquire) {
         if (!local_access_allowed() || !mounted()) return false;
         TaskHandle_t expected = nullptr;
@@ -240,6 +247,14 @@ bool dispatch(Request &request, bool control) {
     if (queued) xSemaphoreTake(request.done, portMAX_DELAY);
     vSemaphoreDelete(request.done);
     return queued && request.success;
+}
+
+void close_handle(uint32_t handle) {
+    if (!handle) return;
+    Request request = {};
+    request.kind = Request::Close;
+    request.file_id = handle;
+    (void)dispatch(request, true);
 }
 }  // namespace
 
@@ -454,7 +469,7 @@ void advance_usb() {
     bool usb_failed = false;
     const Mode mode = __atomic_load_n(&status.mode, __ATOMIC_ACQUIRE);
     if (mode == Mode::ToUsb) {
-        close_readers();
+        close_files();
         __atomic_store_n(&active_session, 0, __ATOMIC_RELEASE);
         if (__atomic_load_n(&direct_owner, __ATOMIC_ACQUIRE)) return;
         // Covers an update/reboot admitted just before the handoff request.
@@ -734,9 +749,7 @@ bool Reader::open(const Session &session, const char *path, bool directory) {
         if (!file || file.isDirectory() != directory) return false;
         size_ = file.size();
         modified_ = file.getLastWrite();
-        if (++next_reader == 0) ++next_reader;
-        slot->id = handle_ = next_reader;
-        slot->file = file;
+        handle_ = retain_file(*slot, file);
         return true;
     });
     if (!opened) return false;
@@ -752,7 +765,7 @@ bool Reader::next(Entry &entry, bool &end) {
 #if AB_STORAGE_HAS_SDCARD
     if (!handle_) return false;
     return session_.run([&](fs::FS &) {
-        OpenFile *reader = find_reader(handle_);
+        OpenFile *reader = find_file(handle_);
         if (!reader || !reader->file.isDirectory()) return false;
         fs::File file = reader->file.openNextFile();
         if (!file) { end = true; return true; }
@@ -773,7 +786,7 @@ bool Reader::seek(uint64_t offset) {
 #if AB_STORAGE_HAS_SDCARD
     if (!handle_ || offset > size_ || offset > UINT32_MAX) return false;
     const bool sought = session_.run([&](fs::FS &) {
-        OpenFile *reader = find_reader(handle_);
+        OpenFile *reader = find_file(handle_);
         return reader && reader->file && !reader->file.isDirectory() &&
             reader->file.seek(static_cast<uint32_t>(offset));
     });
@@ -793,7 +806,7 @@ size_t Reader::read(uint8_t *data, size_t length) {
         const size_t count = std::min<size_t>(READ_CHUNK_BYTES,
             std::min<uint64_t>(length - total, size_ - offset_));
         const bool read = session_.run([&](fs::FS &) {
-            OpenFile *reader = find_reader(handle_);
+            OpenFile *reader = find_file(handle_);
             return reader && reader->file.read(data + total, count) == count;
         });
         if (!read) break;
@@ -806,15 +819,70 @@ size_t Reader::read(uint8_t *data, size_t length) {
 
 void Reader::close() {
 #if AB_STORAGE_HAS_SDCARD
-    if (handle_) {
-        Request request = {};
-        request.kind = Request::Close;
-        request.reader_id = handle_;
-        (void)dispatch(request, true);
-    }
+    close_handle(handle_);
 #endif
     handle_ = 0;
     size_ = offset_ = 0;
+}
+
+bool Writer::open(const Session &session, const char *path) {
+    close();
+#if AB_STORAGE_HAS_SDCARD
+    if (!path || !session.run([&](fs::FS &fs) {
+        if (writer.id) return false;
+        fs::File file = fs.open(path, FILE_WRITE);
+        if (!file || file.isDirectory()) return false;
+        handle_ = retain_file(writer, file);
+        return true;
+    })) return false;
+    session_ = session;
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool Writer::write(const uint8_t *data, size_t length) {
+#if AB_STORAGE_HAS_SDCARD
+    if (!handle_ || (!data && length) || length > UINT32_MAX - size_) return false;
+    for (size_t at = 0; at < length;) {
+        const size_t take = std::min(length - at, WRITE_CHUNK_BYTES);
+        if (!session_.run([&](fs::FS &) {
+            OpenFile *file = find_file(handle_);
+            return file && write_exact(file->file, data + at, take);
+        })) {
+            close();
+            return false;
+        }
+        at += take;
+        size_ += take;
+    }
+    return session_.valid();
+#else
+    return false;
+#endif
+}
+
+bool Writer::finish(uint64_t expected_size) {
+    bool complete = false;
+#if AB_STORAGE_HAS_SDCARD
+    complete = handle_ && size_ == expected_size && session_.run([&](fs::FS &) {
+        OpenFile *file = find_file(handle_);
+        if (!file) return false;
+        file->file.flush();
+        return file->file.size() == expected_size;
+    });
+#endif
+    close();
+    return complete;
+}
+
+void Writer::close() {
+#if AB_STORAGE_HAS_SDCARD
+    close_handle(handle_);
+#endif
+    handle_ = 0;
+    size_ = 0;
 }
 
 }  // namespace SdStorage
