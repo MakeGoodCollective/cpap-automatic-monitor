@@ -75,6 +75,28 @@ bool same_scale(const Signal &a, const Signal &b) {
            a.physical_min == b.physical_min && a.physical_max == b.physical_max;
 }
 
+const Signal *paired_pressure(const Header &header, const Signal &signal) {
+    const int index = !strcmp(signal.label, "Flow.40ms")
+        ? find_signal(header, "Press.40ms") : -1;
+    return index >= 0 && header.signals[index].samples_per_record == signal.samples_per_record
+        ? &header.signals[index] : nullptr;
+}
+
+Sample decode_sample(const Signal &signal, const uint8_t *bytes,
+                     const Signal *pressure, const uint8_t *paired) {
+    // Decode explicitly; no host endian/alignment dependency.
+    const uint16_t bits = bytes[0] | (uint16_t(bytes[1]) << 8);
+    Sample value;
+    value.raw = static_cast<int16_t>(bits < 32768 ? bits : int32_t(bits) - 65536);
+    value.valid = signal.valid(value.raw);
+    if (pressure) {
+        const uint16_t p = paired[0] | (uint16_t(paired[1]) << 8);
+        value.valid &= pressure->valid(static_cast<int16_t>(p < 32768 ? p : int32_t(p) - 65536));
+    }
+    value.value = value.valid ? signal.physical(value.raw) : 0;
+    return value;
+}
+
 bool record_has_valid(const Reader &reader, const Header &header, size_t signal,
                       uint32_t record, bool &valid) {
     Sample samples[32];
@@ -221,11 +243,7 @@ bool read_samples(const Reader &reader, const Header &header, size_t index,
     if (signal.crc || signal.annotation || !signal.samples_per_record ||
         first > total || count > total - first) return false;
 
-    const int pressure_index = !strcmp(signal.label, "Flow.40ms")
-        ? find_signal(header, "Press.40ms") : -1;
-    const Signal *pressure = pressure_index >= 0 ? &header.signals[pressure_index] : nullptr;
-    if (pressure && pressure->samples_per_record != signal.samples_per_record)
-        pressure = nullptr;
+    const Signal *pressure = paired_pressure(header, signal);
 
     uint8_t bytes[256], paired[256];
     size_t done = 0;
@@ -241,21 +259,33 @@ bool read_samples(const Reader &reader, const Header &header, size_t index,
             (pressure && !read_at(reader, base + pressure->record_offset, paired, take * 2)))
             return false;
 
-        for (size_t i = 0; i < take; i++) {
-            // Decode explicitly; no host endian/alignment dependency.
-            const uint16_t bits = bytes[i * 2] | (uint16_t(bytes[i * 2 + 1]) << 8);
-            const int16_t raw = static_cast<int16_t>(bits < 32768 ? bits : int32_t(bits) - 65536);
-            Sample &value = out[done + i];
-            value.raw = raw;
-            value.valid = signal.valid(raw);
-            if (pressure) {
-                const uint16_t p = paired[i * 2] | (uint16_t(paired[i * 2 + 1]) << 8);
-                value.valid &= pressure->valid(static_cast<int16_t>(p < 32768 ? p : int32_t(p) - 65536));
-            }
-            value.value = value.valid ? signal.physical(raw) : 0;
-        }
+        for (size_t i = 0; i < take; i++)
+            out[done + i] = decode_sample(signal, bytes + i * 2, pressure, paired + i * 2);
         done += take;
     }
+    return true;
+}
+
+Sample RecordSamples::operator[](size_t slot) const {
+    return decode_sample(*signal, data + slot * 2, pressure, paired ? paired + slot * 2 : nullptr);
+}
+
+bool record_samples(const Header &header, const uint8_t *record, size_t bytes,
+                    size_t index, RecordSamples &out) {
+    out = {};
+    if (!record || bytes != header.record_bytes || header.signal_count > MAX_SIGNALS ||
+        index >= header.signal_count) return false;
+    const auto &signal = header.signals[index];
+    const Signal *pressure = paired_pressure(header, signal);
+    const Signal *specs[] = {&signal, pressure};
+    for (const Signal *spec : specs) {
+        if (!spec) continue;
+        if (spec->crc || spec->annotation || !spec->samples_per_record ||
+            spec->record_offset > bytes || spec->samples_per_record > (bytes - spec->record_offset) / 2)
+            return false;
+    }
+    out = {&signal, pressure, record + signal.record_offset,
+           pressure ? record + pressure->record_offset : nullptr};
     return true;
 }
 

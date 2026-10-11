@@ -45,6 +45,14 @@ struct Sample {
     bool valid = false;
 };
 
+// Borrowed view into one complete raw record. No I/O or decoded sample array;
+// valid until the caller reuses the record buffer. Uses read_samples' validity.
+struct RecordSamples {
+    const Signal *signal = nullptr, *pressure = nullptr;
+    const uint8_t *data = nullptr, *paired = nullptr;
+    Sample operator[](size_t slot) const;  // slot < signal->samples_per_record
+};
+
 enum class EventKind : uint8_t {
     Unknown, OA, CA, H, UA, RERA, CsrStart, CsrEnd,
 };
@@ -94,6 +102,9 @@ uint64_t sample_count(const Header &header, size_t signal);
 // Failure may leave a partial output; callers must discard that range.
 bool read_samples(const Reader &reader, const Header &header, size_t signal,
                   uint64_t first, size_t count, Sample *out);
+
+bool record_samples(const Header &header, const uint8_t *record, size_t bytes,
+                    size_t signal, RecordSamples &out);
 
 // Contiguous valid sample slots on the unshifted file axis. Zero is valid if
 // inside digital bounds. Sink receives native absolute [begin, end) seconds.

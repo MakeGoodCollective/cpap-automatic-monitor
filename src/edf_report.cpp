@@ -620,17 +620,7 @@ struct Input {
                 const uint64_t base = header.header_bytes +
                     ((offset - header.header_bytes) / header.record_bytes) * header.record_bytes;
                 if (offset + count <= base + header.record_bytes) {
-                    if (base != input.record_offset) {
-                        if (!file.seek(base)) return note_issue(input.job, "source_seek", input.path);
-                        for (size_t at = 0; at < header.record_bytes;) {
-                            const size_t take = std::min<size_t>(header.record_bytes - at,
-                                                                SdStorage::READ_CHUNK_BYTES);
-                            if (file.read(input.record + at, take) != take)
-                                return note_issue(input.job, "source_read", input.path);
-                            at += take;
-                        }
-                        input.record_offset = base;
-                    }
+                    if (!input.load_record((base - header.header_bytes) / header.record_bytes)) return false;
                     memcpy(out, input.record + (offset - base), count);
                     return true;
                 }
@@ -658,6 +648,42 @@ struct Input {
             }
         }
         if (record_capacity < header->record_bytes) return note_issue(job, "record_alloc", path);
+        return true;
+    }
+
+    bool load_record(uint32_t index) {
+        if (aborted(&job, session) || index >= header->records || !record ||
+            record_capacity < header->record_bytes) return false;
+        const uint64_t base = header->header_bytes + uint64_t(index) * header->record_bytes;
+        if (base == record_offset) return true;
+        record_offset = UINT64_MAX;
+        if (!file.seek(base)) return note_issue(job, "source_seek", path);
+        for (size_t at = 0; at < header->record_bytes;) {
+            if (aborted(&job, session)) return false;
+            const size_t take = std::min<size_t>(header->record_bytes - at, SdStorage::READ_CHUNK_BYTES);
+            if (file.read(record + at, take) != take) return note_issue(job, "source_read", path);
+            at += take;
+        }
+        record_offset = base;
+        return true;
+    }
+
+    template <typename Sink>
+    bool scan_records(const int *signals, size_t count, uint32_t first, uint32_t end, Sink consume) {
+        if (first > end || end > header->records) return false;
+        bool present = false;
+        for (size_t c = 0; c < count; ++c) present |= signals[c] >= 0;
+        if (!present) return true;
+        for (uint32_t n = first; n < end; ++n) {
+            if (!load_record(n)) return false;
+            for (size_t c = 0; c < count; ++c) {
+                if (signals[c] < 0) continue;
+                ReportEdf::RecordSamples samples;
+                if (aborted(&job, session) ||
+                    !ReportEdf::record_samples(*header, record, header->record_bytes, signals[c], samples) ||
+                    !consume(c, uint64_t(n) * samples.signal->samples_per_record, samples)) return false;
+            }
+        }
         return true;
     }
 };
@@ -976,48 +1002,33 @@ bool prepare_channels(Input &input, uint8_t file, SessionData &data) {
     return true;
 }
 
-bool scan_channels(const SdStorage::Session &session, const Job &job,
-                   Input &input, uint8_t file, SessionData &data) {
+bool scan_channels(Input &input, uint8_t file, SessionData &data) {
     int signals[CHANNEL_COUNT];
-    bool present = false;
+    size_t offsets[CHANNEL_COUNT], offset = 0;
     for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
+        offsets[c] = offset;
+        offset += data.header.channels[c].bins;
         signals[c] = -1;
         if (CHANNELS[c].file != file || !data.header.channels[c].bins) continue;
         signals[c] = ReportEdf::find_signal(*input.header, CHANNELS[c].signal);
         if (signals[c] < 0) return false;
-        present = true;
     }
-    if (!present) return true;
-
-    ReportEdf::Sample samples[32];
-    for (uint32_t record = 0; record < input.header->records; ++record) {
-        size_t offset = 0;
-        for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
+    if (!input.scan_records(signals, CHANNEL_COUNT, 0, input.header->records,
+        [&](size_t c, uint64_t, const ReportEdf::RecordSamples &samples) {
             auto &channel = data.header.channels[c];
-            if (signals[c] >= 0) {
-                auto hist = histogram(channel, data.bins + offset);
-                const uint32_t count = channel.signal.samples_per_record;
-                const uint64_t first = uint64_t(record) * count;
-                // Stay inside this record so every channel reuses Input's buffer.
-                for (uint32_t slot = 0; slot < count;) {
-                    if (aborted(&job, session)) return false;
-                    const size_t take = std::min<size_t>(32, count - slot);
-                    if (!ReportEdf::read_samples(input.reader, *input.header, signals[c],
-                                                 first + slot, take, samples)) return false;
-                    for (size_t i = 0; i < take; ++i) {
-                        if (!ReportEdf::add_sample(hist, samples[i].raw, samples[i].valid)) return false;
-                        if (c == 3 && samples[i].valid && channel.signal.physical(samples[i].raw) > LEAK_THRESHOLD)
-                            data.header.leak_high_seconds += input.header->record_seconds / count;
-                    }
-                    slot += take;
-                }
-                channel.count = hist.count;
-                channel.missing = hist.missing;
-                channel.sum = hist.sum;
+            auto hist = histogram(channel, data.bins + offsets[c]);
+            const uint32_t count = samples.signal->samples_per_record;
+            for (uint32_t slot = 0; slot < count; ++slot) {
+                const auto sample = samples[slot];
+                if (!ReportEdf::add_sample(hist, sample.raw, sample.valid)) return false;
+                if (c == 3 && sample.valid && channel.signal.physical(sample.raw) > LEAK_THRESHOLD)
+                    data.header.leak_high_seconds += input.header->record_seconds / count;
             }
-            offset += channel.bins;
-        }
-    }
+            channel.count = hist.count;
+            channel.missing = hist.missing;
+            channel.sum = hist.sum;
+            return true;
+        })) return false;
     for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
         if (signals[c] >= 0) {
             auto &channel = data.header.channels[c];
@@ -1152,7 +1163,7 @@ bool build_session(const SdStorage::Session &session, const Job &job,
     if (!allocate_data(out)) return false;
     for (uint8_t kind : {uint8_t(1), uint8_t(2)}) {
         if (!(readable_numeric & (1u << kind))) continue;
-        if (!input.open(session, entry, kind) || !scan_channels(session, job, input, kind, out))
+        if (!input.open(session, entry, kind) || !scan_channels(input, kind, out))
             return false;
         input.file.close();
     }
@@ -1473,6 +1484,12 @@ double chart_scale(size_t c, const ReportEdf::Signal &signal) {
     return 1;
 }
 
+void chart_signals(const ReportEdf::Header &header, uint8_t kind,
+                   int (&signals)[CHART_CHANNEL_COUNT + 1]) {
+    for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c)
+        signals[c] = chart_file(c) == kind ? ReportEdf::find_signal(header, chart_signal(c)) : -1;
+}
+
 bool start_part(const SdStorage::Session &session, const char *path,
                 const uint8_t *header, size_t bytes) {
     return session.run([&](fs::FS &fs) {
@@ -1701,49 +1718,41 @@ bool build_reduced(const SdStorage::Session &session, const Job &job,
     if (!prune_cache(session, out.bytes, path)) return false;
     PartGuard part_guard{session, part};
     if (!start_part(session, part, reinterpret_cast<const uint8_t *>(&out), sizeof(out))) return false;
-    for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
-        const auto &channel = out.channels[c];
-        size_t count = 0;
-        for (const auto &level : channel.levels) count += level.count;
-        const size_t bytes = count * sizeof(Cell);
-        if (!count) continue;
-        auto *cells = static_cast<Cell *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
-        if (!cells) return false;
-        for (size_t i = 0; i < count; ++i) new (&cells[i]) Cell;
-        bool success = input.open(session, entry, chart_file(c));
-        const int signal = success ? ReportEdf::find_signal(*input.header, chart_signal(c)) : -1;
-        success &= signal >= 0;
-        if (success) {
-            const auto &spec = input.header->signals[signal];
-            const double step = input.header->record_seconds * 1000 / spec.samples_per_record;
-            const int64_t origin = input.header->start_seconds * 1000;
-            const uint64_t samples = ReportEdf::sample_count(*input.header, signal);
-            const double scale = chart_scale(c, spec);
-            ReportEdf::Sample values[32];
-            for (uint64_t first = 0; success && first < samples;) {
-                const size_t take = std::min<uint64_t>(32, samples - first);
-                success = !aborted(&job, session) && ReportEdf::read_samples(input.reader,
-                    *input.header, signal, first, take, values);
-                for (size_t i = 0; success && i < take; ++i) {
+    // Retain only reduced cells, never the session's raw/decoded samples. At
+    // most 24 h x 12 channels x the four LODs: under 1.5 MB, including on GEEK.
+    const size_t bytes = out.bytes - sizeof(out);
+    std::unique_ptr<Cell, decltype(&aircannect::Memory::free)> cells(
+        bytes ? static_cast<Cell *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK)) : nullptr,
+        aircannect::Memory::free);
+    if (bytes && !cells) return false;
+    for (size_t i = 0; i < bytes / sizeof(Cell); ++i) new (cells.get() + i) Cell;
+    for (uint8_t kind = 0; kind < 3; ++kind) {
+        if (!(entry.key.present & (1u << kind))) continue;
+        if (!input.open(session, entry, kind)) return false;
+        int signals[CHART_CHANNEL_COUNT + 1];
+        chart_signals(*input.header, kind, signals);
+        if (!input.scan_records(signals, CHART_CHANNEL_COUNT + 1, 0, input.header->records,
+            [&](size_t c, uint64_t first, const ReportEdf::RecordSamples &samples) {
+                const auto &channel = out.channels[c];
+                const double step = input.header->record_seconds * 1000 / samples.signal->samples_per_record;
+                const int64_t origin = input.header->start_seconds * 1000;
+                const double scale = chart_scale(c, *samples.signal);
+                for (uint32_t i = 0; i < samples.signal->samples_per_record; ++i) {
+                    const auto sample = samples[i];
                     const int64_t begin = origin + llround((first + i) * step);
                     const int64_t end = origin + llround((first + i + 1) * step);
-                    const double value = values[i].value * scale;
-                    size_t cell_offset = 0;
                     for (size_t n = 0; n < LEVEL_COUNT; ++n) {
                         const auto &level = channel.levels[n];
-                        cell_sample(cells + cell_offset, level.count, level.start_ms, LEVEL_MS[n],
-                                    begin, end, value, values[i].valid);
-                        cell_offset += level.count;
+                        cell_sample(cells.get() + (level.offset - sizeof(out)) / sizeof(Cell),
+                                    level.count, level.start_ms, LEVEL_MS[n], begin, end,
+                                    sample.value * scale, sample.valid);
                     }
                 }
-                first += take;
-            }
-        }
+                return true;
+            })) return false;
         input.file.close();
-        success = success && append_part(session, part, reinterpret_cast<uint8_t *>(cells), bytes);
-        aircannect::Memory::free(cells);
-        if (!success) return false;
     }
+    if (!append_part(session, part, reinterpret_cast<const uint8_t *>(cells.get()), bytes)) return false;
     part_guard.complete = finish_part(session, part, path, out.bytes);
     return part_guard.complete;
 }
@@ -1894,39 +1903,41 @@ bool cached_series(const SdStorage::Session &session, const Job &job,
 bool window_series(const SdStorage::Session &session, const Job &job,
                    const IndexedSession &entry, Series &series) {
     Input input(session, job);
-    ReportEdf::Sample values[32];
-    for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
-        if (!(entry.key.present & (1u << chart_file(c)))) { series.partial = true; continue; }
-        if (!input.open(session, entry, chart_file(c))) return false;
-        const int signal = ReportEdf::find_signal(*input.header, chart_signal(c));
-        if (signal < 0) { input.file.close(); continue; }
-        const auto &spec = input.header->signals[signal];
-        const double step = input.header->record_seconds * 1000 / spec.samples_per_record;
+    for (uint8_t kind = 0; kind < 3; ++kind) {
+        if (!(entry.key.present & (1u << kind))) { series.partial = true; continue; }
+        if (!input.open(session, entry, kind)) return false;
+        int signals[CHART_CHANNEL_COUNT + 1];
+        chart_signals(*input.header, kind, signals);
         const int64_t origin = input.header->start_seconds * 1000;
-        const uint64_t count = ReportEdf::sample_count(*input.header, signal);
-        const uint64_t first = std::min<uint64_t>(count,
-            std::max<double>(0, std::floor((series.from_ms - origin) / step)));
-        const uint64_t last = std::min<uint64_t>(count,
-            std::max<double>(0, std::ceil((series.to_ms - origin) / step)));
-        const double scale = chart_scale(c, spec);
-        for (uint64_t n = first; n < last;) {
-            const size_t take = std::min<uint64_t>(32, last - n);
-            if (aborted(&job, session) || !ReportEdf::read_samples(input.reader, *input.header,
-                signal, n, take, values)) return false;
-            for (size_t i = 0; i < take; ++i) {
-                if (!values[i].valid) continue;
-                int64_t begin = std::max<int64_t>(series.from_ms, origin + llround((n + i) * step));
-                const int64_t end = std::min<int64_t>(series.to_ms, origin + llround((n + i + 1) * step));
-                while (begin < end) {
-                    const int64_t cell = (begin - series.from_ms) / series.step_ms;
-                    const int64_t right = std::min(end, series.from_ms + (cell + 1) * series.step_ms);
-                    const float value = values[i].value * scale;
-                    series.add(c, begin, right, value, value, right - begin);
-                    begin = right;
+        const double record_ms = input.header->record_seconds * 1000;
+        const uint32_t first = std::min<double>(input.header->records,
+            std::max<double>(0, std::floor((series.from_ms - origin) / record_ms)));
+        const uint32_t last = std::min<double>(input.header->records,
+            std::max<double>(0, std::ceil((series.to_ms - origin) / record_ms)));
+        if (!input.scan_records(signals, CHART_CHANNEL_COUNT + 1, first, last,
+            [&](size_t c, uint64_t base, const ReportEdf::RecordSamples &samples) {
+                const auto &spec = *samples.signal;
+                const double step = record_ms / spec.samples_per_record;
+                const uint64_t begin_sample = std::max<uint64_t>(base,
+                    std::max<double>(0, std::floor((series.from_ms - origin) / step)));
+                const uint64_t end_sample = std::min<uint64_t>(base + spec.samples_per_record,
+                    std::max<double>(0, std::ceil((series.to_ms - origin) / step)));
+                const double scale = chart_scale(c, spec);
+                for (uint64_t n = begin_sample; n < end_sample; ++n) {
+                    const auto sample = samples[n - base];
+                    if (!sample.valid) continue;
+                    int64_t begin = std::max<int64_t>(series.from_ms, origin + llround(n * step));
+                    const int64_t end = std::min<int64_t>(series.to_ms, origin + llround((n + 1) * step));
+                    while (begin < end) {
+                        const int64_t cell = (begin - series.from_ms) / series.step_ms;
+                        const int64_t right = std::min(end, series.from_ms + (cell + 1) * series.step_ms);
+                        const float value = sample.value * scale;
+                        series.add(c, begin, right, value, value, right - begin);
+                        begin = right;
+                    }
                 }
-            }
-            n += take;
-        }
+                return true;
+            })) return false;
         input.file.close();
     }
     return true;
