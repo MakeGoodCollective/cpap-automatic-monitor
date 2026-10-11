@@ -840,7 +840,7 @@ private:
 
 static bool reportQueryKeys(AsyncWebServerRequest *request) {
     const char *keys[] = {"source", "action", "view", "day", "period", "job",
-                          "from_ms", "to_ms", "px", "revision", "exclude"};
+                          "revision"};
     const size_t count = request->params();
     if (count > sizeof(keys) / sizeof(keys[0])) return false;
     for (size_t i = 0; i < count; i++) {
@@ -867,19 +867,6 @@ static bool reportNumber(AsyncWebServerRequest *request, const char *key,
     return true;
 }
 
-static bool reportExclusions(AsyncWebServerRequest *request, SleepReport::LocalRequest &local) {
-    const auto *param = request->getParam("exclude");
-    if (!param) return true;
-#if AB_STORAGE_HAS_SDCARD
-    const auto &text = param->value();
-    size_t decoded = 0;
-    return aircannect::hex_decode(text.c_str(), text.length(), local.excluded,
-                                  sizeof(local.excluded), decoded);
-#else
-    (void)local;
-    return false;
-#endif
-}
 
 static bool reportJob(AsyncWebServerRequest *request, SleepReport::Source &source,
                        uint32_t &id, bool &qualified) {
@@ -965,7 +952,7 @@ static void handleReport(AsyncWebServerRequest *request) {
     SleepReport::LocalRequest local;
     if (const auto *param = request->getParam("action")) {
         if (param->value() == "days") local.action = EdfReport::Action::Days;
-        else if (param->value() == "series") local.action = EdfReport::Action::Series;
+        else if (param->value() == "reindex") local.action = EdfReport::Action::Reindex;
         else if (param->value() == "history") local.action = EdfReport::Action::History;
         else if (param->value() == "prepare") local.action = EdfReport::Action::Prepare;
         else if (param->value() != "summary") { invalid(); return; }
@@ -975,26 +962,17 @@ static void handleReport(AsyncWebServerRequest *request) {
         else if (param->value() != "day") { invalid(); return; }
     }
     const bool period_view = local.view == EdfReport::View::Period;
-    const bool series = local.action == EdfReport::Action::Series;
-    uint64_t day = 0, period = 0, from = 0, to = 0, px = local.px, revision = 0;
+    uint64_t day = 0, period = 0, revision = 0;
     if (!reportNumber(request, "day", UINT16_MAX, day) ||
         !reportNumber(request, "period", 5, period) ||
-        !reportNumber(request, "from_ms", INT64_MAX, from) ||
-        !reportNumber(request, "to_ms", INT64_MAX, to) ||
-        !reportNumber(request, "px", 1600, px) ||
         !reportNumber(request, "revision", UINT32_MAX, revision) ||
         (!period_view && request->hasParam("period")) ||
-        (!series && (request->hasParam("from_ms") || request->hasParam("to_ms") ||
-                     request->hasParam("px") || request->hasParam("exclude")))) {
+        (local.action == EdfReport::Action::Reindex && request->method() != HTTP_POST)) {
         invalid(); return;
     }
     local.day = static_cast<uint16_t>(day);
     local.period = SleepReport::period_days(static_cast<uint16_t>(period));
-    local.from_ms = static_cast<int64_t>(from);
-    local.to_ms = static_cast<int64_t>(to);
-    local.px = static_cast<uint16_t>(px);
     local.revision = static_cast<uint32_t>(revision);
-    if (!reportExclusions(request, local)) { invalid(); return; }
 
     if (source == SleepReport::Source::Device) {
         if (local.action != EdfReport::Action::Summary || request->hasParam("revision") ||
@@ -1013,7 +991,7 @@ static void handleReport(AsyncWebServerRequest *request) {
         return;
     }
 
-    if (request->method() != HTTP_GET) {
+    if (request->method() != (local.action == EdfReport::Action::Reindex ? HTTP_POST : HTTP_GET)) {
         request->send(405, "application/json", "{\"error\":\"report_edf_requires_GET\"}");
         return;
     }

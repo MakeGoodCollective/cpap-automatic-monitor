@@ -8,7 +8,7 @@
 namespace EdfReport {
 
 enum class State : uint8_t { Ready, WaitingStorage, Building, Blocked, Error };
-enum class Action : uint8_t { Days, Summary, Series, History, Prepare };
+enum class Action : uint8_t { Days = 0, Summary = 1, History = 3, Prepare = 4, Reindex = 5 };
 enum class View : uint8_t { Day, Period };
 
 constexpr size_t MAX_SESSION_COUNT = 8192;
@@ -18,16 +18,7 @@ struct Request {
     View view = View::Day;
     uint16_t day = 0;       // Native epoch day; zero selects latest catalog day.
     uint16_t period = 1;    // Actual days: 1/7/30/90/180/365, ending at day.
-    int64_t from_ms = 0, to_ms = 0;
-    uint16_t px = 800;      // Shared aligned min/max buckets, at most 1600.
     uint32_t revision = 0;  // Dataset revision, NOT status.revision; zero accepts latest.
-    // Summary session IDs are catalog indexes valid only for that data revision.
-    // Bit n excludes session n from series values and events, never statistics.
-    uint8_t excluded[MAX_SESSION_COUNT / 8] = {};
-
-    bool excludes(size_t id) const {
-        return id < MAX_SESSION_COUNT && (excluded[id / 8] & (1u << (id % 8)));
-    }
     bool operator==(const Request &other) const;
 };
 

@@ -13,24 +13,17 @@ namespace EdfReport {
 
 bool Request::operator==(const Request &other) const {
     return action == other.action && view == other.view && day == other.day &&
-        period == other.period && from_ms == other.from_ms && to_ms == other.to_ms &&
-        px == other.px && revision == other.revision &&
-        !memcmp(excluded, other.excluded, sizeof(excluded));
+        period == other.period && revision == other.revision;
 }
 
 bool valid(const Request &request) {
-    if (request.action > Action::Prepare || request.view > View::Period ||
+    if (request.action > Action::Reindex || uint8_t(request.action) == 2 || request.view > View::Period ||
         request.day == UINT16_MAX) return false;
     if (request.action == Action::History && request.view != View::Day) return false;
     if (request.view == View::Period && request.period != 1 && request.period != 7 &&
         request.period != 30 && request.period != 90 && request.period != 180 &&
         request.period != 365) return false;
-    for (uint8_t excluded : request.excluded)
-        if (excluded && (request.action != Action::Series || !request.revision)) return false;
-    return request.action != Action::Series ||
-        (request.from_ms > 0 && request.to_ms > request.from_ms &&
-         request.to_ms - request.from_ms <= 366ll * 86400000 &&
-         request.px && request.px <= 1600);
+    return true;
 }
 
 const char *state_name(State state) {
@@ -83,27 +76,21 @@ Result::Result(Result &&other) noexcept
 namespace EdfReport {
 namespace {
 constexpr uint32_t STATS_CACHE_VERSION = 7;
-constexpr uint32_t SERIES_CACHE_VERSION = 7;
 constexpr size_t MAX_BINS = 16384;
 constexpr size_t MAX_EVENTS = 4096;
 constexpr size_t MAX_DISK_EVENTS = 65536;
 constexpr size_t MAX_BODY = 512 * 1024;
 constexpr size_t INTERNAL_BODY = 16 * 1024;
 constexpr size_t INTERNAL_WORK = 8 * 1024;
-constexpr uint64_t MAX_SD_CACHE = 128ull * 1024 * 1024;
 constexpr uint32_t RETAIN_MS = 6 * 60 * 60 * 1000;
 constexpr uint32_t DELIVERY_MS = 30000;
 constexpr size_t SLOT_COUNT = 2;
 constexpr size_t RETAINED_SLOTS = 32;
-constexpr size_t CHART_CHANNEL_COUNT = 11;
 constexpr double LEAK_THRESHOLD = 24;
-constexpr int64_t LEVEL_MS[] = {2000, 10000, 60000, 600000, 3600000};
-constexpr size_t LEVEL_COUNT = sizeof(LEVEL_MS) / sizeof(LEVEL_MS[0]);
-constexpr int64_t FINE_BLOCK_MS = 60000;
-constexpr size_t FINE_BLOCK_CELLS = FINE_BLOCK_MS / LEVEL_MS[0];
 constexpr const char *CACHE_DIR = "/airbridge/report";
 constexpr const char *SUFFIXES[] = {"BRP", "PLD", "SAD", "EVE", "CSL"};
 char dataset_id[65] = {};
+uint32_t rebuild_generation = 0;
 
 struct ChannelSpec {
     const char *id, *label, *unit, *signal;
@@ -369,27 +356,10 @@ enum class IndexFailure : uint8_t { Error, WaitingCatalog, Preempted };
 IndexFailure index_failure = IndexFailure::Error;
 const char *index_error = nullptr;
 size_t index_error_entry = SIZE_MAX;
-bool prune_cache(const SdStorage::Session &session, uint64_t needed = 0,
-                 const char *keep = nullptr);
+bool migrate_cache(const SdStorage::Session &session);
+bool artifact_headroom(const SdStorage::Session &session, uint16_t day);
 void invalidate_str();
-
-bool retire_cache(const SdStorage::Session &session, const IndexedSession &entry) {
-    bool removed = false;
-    const bool success = session.run([&](fs::FS &fs) {
-        for (const char *suffix : {"stats", "series", "stats.part", "series.part"}) {
-            char path[96];
-            snprintf(path, sizeof(path), "%s/%s/%s.%s", CACHE_DIR,
-                     entry.entry.therapy_day, entry.entry.file_prefix, suffix);
-            if (fs.exists(path)) {
-                if (!fs.remove(path)) return false;
-                removed = true;
-            }
-        }
-        return true;
-    });
-    if (removed) cache_usage_known = false;
-    return success;
-}
+bool dataset(const SdStorage::Session &session);
 
 void publish(State state, const char *error = "") {
     portENTER_CRITICAL(&status_mux);
@@ -431,6 +401,11 @@ bool reclaim_result() {
     return oldest != nullptr;
 }
 bool aborted(const Job *job, const SdStorage::Session &session) {
+    // Owner-only work batches: SD operations remain individually bounded, and
+    // CPU codec/histogram loops also yield without a delay per sample or tile.
+    static uint32_t batch_us = 0;
+    const uint32_t now = micros();
+    if (uint32_t(now - batch_us) >= 4000) { vTaskDelay(1); batch_us = micros(); }
     return (job && __atomic_load_n(&job->cancelled, __ATOMIC_ACQUIRE)) ||
         (job && job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE)) ||
         !AirSenseState::local_background_allowed() || !session.valid();
@@ -442,8 +417,10 @@ void source_path(const IndexedSession &entry, uint8_t file, const char *ext,
              entry.entry.file_prefix, SUFFIXES[file], ext);
 }
 void cache_path(const IndexedSession &entry, const char *ext, char (&out)[96]) {
-    snprintf(out, sizeof(out), "%s/%s/%s.%s", CACHE_DIR,
-             entry.entry.therapy_day, entry.entry.file_prefix, ext);
+    if (rebuild_generation) snprintf(out, sizeof(out), "%s/%s/%s.g%lu.%s", CACHE_DIR,
+        entry.entry.therapy_day, entry.entry.file_prefix, static_cast<unsigned long>(rebuild_generation), ext);
+    else snprintf(out, sizeof(out), "%s/%s/%s.%s", CACHE_DIR,
+        entry.entry.therapy_day, entry.entry.file_prefix, ext);
 }
 
 bool catalog_day(const char *text, uint16_t &out) {
@@ -508,6 +485,7 @@ bool refresh_index(const SdStorage::Session &session) {
     const bool full = !index_ready || invalidated || !incremental || files != file_revision ||
         changes.catalog.entries < index_count;
     if (full) { invalidate_day(); invalidate_str(); dataset_id[0] = 0; }
+    if (!dataset(session)) { index_error = "dataset_identity"; return false; }
     const size_t old_count = index_count;
     index_error = "session_limit";
     if (changes.catalog.entries > MAX_SESSION_COUNT) return false;
@@ -586,7 +564,7 @@ bool refresh_index(const SdStorage::Session &session) {
     index_ready = true;
     if (full) {
         cache_usage_known = false;
-        if (!prune_cache(session)) { index_ready = false; index_error = "cache_prune"; return false; }
+        if (!migrate_cache(session)) { index_ready = false; index_error = "cache_migrate"; return false; }
     }
     if ((detail_changed || summary_changed) && !invalidated) __atomic_add_fetch(&data_revision, 1, __ATOMIC_RELEASE);
     portENTER_CRITICAL(&status_mux);
@@ -713,24 +691,6 @@ struct Input {
         return true;
     }
 
-    template <typename Sink>
-    bool scan_window(const int *signals, size_t count, int64_t from, int64_t to, Sink consume) {
-        const int64_t origin = header->start_seconds * 1000;
-        const double record_ms = header->record_seconds * 1000;
-        const uint32_t first = std::min<double>(header->records,
-            std::max<double>(0, std::floor((from - origin) / record_ms)));
-        const uint32_t last = std::min<double>(header->records,
-            std::max<double>(0, std::ceil((to - origin) / record_ms)));
-        return scan_records(signals, count, first, last,
-            [&](size_t c, uint64_t base, const ReportEdf::RecordSamples &samples) {
-                const double step = record_ms / samples.signal->samples_per_record;
-                const uint64_t begin = std::max<uint64_t>(base,
-                    std::max<double>(0, std::floor((from - origin) / step)));
-                const uint64_t end = std::min<uint64_t>(base + samples.signal->samples_per_record,
-                    std::max<double>(0, std::ceil((to - origin) / step)));
-                return consume(c, base, begin, end, samples);
-            });
-    }
 };
 
 double chart_scale(size_t c, const ReportEdf::Signal &signal);
@@ -738,6 +698,8 @@ double chart_scale(size_t c, const ReportEdf::Signal &signal);
 bool artifact_identity(const IndexedSession &entry, uint8_t kind, char (&prefix)[96], uint8_t (&key)[32]) {
     snprintf(prefix, sizeof(prefix), "%s/%s/%s_%s", CACHE_DIR, entry.entry.therapy_day,
              entry.entry.file_prefix, SUFFIXES[kind]);
+    if (rebuild_generation) snprintf(prefix + strlen(prefix), sizeof(prefix) - strlen(prefix),
+        ".g%lu", static_cast<unsigned long>(rebuild_generation));
     uint8_t identity[20] = {};
     SdStorage::put_le16(identity, ReportArtifact::VERSION);
     identity[2] = kind;
@@ -1039,7 +1001,7 @@ bool store_cache(const SdStorage::Session &session, const Job &job, const Indexe
     cache_path(entry, "stats.part", part);
     data.header.bytes = sizeof(data.header) + total_bins(data.header) * sizeof(uint64_t) +
         data.header.events * sizeof(Event);
-    if (!prune_cache(session, data.header.bytes, path)) return false;
+    if (!artifact_headroom(session, entry.day)) return false;
     PartGuard part_guard{session, part};
     if (!start_part(part_guard, reinterpret_cast<const uint8_t *>(&data.header), sizeof(data.header)) ||
         !part_guard.writer.write(reinterpret_cast<const uint8_t *>(data.bins),
@@ -1398,6 +1360,14 @@ bool dataset(const SdStorage::Session &session) {
         if (!ReportArtifact::document_publish(session, prefix, key, id, sizeof(id), document)) return false;
     } else if (found != ReportArtifact::Lookup::Ready) return false;
     if (!ReportArtifact::document_read(session, prefix, document, bytes) || bytes.length() != 32) return false;
+    ReportArtifact::Document rebuild;
+    const auto generation = ReportArtifact::document_lookup(session, "/airbridge/report/rebuild", nullptr, rebuild);
+    rebuild_generation = 0;
+    if (generation == ReportArtifact::Lookup::Ready) {
+        Payload value;
+        if (!ReportArtifact::document_read(session, "/airbridge/report/rebuild", rebuild, value) || value.length() != 4) return false;
+        rebuild_generation = SdStorage::get_le32(reinterpret_cast<const uint8_t *>(value.c_str()));
+    } else if (generation != ReportArtifact::Lookup::Missing) return false;
     return aircannect::hex_encode(reinterpret_cast<const uint8_t *>(bytes.c_str()), 32,
         dataset_id, sizeof(dataset_id), aircannect::HexCase::Lower);
 }
@@ -1416,7 +1386,8 @@ bool publication_key(const Request &request, uint8_t (&key)[32]) {
     Payload identity;
     const uint16_t last = last_day(request);
     const uint16_t first = request.view == View::Day ? (last > 13 ? last - 13 : 0) : first_day(request, last);
-    identity.print("publication-1:%s:%u:%u:%u", dataset_id, first, last, request.period);
+    identity.print("publication-1:%s:%u:%u:%u:%lu", dataset_id, first, last, request.period,
+                   static_cast<unsigned long>(rebuild_generation));
     for (size_t i = 0; i < index_count; ++i) {
         const auto &entry = index[i];
         if (!selected(entry, first, last)) continue;
@@ -1467,6 +1438,51 @@ bool prepare_period(const SdStorage::Session &session, Job &job) {
     ++status.revision;
     portEXIT_CRITICAL(&status_mux);
     return true;
+}
+
+bool publish_histograms(const SdStorage::Session &session, const IndexedSession &entry,
+                        const SessionData &data, ReportArtifact::Document &document) {
+    Payload bytes;
+    uint8_t header[16] = {};
+    memcpy(header, "ABHIST01", 8);
+    SdStorage::put_le16(header + 8, 1);
+    SdStorage::put_le16(header + 10, CHANNEL_COUNT);
+    const uint32_t length = sizeof(header) + CHANNEL_COUNT * 72 + total_bins(data.header) * 8;
+    SdStorage::put_le32(header + 12, length);
+    if (!bytes.reserve(length) || !bytes.append(reinterpret_cast<const char *>(header), sizeof(header))) return false;
+    const auto u64 = [](uint8_t *out, uint64_t value) {
+        SdStorage::put_le32(out, uint32_t(value));
+        SdStorage::put_le32(out + 4, uint32_t(value >> 32));
+    };
+    const auto real = [&](uint8_t *out, double value) {
+        static_assert(sizeof(value) == sizeof(uint64_t), "binary64 histogram values");
+        uint64_t bits; memcpy(&bits, &value, sizeof(bits)); u64(out, bits);
+    };
+    size_t offset = 0;
+    for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
+        const auto &channel = data.header.channels[c];
+        uint8_t descriptor[72] = {};
+        SdStorage::put_le16(descriptor, uint16_t(CHANNELS[c].artifact_id));
+        SdStorage::put_le32(descriptor + 4, channel.bins);
+        SdStorage::put_le32(descriptor + 8, uint32_t(channel.signal.digital_min));
+        SdStorage::put_le32(descriptor + 12, uint32_t(channel.signal.digital_max));
+        real(descriptor + 16, channel.signal.physical_min);
+        real(descriptor + 24, channel.signal.physical_max);
+        u64(descriptor + 32, channel.count); u64(descriptor + 40, channel.missing);
+        real(descriptor + 48, channel.sum); real(descriptor + 56, channel.coverage_seconds);
+        SdStorage::put_le32(descriptor + 64, channel.signal.samples_per_record);
+        if (!bytes.append(reinterpret_cast<const char *>(descriptor), sizeof(descriptor))) return false;
+        for (uint32_t bin = 0; bin < channel.bins; ++bin) {
+            uint8_t value[8]; u64(value, data.bins[offset++]);
+            if (!bytes.append(reinterpret_cast<const char *>(value), sizeof(value))) return false;
+        }
+    }
+    char prefix[96]; uint8_t key[32];
+    cache_path(entry, "histograms", prefix);
+    return bytes.length() == length && ReportArtifact::fingerprint(
+        reinterpret_cast<const uint8_t *>(bytes.c_str()), bytes.length(), key) &&
+        ReportArtifact::document_publish(session, prefix, key,
+            reinterpret_cast<const uint8_t *>(bytes.c_str()), bytes.length(), document);
 }
 
 bool prepare_json(const SdStorage::Session &session, Job &job) {
@@ -1546,6 +1562,8 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
         if (!selected(entry, day, day)) continue;
         SessionData data;
         if (!session_data(session, job, entry, data)) return false;
+        ReportArtifact::Document histogram;
+        if (!publish_histograms(session, entry, data, histogram)) return note_issue(job, "histogram_publish");
         Payload events;
         bool event_comma = false, truncated = false;
         events.print("{\"events\":[");
@@ -1560,8 +1578,11 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
             !ReportArtifact::document_publish(session, prefix, event_key,
                 reinterpret_cast<const uint8_t *>(events.c_str()), events.length(), publication)) return note_issue(job, "events_publish");
         aircannect::hex_encode(publication.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
-        job.body.print("%s{\"session\":%u,\"day\":\"%s\",\"digest\":\"%s\",\"bytes\":%u}",
+        job.body.print("%s{\"session\":%u,\"day\":\"%s\",\"digest\":\"%s\",\"bytes\":%u,",
             comma ? "," : "", unsigned(i), entry.entry.therapy_day, digest, publication.bytes);
+        aircannect::hex_encode(histogram.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+        job.body.print("\"histogram\":{\"day\":\"%s\",\"digest\":\"%s\",\"bytes\":%u}}",
+            entry.entry.therapy_day, digest, histogram.bytes);
         comma = true;
     }
     job.body.print("],\"summary\":");
@@ -1574,7 +1595,12 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
     envelope.append(job.body.c_str(), job.body.length());
     envelope.print("}");
     job.body.swap(envelope);
-    if (!job.body.good() || job.issue || aborted(&job, session)) return false;
+    if (!job.body.good() || aborted(&job, session)) return false;
+    if (job.issue) {
+        ReportArtifact::Document previous;
+        const bool prior = ReportArtifact::document_lookup(session, manifest, nullptr, previous) == ReportArtifact::Lookup::Ready;
+        if (strcmp(job.issue, "partial_source") || prior) return false;
+    }
     // A catalog/STR update during production must not become the current head.
     EdfCatalog::Status current;
     EdfCatalog::get_status(current);
@@ -1828,41 +1854,10 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
     return job.body.good();
 }
 
-struct Cell {
-    float low = INFINITY, high = -INFINITY;
-    uint32_t covered_ms = 0;
-};
-struct ReducedLevel {
-    int64_t start_ms = 0;
-    uint32_t count = 0;
-    uint64_t offset = 0;
-};
-struct ReducedChannel {
-    int64_t end_ms = 0;
-    ReducedLevel levels[LEVEL_COUNT];
-};
-struct ReducedHeader {
-    char magic[8] = {'A','B','S','E','R','0','1',0};
-    uint32_t version = SERIES_CACHE_VERSION, header_bytes = sizeof(ReducedHeader);
-    uint64_t bytes = 0;
-    SourceKey key;
-    uint32_t fine = 0;
-    uint32_t fine_stride[3] = {};
-    ReducedChannel channels[CHART_CHANNEL_COUNT + 1];
-};
-
-uint8_t chart_file(size_t c) { return c ? CHANNELS[c - 1].file : 0; }
-const char *chart_signal(size_t c) { return c ? CHANNELS[c - 1].signal : "Flow.40ms"; }
 double chart_scale(size_t c, const ReportEdf::Signal &signal) {
     if ((c == 0 || c == 4) && !strcmp(signal.unit, "L/s")) return 60;
     if (c == 7 && !strcmp(signal.unit, "L")) return 1000;
     return 1;
-}
-
-void chart_signals(const ReportEdf::Header &header, uint8_t kind,
-                   int (&signals)[CHART_CHANNEL_COUNT + 1]) {
-    for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c)
-        signals[c] = chart_file(c) == kind ? ReportEdf::find_signal(header, chart_signal(c)) : -1;
 }
 
 bool start_part(PartGuard &part, const uint8_t *header, size_t bytes) {
@@ -1904,6 +1899,7 @@ bool cache_name(const char *input, const char *&base) {
 }
 
 bool migrate_cache(const SdStorage::Session &session) {
+    if (rebuild_generation) return true;
     SdStorage::Reader directory;
     if (!directory.open(session, CACHE_DIR, true))
         return session.run([&](fs::FS &fs) { return !fs.exists(CACHE_DIR); });
@@ -1930,464 +1926,6 @@ bool migrate_cache(const SdStorage::Session &session) {
     return true;
 }
 
-bool prune_cache(const SdStorage::Session &session, uint64_t needed, const char *keep) {
-    if (needed > MAX_SD_CACHE) return false;
-    if (cache_usage_known && cache_bytes + needed <= MAX_SD_CACHE) return true;
-    if (!migrate_cache(session)) return false;
-    while (true) {
-        SdStorage::Reader directory;
-        if (!directory.open(session, CACHE_DIR, true)) {
-            bool missing = false;
-            if (!session.run([&](fs::FS &fs) { missing = !fs.exists(CACHE_DIR); return true; })) return false;
-            if (missing) { cache_bytes = 0; cache_usage_known = true; return true; }
-            return false;
-        }
-        uint64_t total = 0, oldest_bytes = 0;
-        char oldest[96] = {};
-        auto visit = [&](const char *parent, const SdStorage::Reader::Entry &file) {
-            char path[96];
-            const char *base = nullptr;
-            if (!cache_name(file.name, base)) return true;
-            snprintf(path, sizeof(path), "%s/%s", parent, base);
-            bool rebuildable = false;
-            for (size_t i = 0; i < index_count; ++i)
-                if (index[i].key.present == 31 && !strncmp(base, index[i].entry.file_prefix, 15)) {
-                    rebuildable = true;
-                    break;
-                }
-            if (strstr(base, ".part"))
-                return session.run([&](fs::FS &fs) { return fs.remove(path); });
-            total += file.size;
-            if (rebuildable && (!keep || strcmp(path, keep)) && (!oldest[0] || strcmp(path, oldest) < 0)) {
-                snprintf(oldest, sizeof(oldest), "%s", path);
-                oldest_bytes = file.size;
-            }
-            return true;
-        };
-        bool end = false;
-        SdStorage::Reader::Entry file;
-        while (!end) {
-            if (!directory.next(file, end)) return false;
-            if (end) break;
-            if (!file.directory) {
-                if (!visit(CACHE_DIR, file)) return false;
-                continue;
-            }
-            const char *name = strrchr(file.name, '/');
-            name = name ? name + 1 : file.name;
-            uint16_t day = 0;
-            if (!catalog_day(name, day)) continue;
-            char parent[96];
-            snprintf(parent, sizeof(parent), "%s/%s", CACHE_DIR, name);
-            SdStorage::Reader children;
-            if (!children.open(session, parent, true)) return false;
-            bool last = false;
-            while (!last) {
-                if (!children.next(file, last)) return false;
-                if (!last && !file.directory && !visit(parent, file)) return false;
-            }
-        }
-        directory.close();
-        cache_bytes = total;
-        cache_usage_known = true;
-        if (total + needed <= MAX_SD_CACHE) return true;
-        if (!oldest[0] || !session.run([&](fs::FS &fs) { return fs.remove(oldest); })) return false;
-        cache_bytes -= oldest_bytes;
-        // Retire oldest cache entries only. Missing cache is rebuilt from EDF.
-        if (cache_bytes + needed <= MAX_SD_CACHE) return true;
-    }
-}
-
-bool reduced_layout(ReducedHeader &out, bool initialize) {
-    if (out.fine > 1) return false;
-    uint64_t offset = sizeof(out);
-    for (const auto &channel : out.channels) {
-        if (channel.end_ms < 0) return false;
-        for (size_t n = 0; n < LEVEL_COUNT; ++n) {
-            const auto &level = channel.levels[n];
-            const uint64_t limit = n ? 86400000 / LEVEL_MS[n] + 2
-                                     : (86400000 / FINE_BLOCK_MS + 2) * FINE_BLOCK_CELLS;
-            if ((!n && !out.fine && level.count) || level.count > limit ||
-                level.start_ms < 0 || level.start_ms % LEVEL_MS[n]) return false;
-        }
-    }
-    // Fine data is minute-major within each source file. Coarser levels keep
-    // their contiguous channel-major layout, independent of recording length.
-    for (uint8_t kind = 0; kind < 3; ++kind) {
-        uint32_t stride = 0, count = 0;
-        int64_t start = 0;
-        for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
-            if (chart_file(c) != kind) continue;
-            auto &level = out.channels[c].levels[0];
-            if (!level.count) {
-                if (level.offset) return false;
-                continue;
-            }
-            if (level.count % FINE_BLOCK_CELLS || level.start_ms % FINE_BLOCK_MS ||
-                (stride && (level.count != count || level.start_ms != start))) return false;
-            count = level.count;
-            start = level.start_ms;
-            const uint64_t channel_offset = offset + uint64_t(stride) * sizeof(Cell);
-            if (initialize) level.offset = channel_offset;
-            else if (level.offset != channel_offset) return false;
-            stride += FINE_BLOCK_CELLS;
-        }
-        if (initialize) out.fine_stride[kind] = stride;
-        else if (out.fine_stride[kind] != stride) return false;
-        offset += uint64_t(count / FINE_BLOCK_CELLS) * stride * sizeof(Cell);
-    }
-    for (auto &channel : out.channels) {
-        for (size_t n = 1; n < LEVEL_COUNT; ++n) {
-            auto &level = channel.levels[n];
-            if (initialize) level.offset = offset;
-            else if (level.offset != offset) return false;
-            offset += uint64_t(level.count) * sizeof(Cell);
-        }
-    }
-    if (initialize) out.bytes = offset;
-    return offset == out.bytes;
-}
-
-bool reduced_header(const SdStorage::Session &session, const IndexedSession &entry,
-                    ReducedHeader &out) {
-    char path[96];
-    cache_path(entry, "series", path);
-    SdStorage::Reader reader;
-    return reader.open(session, path) && reader.read(reinterpret_cast<uint8_t *>(&out), sizeof(out)) == sizeof(out) &&
-        !memcmp(out.magic, "ABSER01", 8) && out.version == SERIES_CACHE_VERSION &&
-        out.header_bytes == sizeof(out) && out.key == entry.key && out.bytes == reader.size() &&
-        reduced_layout(out, false);
-}
-
-void cell_sample(Cell *cells, uint32_t count, int64_t start_ms, int64_t step_ms,
-                 int64_t begin, int64_t end, double value, bool valid) {
-    if (!valid || end <= start_ms) return;
-    int64_t cell = std::max<int64_t>(0, (begin - start_ms) / step_ms);
-    while (cell < count && start_ms + cell * step_ms < end) {
-        const int64_t left = std::max(begin, start_ms + cell * step_ms);
-        const int64_t right = std::min(end, start_ms + (cell + 1) * step_ms);
-        if (right > left) {
-            cells[cell].low = std::min(cells[cell].low, static_cast<float>(value));
-            cells[cell].high = std::max(cells[cell].high, static_cast<float>(value));
-            cells[cell].covered_ms += right - left;
-        }
-        ++cell;
-    }
-}
-
-bool build_reduced(const SdStorage::Session &session, const Job &job,
-                   const IndexedSession &entry, bool fine, ReducedHeader &out) {
-    out = {};
-    out.key = entry.key;
-    out.fine = fine;
-    Input input(session, job);
-    for (uint8_t kind = 0; kind < 3; ++kind) {
-        if (!(entry.key.present & (1u << kind))) continue;
-        if (!input.open(session, entry, kind)) return false;
-        int64_t start = 0, end = 0;
-        if (!numeric_extent(*input.header, start, end)) return false;
-        for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
-            if (chart_file(c) != kind || ReportEdf::find_signal(*input.header, chart_signal(c)) < 0)
-                continue;
-            auto &channel = out.channels[c];
-            channel.end_ms = end;
-            for (size_t n = 0; n < LEVEL_COUNT; ++n) {
-                if (!n && !fine) continue;
-                auto &level = channel.levels[n];
-                const int64_t block = n ? LEVEL_MS[n] : FINE_BLOCK_MS;
-                level.start_ms = start / block * block;
-                level.count = end > start ? ((end - level.start_ms + block - 1) / block) * (block / LEVEL_MS[n]) : 0;
-            }
-        }
-        input.file.close();
-    }
-    if (!reduced_layout(out, true)) return false;
-    char path[96], part[96];
-    cache_path(entry, "series", path);
-    cache_path(entry, "series.part", part);
-    if (!prune_cache(session, out.bytes, path)) return false;
-    PartGuard part_guard{session, part};
-    if (!start_part(part_guard, reinterpret_cast<const uint8_t *>(&out), sizeof(out))) return false;
-    // Keep only the coarse levels (under 1.5 MB for 24 h x 12 channels).
-    // Fine cells are appended one minute at a time, not retained for the day.
-    const uint64_t coarse_offset = out.channels[0].levels[1].offset;
-    const size_t bytes = out.bytes - coarse_offset;
-    std::unique_ptr<Cell, decltype(&aircannect::Memory::free)> cells(
-        bytes ? static_cast<Cell *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK)) : nullptr,
-        aircannect::Memory::free);
-    if (bytes && !cells) return false;
-    for (size_t i = 0; i < bytes / sizeof(Cell); ++i) new (cells.get() + i) Cell;
-    for (uint8_t kind = 0; kind < 3; ++kind) {
-        if (!(entry.key.present & (1u << kind))) continue;
-        const size_t stride = out.fine_stride[kind];
-        if (!input.open(session, entry, kind)) return false;
-        int signals[CHART_CHANNEL_COUNT + 1];
-        chart_signals(*input.header, kind, signals);
-        size_t fine_offsets[CHART_CHANNEL_COUNT + 1], fine_count = 0;
-        for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
-            fine_offsets[c] = fine_count;
-            if (signals[c] >= 0) fine_count += FINE_BLOCK_CELLS;
-        }
-        if (fine && fine_count != stride && input.header->records) return false;
-        const size_t fine_bytes = stride * sizeof(Cell);
-        std::unique_ptr<Cell, decltype(&aircannect::Memory::free)> fine_cells(
-            fine_bytes ? static_cast<Cell *>(aircannect::Memory::alloc_large(fine_bytes, fine_bytes <= INTERNAL_WORK)) : nullptr,
-            aircannect::Memory::free);
-        if (fine_bytes && !fine_cells) return false;
-        int64_t start = 0, end = 0;
-        if (!numeric_extent(*input.header, start, end)) return false;
-        const int64_t origin = input.header->start_seconds * 1000;
-        for (int64_t block = start / FINE_BLOCK_MS * FINE_BLOCK_MS; block < end; block += FINE_BLOCK_MS) {
-            for (size_t i = 0; i < stride; ++i) new (fine_cells.get() + i) Cell;
-            if (!input.scan_window(signals, CHART_CHANNEL_COUNT + 1, block, block + FINE_BLOCK_MS,
-                [&](size_t c, uint64_t base, uint64_t first, uint64_t last, const ReportEdf::RecordSamples &samples) {
-                    const auto &channel = out.channels[c];
-                    const double step = input.header->record_seconds * 1000 / samples.signal->samples_per_record;
-                    const double scale = chart_scale(c, *samples.signal);
-                    for (uint64_t i = first; i < last; ++i) {
-                        const auto sample = samples[i - base];
-                        const int64_t begin = std::max<int64_t>(block, origin + llround(i * step));
-                        const int64_t end = std::min<int64_t>(block + FINE_BLOCK_MS, origin + llround((i + 1) * step));
-                        if (fine)
-                            cell_sample(fine_cells.get() + fine_offsets[c], FINE_BLOCK_CELLS, block, LEVEL_MS[0],
-                                        begin, end, sample.value * scale, sample.valid);
-                        for (size_t n = 1; n < LEVEL_COUNT; ++n) {
-                            const auto &level = channel.levels[n];
-                            cell_sample(cells.get() + (level.offset - coarse_offset) / sizeof(Cell),
-                                        level.count, level.start_ms, LEVEL_MS[n], begin, end,
-                                        sample.value * scale, sample.valid);
-                        }
-                    }
-                    return true;
-                })) return false;
-            if (!part_guard.writer.write(reinterpret_cast<const uint8_t *>(fine_cells.get()), fine_bytes)) return false;
-        }
-        input.file.close();
-    }
-    if (!part_guard.writer.write(reinterpret_cast<const uint8_t *>(cells.get()), bytes)) return false;
-    part_guard.complete = finish_part(part_guard, path, out.bytes);
-    return part_guard.complete;
-}
-
-struct Bucket {
-    float low = INFINITY, high = -INFINITY;
-    uint64_t covered_ms = 0;
-};
-struct Series {
-    Bucket *buckets = nullptr;
-    uint16_t px = 0;
-    int64_t from_ms = 0, to_ms = 0, step_ms = 0, level_ms = 0;
-    size_t level_index = 0;
-    bool partial = false;
-    explicit Series(const Request &request) {
-        from_ms = request.from_ms;
-        to_ms = request.to_ms;
-        step_ms = (to_ms - from_ms + request.px - 1) / request.px;
-        if (step_ms >= LEVEL_MS[0]) {
-            for (size_t n = 0; n < LEVEL_COUNT; ++n)
-                if (LEVEL_MS[n] <= step_ms) level_index = n;
-            level_ms = LEVEL_MS[level_index];
-            from_ms = from_ms / level_ms * level_ms;
-            step_ms = ((request.to_ms - from_ms + request.px - 1) / request.px + level_ms - 1) /
-                level_ms * level_ms;
-            px = (request.to_ms - from_ms + step_ms - 1) / step_ms;
-            to_ms = from_ms + px * step_ms;
-        } else px = (to_ms - from_ms + step_ms - 1) / step_ms;
-        const size_t count = px * (CHART_CHANNEL_COUNT + 1), bytes = count * sizeof(Bucket);
-        buckets = static_cast<Bucket *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
-        if (buckets) for (size_t i = 0; i < count; ++i) new (&buckets[i]) Bucket;
-    }
-    ~Series() { aircannect::Memory::free(buckets); }
-    void add(size_t c, int64_t begin, int64_t end, float low, float high, uint64_t covered) {
-        if (!covered || end <= from_ms || begin >= to_ms) return;
-        const int64_t cell = std::max<int64_t>(0, (begin - from_ms) / step_ms);
-        if (cell >= px) return;
-        Bucket &bucket = buckets[c * px + cell];
-        bucket.low = std::min(bucket.low, low);
-        bucket.high = std::max(bucket.high, high);
-        bucket.covered_ms += covered;
-    }
-};
-
-void series_channel_json(Payload &out, const Series &series, size_t channel) {
-    auto format_bucket = [&](size_t at, char *text) -> size_t {
-        const auto &bucket = series.buckets[channel * series.px + at];
-        if (!bucket.covered_ms || !std::isfinite(bucket.low) || !std::isfinite(bucket.high))
-            return 0;
-        const uint64_t expected = std::min<int64_t>(series.step_ms, series.to_ms -
-            (series.from_ms + int64_t(at) * series.step_ms));
-        return snprintf(text, 64, "%.7g,%.7g,%llu", bucket.low, bucket.high,
-                        static_cast<unsigned long long>(std::min(bucket.covered_ms, expected)));
-    };
-    auto visit_runs = [&](auto &&visit) {
-        char value[64], next[64];
-        const auto *buckets = series.buckets + channel * series.px;
-        size_t begin = 0, length = format_bucket(0, value);
-        for (size_t at = 1; at <= series.px; ++at) {
-            if (at < series.px) {
-                const auto &bucket = buckets[at], &previous = buckets[at - 1];
-                const uint64_t expected = std::min<int64_t>(series.step_ms, series.to_ms -
-                    (series.from_ms + int64_t(at) * series.step_ms));
-                // The preceding bucket cannot be the clipped tail. Bitwise
-                // float equality also distinguishes +0 from -0.
-                if (std::min(bucket.covered_ms, expected) ==
-                    std::min(previous.covered_ms, static_cast<uint64_t>(series.step_ms)) &&
-                    !memcmp(&bucket.low, &previous.low, sizeof(bucket.low)) &&
-                    !memcmp(&bucket.high, &previous.high, sizeof(bucket.high)))
-                    continue;
-            }
-            const size_t next_length = at < series.px ? format_bucket(at, next) : 0;
-            // Compare wire values, including tail-clipped coverage and the
-            // existing seven-significant-digit representation, not raw floats.
-            if (at < series.px && length == next_length && !memcmp(value, next, length))
-                continue;
-            visit(at - begin, value, length);
-            begin = at;
-            length = next_length;
-            if (length) memcpy(value, next, length + 1);
-        }
-    };
-
-    size_t dense_bytes = sizeof("\"buckets\":[]") - 1 + series.px - 1;
-    size_t run_bytes = sizeof("\"runs\":[]") - 1, run_count = 0;
-    visit_runs([&](size_t count, const char *, size_t length) {
-        dense_bytes += count * (length ? length + 2 : 4);
-        run_bytes += snprintf(nullptr, 0, "%zu", count) + 2 +
-            (length ? length + 1 : 0) + (run_count++ ? 1 : 0);
-    });
-    const bool compact = run_bytes < dense_bytes;
-    out.print("\"%s\":[", compact ? "runs" : "buckets");
-    bool comma = false;
-    visit_runs([&](size_t count, const char *value, size_t length) {
-        if (compact) {
-            if (length) out.print("%s[%zu,%s]", comma ? "," : "", count, value);
-            else out.print("%s[%zu]", comma ? "," : "", count);
-            comma = true;
-        } else {
-            for (size_t i = 0; i < count; ++i) {
-                if (length) out.print("%s[%s]", comma ? "," : "", value);
-                else out.print("%snull", comma ? "," : "");
-                comma = true;
-            }
-        }
-    });
-    out.print("]");
-}
-
-bool cached_series(const SdStorage::Session &session, const Job &job,
-                   const IndexedSession &entry, Series &series, ReducedHeader &header) {
-    const bool fine = !series.level_index;
-    if (!reduced_header(session, entry, header) || (fine && !header.fine))
-        if (!build_reduced(session, job, entry, fine, header))
-            return note_issue(job, "series_cache_build", entry.entry.file_prefix);
-    char path[96];
-    cache_path(entry, "series", path);
-    SdStorage::Reader reader;
-    if (!reader.open(session, path)) return false;
-    auto add = [&](size_t c, int64_t begin, const Cell &cell) {
-        if (cell.covered_ms > series.level_ms ||
-            (cell.covered_ms && (!std::isfinite(cell.low) ||
-             !std::isfinite(cell.high) || cell.low > cell.high))) return false;
-        series.add(c, begin, begin + series.level_ms, cell.low, cell.high, cell.covered_ms);
-        return true;
-    };
-    if (!series.level_index) {
-        const size_t stride = *std::max_element(header.fine_stride, header.fine_stride + 3);
-        const size_t bytes = stride * sizeof(Cell);
-        std::unique_ptr<Cell, decltype(&aircannect::Memory::free)> cells(
-            bytes ? static_cast<Cell *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK)) : nullptr,
-            aircannect::Memory::free);
-        if (bytes && !cells) return false;
-        for (uint8_t kind = 0; kind < 3; ++kind) {
-            if (!header.fine_stride[kind]) continue;
-            size_t first_channel = 0;
-            while (chart_file(first_channel) != kind || !header.channels[first_channel].levels[0].count)
-                ++first_channel;
-            const auto &level = header.channels[first_channel].levels[0];
-            const uint32_t first = std::min<int64_t>(level.count / FINE_BLOCK_CELLS,
-                std::max<int64_t>(0, (series.from_ms - level.start_ms) / FINE_BLOCK_MS));
-            const uint32_t last = std::min<int64_t>(level.count / FINE_BLOCK_CELLS,
-                std::max<int64_t>(0, (series.to_ms - level.start_ms + FINE_BLOCK_MS - 1) / FINE_BLOCK_MS));
-            const size_t block_bytes = header.fine_stride[kind] * sizeof(Cell);
-            if (!reader.seek(level.offset + uint64_t(first) * block_bytes)) return false;
-            for (uint32_t n = first; n < last; ++n) {
-                if (aborted(&job, session) || reader.read(reinterpret_cast<uint8_t *>(cells.get()),
-                    block_bytes) != block_bytes) return false;
-                size_t at = 0;
-                const int64_t block = level.start_ms + int64_t(n) * FINE_BLOCK_MS;
-                for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
-                    if (chart_file(c) != kind || !header.channels[c].levels[0].count) continue;
-                    for (size_t i = 0; i < FINE_BLOCK_CELLS; ++i) {
-                        const int64_t begin = block + int64_t(i) * series.level_ms;
-                        if (begin >= series.from_ms && begin < series.to_ms &&
-                            !add(c, begin, cells.get()[at + i])) return false;
-                    }
-                    at += FINE_BLOCK_CELLS;
-                }
-            }
-        }
-        return true;
-    }
-    Cell cells[64];
-    for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
-        const auto &channel = header.channels[c];
-        const auto &level = channel.levels[series.level_index];
-        const uint32_t count = level.count;
-        const int64_t start = level.start_ms;
-        const uint64_t offset = level.offset;
-        if (!count || channel.end_ms <= series.from_ms || start >= series.to_ms) continue;
-        const uint32_t first = std::max<int64_t>(0, (series.from_ms - start) / series.level_ms);
-        const uint32_t last = std::min<int64_t>(count, (series.to_ms - start) / series.level_ms);
-        if (!reader.seek(offset + first * sizeof(Cell))) return false;
-        for (uint32_t n = first; n < last;) {
-            const size_t take = std::min<uint32_t>(64, last - n);
-            if (aborted(&job, session) || reader.read(reinterpret_cast<uint8_t *>(cells),
-                take * sizeof(Cell)) != take * sizeof(Cell)) return false;
-            for (size_t i = 0; i < take; ++i) {
-                const int64_t begin = start + (n + i) * series.level_ms;
-                if (!add(c, begin, cells[i])) return false;
-            }
-            n += take;
-        }
-    }
-    return true;
-}
-
-bool window_series(const SdStorage::Session &session, const Job &job,
-                   const IndexedSession &entry, Series &series) {
-    Input input(session, job);
-    for (uint8_t kind = 0; kind < 3; ++kind) {
-        if (!(entry.key.present & (1u << kind))) { series.partial = true; continue; }
-        if (!input.open(session, entry, kind)) return false;
-        int signals[CHART_CHANNEL_COUNT + 1];
-        chart_signals(*input.header, kind, signals);
-        const int64_t origin = input.header->start_seconds * 1000;
-        const double record_ms = input.header->record_seconds * 1000;
-        if (!input.scan_window(signals, CHART_CHANNEL_COUNT + 1, series.from_ms, series.to_ms,
-            [&](size_t c, uint64_t base, uint64_t begin_sample, uint64_t end_sample,
-                const ReportEdf::RecordSamples &samples) {
-                const auto &spec = *samples.signal;
-                const double step = record_ms / spec.samples_per_record;
-                const double scale = chart_scale(c, spec);
-                for (uint64_t n = begin_sample; n < end_sample; ++n) {
-                    const auto sample = samples[n - base];
-                    if (!sample.valid) continue;
-                    int64_t begin = std::max<int64_t>(series.from_ms, origin + llround(n * step));
-                    const int64_t end = std::min<int64_t>(series.to_ms, origin + llround((n + 1) * step));
-                    while (begin < end) {
-                        const int64_t cell = (begin - series.from_ms) / series.step_ms;
-                        const int64_t right = std::min(end, series.from_ms + (cell + 1) * series.step_ms);
-                        const float value = sample.value * scale;
-                        series.add(c, begin, right, value, value, right - begin);
-                        begin = right;
-                    }
-                }
-                return true;
-            })) return false;
-        input.file.close();
-    }
-    return true;
-}
 
 bool cached_summary_header(const SdStorage::Session &session, const IndexedSession &entry,
                            CacheHeader &header) {
@@ -2528,90 +2066,6 @@ bool window_events(const SdStorage::Session &session, const Job &job,
     return out.good();
 }
 
-bool series_json(const SdStorage::Session &session, Job &job, JobTiming &timing) {
-    uint32_t started = timing.stamp();
-    // Inlining cache branches must not reserve their large headers on the raw
-    // zoom stack, which also needs room for EDF parsing and libc formatting.
-    struct Work { CacheHeader summary; ReducedHeader reduced; };
-    void *memory = aircannect::Memory::alloc_large(sizeof(Work), sizeof(Work) <= INTERNAL_WORK);
-    if (!memory) return note_issue(job, "series_work_alloc");
-    std::unique_ptr<Work, decltype(&aircannect::Memory::free)> work(new (memory) Work, aircannect::Memory::free);
-    Series series(job.request);
-    timing.numeric_us += timing.stamp() - started;
-    if (!series.buckets) return false;
-    Payload events;
-    bool event_comma = false, events_truncated = false;
-    const uint16_t last = last_day(job.request), first = first_day(job.request, last);
-    for (size_t i = 0; i < index_count; ++i) {
-        auto &entry = index[i];
-        if (job.request.excludes(i) || !selected(entry, first, last)) continue;
-        const int64_t noon = int64_t(entry.day) * 86400000 + 43200000;
-        if (noon + 86400000 <= series.from_ms || noon >= series.to_ms ||
-            (entry.bounds_known && (entry.end_ms <= series.from_ms || entry.start_ms >= series.to_ms) &&
-             (entry.event_to_ms < series.from_ms || entry.event_from_ms >= series.to_ms))) continue;
-        if (aborted(&job, session)) return false;
-        if (!(entry.key.present & 7)) { series.partial = true; continue; }
-        started = timing.stamp();
-        auto &header = work->summary;
-        if (!cached_summary_header(session, entry, header) && !build_summary_header(session, job, entry, header)) {
-            timing.numeric_us += timing.stamp() - started;
-            if (aborted(&job, session)) return false;
-            series.partial = true;
-            continue;
-        }
-        series.partial |= header.partial;
-        entry.bounds_known = header.chart_end_ms > header.chart_start_ms;
-        entry.start_ms = header.chart_start_ms;
-        entry.end_ms = header.chart_end_ms;
-        entry.event_from_ms = header.event_from_ms;
-        entry.event_to_ms = header.event_to_ms;
-        // Non-overlapping sessions need neither BRP cache construction nor a
-        // source window. Their summaries remain reusable for later requests.
-        const bool numeric_overlap = !entry.bounds_known ||
-            (entry.end_ms > series.from_ms && entry.start_ms < series.to_ms);
-        const bool success = !numeric_overlap || (series.level_ms ? cached_series(session, job, entry, series, work->reduced)
-                                                                  : window_series(session, job, entry, series));
-        timing.numeric_us += timing.stamp() - started;
-        if (!success) {
-            if (aborted(&job, session)) return false;
-            series.partial = true;
-        }
-        started = timing.stamp();
-        if (!window_events(session, job, entry, header, series.from_ms, series.to_ms,
-                           events, event_comma, events_truncated)) series.partial = true;
-        timing.events_us += timing.stamp() - started;
-    }
-    started = timing.stamp();
-    start_json(job.body, revision() + 1, job.data_revision);
-    job.body.print("\"excluded\":\"");
-    size_t mask_bytes = sizeof(job.request.excluded);
-    while (mask_bytes && !job.request.excluded[mask_bytes - 1]) --mask_bytes;
-    for (size_t i = 0; i < mask_bytes; ++i) {
-        const char pair[] = {
-            aircannect::hex_digit(job.request.excluded[i] >> 4, aircannect::HexCase::Lower),
-            aircannect::hex_digit(job.request.excluded[i], aircannect::HexCase::Lower)};
-        job.body.append(pair, sizeof(pair));
-    }
-    job.body.print("\",\"day\":%u,\"from_ms\":%lld,\"to_ms\":%lld,\"bucket_ms\":%lld,\"px\":%u,",
-                   last, static_cast<long long>(series.from_ms), static_cast<long long>(series.to_ms),
-                   static_cast<long long>(series.step_ms), series.px);
-    job.body.print("\"requested_from_ms\":%lld,\"requested_to_ms\":%lld,\"partial\":%s,\"channels\":[",
-                   static_cast<long long>(job.request.from_ms), static_cast<long long>(job.request.to_ms),
-                   series.partial ? "true" : "false");
-    for (size_t c = 0; c <= CHART_CHANNEL_COUNT; ++c) {
-        job.body.print("%s{\"id\":\"%s\",\"label\":\"%s\",\"unit\":\"%s\",", c ? "," : "",
-                       c ? CHANNELS[c - 1].id : "Flow", c ? CHANNELS[c - 1].label : "Flow",
-                       c ? CHANNELS[c - 1].unit : "L/min");
-        series_channel_json(job.body, series, c);
-        job.body.print("}");
-    }
-    job.body.print("],\"events_truncated\":%s,\"events\":[", events_truncated ? "true" : "false");
-    if (events.length()) job.body.append(events.c_str(), events.length());
-    job.body.print("]}");
-    timing.encode_us += timing.stamp() - started;
-    return job.body.good() && events.good();
-}
-
 void error_body(Job &job, int code, const char *error) {
     job.body.~Payload();
     new (&job.body) Payload;
@@ -2626,6 +2080,31 @@ bool dirty() {
     return !index_ready || __atomic_load_n(&invalidation_generation, __ATOMIC_ACQUIRE) != indexed_invalidation ||
         catalog.generation != catalog_generation ||
         SdStorage::files_revision() != file_revision;
+}
+
+bool reindex(const SdStorage::Session &session, Job &job) {
+    if (!dataset(session) || rebuild_generation == UINT32_MAX) return note_issue(job, "rebuild_generation");
+    uint8_t value[4], key[32] = {};
+    SdStorage::put_le32(value, rebuild_generation + 1);
+    ReportArtifact::Document document;
+    if (!ReportArtifact::document_publish(session, "/airbridge/report/rebuild", key, value, sizeof(value), document))
+        return note_issue(job, "rebuild_publish");
+    ++rebuild_generation;
+    invalidate_day(); invalidate_str();
+    backfill_revision = 0; backfill_before = UINT16_MAX; backfill_period = 0;
+    indexed_invalidation = __atomic_add_fetch(&invalidation_generation, 1, __ATOMIC_RELEASE);
+    job.data_revision = __atomic_add_fetch(&data_revision, 1, __ATOMIC_RELEASE);
+    published_index_data = 0;
+    portENTER_CRITICAL(&status_mux);
+    status.data_revision = job.data_revision;
+    ++status.artifact_revision;
+    ++status.revision;
+    portEXIT_CRITICAL(&status_mux);
+    job.body.print("{\"source\":\"edf\",\"rebuilding\":true,\"data_revision\":%lu}",
+        static_cast<unsigned long>(job.data_revision));
+    Log::logf(CAT_REPORT, LOG_INFO, "Report rebuild queued generation=%lu; previous publications preserved\n",
+        static_cast<unsigned long>(rebuild_generation));
+    return job.body.good();
 }
 
 void defer_job(Job *job) {
@@ -2779,14 +2258,14 @@ bool work_once() {
         error_body(*job, 409, "stale_revision");
     else {
         if (recovered_index) success = true;
+        else if (job->request.action == Action::Reindex) success = reindex(session, *job);
         else if (job->request.action == Action::History) {
             start_json(job->body, revision() + 1, job->data_revision);
             job->body.print("\"day\":%u", last_day(job->request));
             success = history_json(session, *job, true);
             job->body.print("}");
         } else if (job->request.action == Action::Prepare) success = prepare_json(session, *job);
-        else success = job->request.action == Action::Days ? days_json(session, *job) :
-            job->request.action == Action::Summary ? summary_json(session, *job) : series_json(session, *job, timing);
+        else success = job->request.action == Action::Days ? days_json(session, *job) : summary_json(session, *job);
         if (success) job->code = 200;
     }
     const bool interrupted = !AirSenseState::local_background_allowed() || !session.valid();

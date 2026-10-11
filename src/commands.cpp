@@ -21,6 +21,7 @@
 #include "board.h"
 #include "storage_browser.h"
 #include "sd_storage.h"
+#include "edf_report.h"
 #include "memory_manager.h"
 #include "crash_diagnostics.h"
 
@@ -162,6 +163,16 @@ void dispatch_command(const char *line, String &response) {
             return;
         }
 #if AB_STORAGE_HAS_SDCARD
+        if (action == "REINDEX") {
+            if (!path.isEmpty()) { response = "ERR: usage: $STORAGE REINDEX\n"; return; }
+            EdfReport::Request rebuild;
+            rebuild.action = EdfReport::Action::Reindex;
+            uint32_t id = 0; const char *error = nullptr;
+            response = EdfReport::submit(rebuild, id, &error)
+                ? "OK: report rebuild queued for catalogued sessions; source files preserved\n"
+                : "ERR: " + String(error ? error : "report_unavailable") + "\n";
+            return;
+        }
         const String name = parse_quoted_token(cmd, &position);
         const String extra = parse_quoted_token(cmd, &position);
         StorageBrowser::Request request = {};
@@ -741,6 +752,7 @@ void dispatch_command(const char *line, String &response) {
 #endif
                    "  STORAGE STATUS      SD state, space and last file operation\n"
                    "  STORAGE FORMAT CONFIRM Erase all SD data, preserve config, restart\n"
+                   "  STORAGE REINDEX Rebuild reports after editing catalogued EDF files\n"
                    "  STORAGE USB ON|OFF  Share SD over USB / return after disconnect\n"
                    "  FLASH [block] [BLX] [FORCE]  Flash uploaded firmware\n"
                    "  FLASH STATUS|CANCEL Monitor/cancel flash\n"
