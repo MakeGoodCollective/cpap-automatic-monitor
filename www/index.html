@@ -2757,7 +2757,7 @@ function prepareReportCanvas(canvas) {
   return {ctx,W,H};
 }
 
-function drawArtifactSegment(ctx, segment, x, y) {
+function drawArtifactSegment(ctx, segment, x, y, flowMidline = false) {
   const points = segment.points;
   if (segment.raw) {
     let group = [], pixel = null, connected = false, runCount = 0, lastPoint = null;
@@ -2790,27 +2790,41 @@ function drawArtifactSegment(ctx, segment, x, y) {
   const complete = i => reportBucket(points[i]) && points[i][2] === points[i][3];
   const xx = i => x((segment.from_ms+i*segment.step_ms
     + Math.min(segment.from_ms+(i+1)*segment.step_ms,segment.end_ms ?? Infinity))/2);
-  for (let first = 0; first < points.length;) {
-    if (!reportBucket(points[first])) { first++; continue; }
-    let last = first;
-    if (complete(first)) while (last+1 < points.length && complete(last+1)) last++;
+  const bar = (at, low, high) => {
+    ctx.moveTo(at-(low === high ? 0.5 : 0),y(low));
+    ctx.lineTo(at+(low === high ? 0.5 : 0),y(high));
+  };
+  let pixel = null, low = 0, high = 0;
+  const flush = () => {
+    if (pixel !== null) bar(pixel+0.5,low,high);
+    pixel = null;
+  };
+  ctx.globalAlpha = 0.55; ctx.beginPath();
+  for (let i = 0; i < points.length; i++) {
+    if (!complete(i)) { flush(); continue; }
+    const at = Math.floor(xx(i));
+    if (at !== pixel) { flush(); pixel = at; low = points[i][0]; high = points[i][1]; }
+    else { low = Math.min(low,points[i][0]); high = Math.max(high,points[i][1]); }
+  }
+  flush(); ctx.stroke();
+
+  // Partial cells say how much is present, not where: never connect them.
+  ctx.globalAlpha = 0.35; ctx.beginPath();
+  for (let i = 0; i < points.length; i++) {
+    if (reportBucket(points[i]) && !complete(i)) bar(xx(i),points[i][0],points[i][1]);
+  }
+  ctx.stroke(); ctx.globalAlpha = 1;
+  if (flowMidline) {
+    let connected = false;
     ctx.beginPath();
-    if (last > first) {
-      ctx.globalAlpha = 0.18; ctx.moveTo(xx(first),y(points[first][0]));
-      for (let i = first+1; i <= last; i++) ctx.lineTo(xx(i),y(points[i][0]));
-      for (let i = last; i >= first; i--) ctx.lineTo(xx(i),y(points[i][1]));
-      ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1; ctx.beginPath();
-      for (const edge of [0,1]) {
-        ctx.moveTo(xx(first),y(points[first][edge]));
-        for (let i = first+1; i <= last; i++) ctx.lineTo(xx(i),y(points[i][edge]));
-      }
-    } else {
-      ctx.globalAlpha = complete(first) ? 1 : 0.45;
-      const low = y(points[first][0]), high = y(points[first][1]);
-      ctx.moveTo(xx(first)-(low === high ? 0.5 : 0),low);
-      ctx.lineTo(xx(first)+(low === high ? 0.5 : 0),high);
+    for (let i = 0; i < points.length; i++) {
+      if (!complete(i)) { connected = false; continue; }
+      // This is the envelope midpoint, not a sample or a statistical mean.
+      const mid = y((points[i][0]+points[i][1])/2), at = xx(i);
+      if (connected) ctx.lineTo(at,mid); else ctx.moveTo(at,mid);
+      connected = true;
     }
-    ctx.stroke(); ctx.globalAlpha = 1; first = last+1;
+    ctx.stroke();
   }
 }
 
@@ -2847,7 +2861,7 @@ function drawEdfChart(canvas, channel, data, color, cursor = reportPlot.cursor) 
   for (const member of members) if (data) {
     const memberColor = members.length > 1 ? reportChannelColor(member.id) : color;
     ctx.strokeStyle = memberColor; ctx.fillStyle = memberColor; ctx.lineWidth = 1.2;
-    for (const segment of member.segments || []) drawArtifactSegment(ctx,segment,x,y);
+    for (const segment of member.segments || []) drawArtifactSegment(ctx,segment,x,y,member.id === 'Flow');
   }
   drawReportEventMarkers(ctx,data?.events,view,x,pad,gh,members.length > 0);
   const selection = reportPlot.gesture?.selection;
