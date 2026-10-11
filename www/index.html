@@ -2351,35 +2351,44 @@ function drawEdfChart(canvas, channel, data, color, cursor = reportPlot.cursor) 
   for (const member of members) if (data) {
     const memberColor = members.length > 1 ? reportChannelColor(member.id) : color;
     ctx.strokeStyle = memberColor; ctx.fillStyle = memberColor; ctx.lineWidth = 1.2;
-    if (String(member.id).toLowerCase() === 'flow') {
-      let previous = null;
-      (member.buckets || []).forEach((bucket,i) => {
-        const expected = Math.min(data.bucket_ms,data.to_ms-data.from_ms-i*data.bucket_ms);
-        if (!reportBucket(bucket) || !Number.isFinite(bucket[2]) || bucket[2] < expected || expected <= 0) { previous = null; return; }
-        const xx = x(data.from_ms+(i+0.5)*data.bucket_ms);
-        if (previous) {
-          // Join only envelope edges, never a fabricated midpoint waveform.
-          ctx.globalAlpha = 0.18;
-          ctx.beginPath(); ctx.moveTo(previous.x,y(previous.bucket[0])); ctx.lineTo(xx,y(bucket[0]));
-          ctx.lineTo(xx,y(bucket[1])); ctx.lineTo(previous.x,y(previous.bucket[1])); ctx.closePath(); ctx.fill();
-          ctx.globalAlpha = 0.65;
-          ctx.beginPath(); ctx.moveTo(previous.x,y(previous.bucket[0])); ctx.lineTo(xx,y(bucket[0]));
-          ctx.moveTo(previous.x,y(previous.bucket[1])); ctx.lineTo(xx,y(bucket[1])); ctx.stroke();
+    const buckets = member.buckets || [];
+    const xx = i => x(data.from_ms+(i+0.5)*data.bucket_ms);
+    const complete = i => {
+      const expected = Math.min(data.bucket_ms,data.to_ms-data.from_ms-i*data.bucket_ms);
+      return reportBucket(buckets[i]) && Number.isFinite(buckets[i][2])
+        && buckets[i][2] >= expected && expected > 0;
+    };
+    for (let first = 0; first < buckets.length;) {
+      const bucket = buckets[first];
+      if (!reportBucket(bucket) || !Number.isFinite(bucket[2]) || bucket[2] <= 0) { first++; continue; }
+      let last = first;
+      const full = complete(first);
+      if (full) while (last+1 < buckets.length && complete(last+1)) last++;
+      if (last > first) {
+        // One path per covered run avoids pixel stippling. Only min/max edges,
+        // never an averaged waveform or a bridge through partial coverage.
+        ctx.globalAlpha = 0.18; ctx.beginPath();
+        ctx.moveTo(xx(first),y(bucket[0]));
+        for (let i = first+1; i <= last; i++) ctx.lineTo(xx(i),y(buckets[i][0]));
+        for (let i = last; i >= first; i--) ctx.lineTo(xx(i),y(buckets[i][1]));
+        ctx.closePath(); ctx.fill();
+        ctx.globalAlpha = 1; ctx.beginPath();
+        for (const edge of [0,1]) {
+          ctx.moveTo(xx(first),y(bucket[edge]));
+          for (let i = first+1; i <= last; i++) ctx.lineTo(xx(i),y(buckets[i][edge]));
         }
-        previous = {x:xx,bucket};
-      });
-    }
-    for (const partial of [false,true]) {
-      ctx.globalAlpha = partial ? 0.45 : 1; ctx.beginPath();
-      (member.buckets || []).forEach((bucket,i) => {
-        if (!reportBucket(bucket)) return;
-        const expected = Math.min(data.bucket_ms,data.to_ms-data.from_ms-i*data.bucket_ms);
-        if ((!Number.isFinite(bucket[2]) || bucket[2] < expected) !== partial) return;
-        const xx = x(data.from_ms+(i+0.5)*data.bucket_ms);
-        ctx.moveTo(xx,y(bucket[0])); ctx.lineTo(xx,y(bucket[1]));
-        if (bucket[0] === bucket[1]) ctx.fillRect(xx-0.5,y(bucket[0])-0.5,1,1);
-      });
-      ctx.stroke();
+        ctx.stroke();
+      } else {
+        ctx.globalAlpha = full ? 1 : 0.45; ctx.beginPath();
+        const at = xx(first);
+        if (bucket[0] === bucket[1]) {
+          ctx.moveTo(at-0.5,y(bucket[0])); ctx.lineTo(at+0.5,y(bucket[0]));
+        } else {
+          ctx.moveTo(at,y(bucket[0])); ctx.lineTo(at,y(bucket[1]));
+        }
+        ctx.stroke();
+      }
+      first = last+1;
     }
     ctx.globalAlpha = 1;
   }
