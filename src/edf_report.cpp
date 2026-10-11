@@ -673,7 +673,7 @@ size_t total_bins(const CacheHeader &header) {
     for (const auto &channel : header.channels) count += channel.bins;
     return count;
 }
-bool allocate_data(SessionData &out) {
+bool allocate_data(SessionData &out, bool events = true) {
     const size_t count = total_bins(out.header);
     if (count > MAX_BINS || out.header.events > MAX_DISK_EVENTS) return false;
     if (count) {
@@ -682,7 +682,7 @@ bool allocate_data(SessionData &out) {
         if (!out.bins) return false;
         memset(out.bins, 0, bytes);
     }
-    if (out.header.events) {
+    if (events && out.header.events) {
         const size_t bytes = std::min<size_t>(out.header.events, MAX_EVENTS) * sizeof(Event);
         out.events = static_cast<Event *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
         if (!out.events) return false;
@@ -721,16 +721,12 @@ bool load_cache(const SdStorage::Session &session, const IndexedSession &entry,
     SdStorage::Reader reader;
     if (!reader.open(session, path) || reader.read(reinterpret_cast<uint8_t *>(&out.header),
         sizeof(out.header)) != sizeof(out.header) || !sane_header(out.header, entry, reader.size()) ||
-        !allocate_data(out)) return false;
+        !allocate_data(out, false)) return false;
     const size_t bin_bytes = total_bins(out.header) * sizeof(uint64_t);
-    const size_t event_bytes = std::min<size_t>(out.header.events, MAX_EVENTS) * sizeof(Event);
-    for (auto range : {std::make_pair(reinterpret_cast<uint8_t *>(out.bins), bin_bytes),
-                       std::make_pair(reinterpret_cast<uint8_t *>(out.events), event_bytes)}) {
-        for (size_t offset = 0; offset < range.second;) {
-            const size_t take = std::min(range.second - offset, SdStorage::READ_CHUNK_BYTES);
-            if (reader.read(range.first + offset, take) != take) return false;
-            offset += take;
-        }
+    for (size_t offset = 0; offset < bin_bytes;) {
+        const size_t take = std::min(bin_bytes - offset, SdStorage::READ_CHUNK_BYTES);
+        if (reader.read(reinterpret_cast<uint8_t *>(out.bins) + offset, take) != take) return false;
+        offset += take;
     }
     return true;
 }
@@ -1191,9 +1187,8 @@ bool history_json(const SdStorage::Session &session, Job &job, bool build);
 bool summary_json(const SdStorage::Session &session, Job &job) {
     Aggregate aggregate;
     if (!aggregate.channels) return note_issue(job, "aggregate_alloc");
-    Payload events;
     const uint16_t last = last_day(job.request), first = first_day(job.request, last);
-    bool partial = false, event_comma = false, session_comma = false, events_truncated = false;
+    bool partial = false, session_comma = false;
     bool usage_known = true, events_known = true, csr_known = true;
     uint32_t sessions = 0;
     uint64_t counts[5] = {};
@@ -1229,7 +1224,6 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
         entry.end_ms = data.header.chart_end_ms;
         entry.event_from_ms = data.header.event_from_ms;
         entry.event_to_ms = data.header.event_to_ms;
-        events_truncated |= data.header.events_truncated;
         if (!aggregate.merge(data, partial)) return false;
         if (data.header.recorded) {
             seconds += data.header.used_seconds;
@@ -1244,12 +1238,6 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
         else job.body.print("null,\"end_ms\":null}");
         session_comma = true;
         ++sessions;
-        for (uint32_t e = 0; e < std::min<size_t>(data.header.events, MAX_EVENTS); ++e) {
-            // Keep the response bounded even for year periods, without losing
-            // event counts used by the independently accumulated AHI.
-            if (events.length() > MAX_BODY / 2 - 256) { events_truncated = true; break; }
-            append_event(events, data.events[e], event_comma);
-        }
     }
     HistoricalStr str(session, job);
     bool str_expected = false;
@@ -1284,9 +1272,7 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
                    static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]),
                    static_cast<unsigned long long>(counts[4]));
     else job.body.print("\"counts\":{\"oa\":null,\"ca\":null,\"ua\":null,\"h\":null,\"rera\":null},");
-    job.body.print("\"events_truncated\":%s,\"events\":[", events_truncated ? "true" : "false");
-    if (events.length()) job.body.append(events.c_str(), events.length());
-    job.body.print("],\"channels\":[");
+    job.body.print("\"channels\":[");
     for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
         ReportEdf::Statistics stats;
         const bool present = !aggregate.incompatible[c] && aggregate.channels[c].bins &&
@@ -1311,7 +1297,7 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
     if (job.request.view == View::Day) str.settings_json(job.body, last);
     if (job.request.view == View::Day && !history_json(session, job, false)) return false;
     job.body.print("}");
-    return job.body.good() && events.good();
+    return job.body.good();
 }
 
 struct Cell {
