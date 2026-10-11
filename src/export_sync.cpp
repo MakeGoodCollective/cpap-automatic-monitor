@@ -1,4 +1,5 @@
 #include "export_sync.h"
+#include "edf_report.h"
 
 #include "board.h"
 
@@ -1099,9 +1100,14 @@ static void export_task(void *) {
         }
         if (generation_aborted(request.generation)) continue;
 
+        const uint32_t preparation = request.kind == RequestKind::PostTherapy
+            ? EdfReport::prepare_before_export(request.entry.therapy_day) : 0;
+        const uint32_t preparation_started = millis();
         bool admitted = false;
         while (!generation_aborted(request.generation)) {
-            if (AirSenseState::device_standby() && storage.begin()) {
+            const bool preparing = EdfReport::preparation_pending(preparation) &&
+                uint32_t(millis() - preparation_started) < 60000;
+            if (!preparing && AirSenseState::device_standby() && storage.begin()) {
                 admitted = true;
                 break;
             }

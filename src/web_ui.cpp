@@ -422,6 +422,7 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
         jsonAddString(json, "report_source", SleepReport::source_name(status.report_source));
         jsonAddUInt32(json, "report_revision", status.report_revision);
         jsonAddUInt32(json, "report_data_revision", status.report_data_revision);
+        jsonAddUInt32(json, "report_artifact_revision", status.report_artifact_revision);
         jsonAddString(json, "report_state", EdfReport::state_name(status.report_state));
         jsonAddString(json, "report_error", status.report_error);
         jsonAddBool(json, "report_available", status.report_available);
@@ -2516,6 +2517,7 @@ static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
         fields |= STATUS_OXI;
     if (a.report_source != b.report_source || a.report_revision != b.report_revision ||
         a.report_data_revision != b.report_data_revision ||
+        a.report_artifact_revision != b.report_artifact_revision ||
         a.report_state != b.report_state || strcmp(a.report_error, b.report_error) ||
         a.report_available != b.report_available)
         fields |= STATUS_REPORT;

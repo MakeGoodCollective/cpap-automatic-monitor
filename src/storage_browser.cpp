@@ -481,7 +481,14 @@ void produce(void *context) {
     delete static_cast<std::shared_ptr<Job> *>(context);
     bool success = false;
     job->report(LOG_DEBUG, "started");
-    const bool admitted = job->session.begin();
+    bool admitted = job->session.begin();
+    // A foreground artifact read has asked background preparation to yield.
+    // Wait only in this producer, never AsyncTCP or the SD executor.
+    while (!admitted && job->request.kind == Kind::Immutable && !job->cancelled.load() &&
+           SdStorage::local_access_allowed() && uint32_t(millis() - job->started_ms) < 2000) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        admitted = job->session.begin();
+    }
     if (mutating(job->request.kind)) {
         uint32_t changed = 0;
         const char *error = admitted ? mutate(*job, changed) : "storage_busy";

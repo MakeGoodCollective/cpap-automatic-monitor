@@ -34,7 +34,7 @@ struct Request {
 struct Status {
     bool supported = false, mounted = false, available = false;
     State state = State::Blocked;
-    uint32_t revision = 0, data_revision = 0;
+    uint32_t revision = 0, data_revision = 0, artifact_revision = 0;
     uint32_t catalog_generation = 0, files_revision = 0;
     uint32_t sessions = 0;
     char error[48] = {};
@@ -57,6 +57,8 @@ StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
 // and polling do no SD work. Completion changes status.revision only; source
 // invalidation also changes status.data_revision. JSON carries both revisions.
 bool submit(const Request &request, uint32_t &id, const char **error = nullptr);
+uint32_t prepare_before_export(const char *therapy_day);
+bool preparation_pending(uint32_t id);
 void cancel(uint32_t id);
 // Cancellation is best-effort for sole requests; coalesced jobs are not cancelled
 // by one consumer. Pinned results remain valid until their last lease releases.

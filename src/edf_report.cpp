@@ -63,6 +63,7 @@ Result::Result(Result &&other) noexcept
 #include "air10_str_timeline.h"
 #include "airsense_state.h"
 #include "edf_catalog.h"
+#include "export_sync.h"
 #include "debug_log.h"
 #include "memory_manager.h"
 #include "large_text_buffer.h"
@@ -279,6 +280,8 @@ struct Job {
     uint16_t readers = 0;
     uint16_t consumers = 1, deliveries = 0;
     bool delivered = false, cancelled = false, shared = false;
+    bool background = false;
+    uint32_t foreground_epoch = 0;
     int code = 0;
     const char *error = nullptr;
     mutable const char *issue = nullptr;
@@ -346,6 +349,11 @@ TaskHandle_t worker_task = nullptr;
 portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
 Status status;
 uint32_t next_id = 1, data_revision = 1;
+uint32_t foreground_epoch = 0;
+uint32_t backfill_revision = 0;
+uint16_t backfill_before = UINT16_MAX;
+uint32_t background_retry = 0;
+bool backfill_enabled = true;
 IndexedSession *index = nullptr;
 size_t index_count = 0;
 uint32_t catalog_generation = 0, file_revision = 0;
@@ -421,6 +429,7 @@ bool reclaim_result() {
 }
 bool aborted(const Job *job, const SdStorage::Session &session) {
     return (job && __atomic_load_n(&job->cancelled, __ATOMIC_ACQUIRE)) ||
+        (job && job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE)) ||
         !AirSenseState::local_background_allowed() || !session.valid();
 }
 
@@ -495,7 +504,7 @@ bool refresh_index(const SdStorage::Session &session) {
         return true;
     const bool full = !index_ready || invalidated || !incremental || files != file_revision ||
         changes.catalog.entries < index_count;
-    if (full) { invalidate_day(); invalidate_str(); }
+    if (full) { invalidate_day(); invalidate_str(); dataset_id[0] = 0; }
     const size_t old_count = index_count;
     index_error = "session_limit";
     if (changes.catalog.entries > MAX_SESSION_COUNT) return false;
@@ -548,6 +557,7 @@ bool refresh_index(const SdStorage::Session &session) {
             }
             index_error = "cache_retire";
             if (index[i].entry.file_prefix[0] && index[i].key.present && (changed || key_changed) &&
+                (next.key.present & index[i].key.present) == index[i].key.present &&
                 !retire_cache(session, index[i])) { index_ready = false; return false; }
             detail_changed |= changed || key_changed;
             if (!changed && !key_changed) {
@@ -1340,7 +1350,7 @@ bool session_data(const SdStorage::Session &session, const Job &job,
     if (out.header.partial) note_issue(job, "partial_source", entry.entry.file_prefix);
     // The cache is derived and replaceable; failed persistence does not discard
     // useful parsed data or modify any source EDF/sidecar.
-    if (!store_cache(session, job, entry, out) && !aborted(&job, session))
+    if (!out.header.partial && !store_cache(session, job, entry, out) && !aborted(&job, session))
         note_issue(job, "cache_write", entry.entry.file_prefix);
     return !aborted(&job, session);
 }
@@ -1415,6 +1425,21 @@ bool publication_key(const Request &request, uint8_t (&key)[32]) {
         reinterpret_cast<const uint8_t *>(identity.c_str()), identity.length(), key);
 }
 
+bool artifact_headroom(const SdStorage::Session &session, uint16_t day) {
+    SdStorage::Status storage;
+    if (!session.run([](fs::FS &) { SdStorage::refresh_usage(); return true; })) return false;
+    SdStorage::get_status(storage);
+    uint64_t needed = 128 * 1024;
+    for (size_t i = 0; i < index_count; ++i) if (selected(index[i], day, day))
+        for (size_t kind = 0; kind < 3; ++kind) needed += index[i].key.sizes[kind] * 3;
+    // Preserve room for another complete 24h numeric recording in the largest
+    // supported schema, plus STR. Artifacts are optional, source EDF is not.
+    const uint64_t reserve = 1440ull * (Air10Edf::record_size(Air10Edf::brp_schema(true)) +
+        Air10Edf::record_size(Air10Edf::pld_schema()) + Air10Edf::record_size(Air10Edf::sad_schema())) +
+        366ull * Air10Edf::record_size(Air10Edf::str_schema()) + 65536;
+    return storage.total_bytes > storage.used_bytes && storage.total_bytes - storage.used_bytes >= needed + reserve;
+}
+
 bool prepare_json(const SdStorage::Session &session, Job &job) {
     const uint16_t day = last_day(job.request);
     if (!dataset(session)) return note_issue(job, "dataset_identity");
@@ -1443,6 +1468,7 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
     }
     if (known == ReportArtifact::Lookup::Failed || known == ReportArtifact::Lookup::Invalid)
         return note_issue(job, "publication_read", manifest);
+    if (!artifact_headroom(session, day)) return note_issue(job, "recording_headroom");
     job.body.clear();
     aircannect::hex_encode(manifest_key, 32, identity, sizeof(identity), aircannect::HexCase::Lower);
     start_json(job.body, revision() + 1, job.data_revision);
@@ -1523,9 +1549,15 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
     EdfCatalog::Status current;
     EdfCatalog::get_status(current);
     if (current.generation != catalog_generation || SdStorage::files_revision() != file_revision) return false;
-    return ReportArtifact::document_publish(session, manifest, manifest_key,
-        reinterpret_cast<const uint8_t *>(job.body.c_str()), job.body.length(), saved) ||
-        note_issue(job, "publication_write", manifest);
+    if (!ReportArtifact::document_publish(session, manifest, manifest_key,
+        reinterpret_cast<const uint8_t *>(job.body.c_str()), job.body.length(), saved))
+        return note_issue(job, "publication_write", manifest);
+    __atomic_add_fetch(&cache_generation, 1, __ATOMIC_RELEASE);
+    portENTER_CRITICAL(&status_mux);
+    ++status.artifact_revision;
+    ++status.revision;
+    portEXIT_CRITICAL(&status_mux);
+    return true;
 }
 void append_event(Payload &body, const Event &event, bool &comma, const char *type = nullptr) {
     body.print("%s{\"time_ms\":%lld,\"duration_ms\":%lld,\"type\":\"%s\"}",
@@ -1534,7 +1566,8 @@ void append_event(Payload &body, const Event &event, bool &comma, const char *ty
     comma = true;
 }
 
-bool days_json(Job &job) {
+bool days_json(const SdStorage::Session &session, Job &job) {
+    if (!dataset(session)) return note_issue(job, "dataset_identity");
     const size_t bytes = index_count * sizeof(uint16_t);
     auto *days = bytes ? static_cast<uint16_t *>(aircannect::Memory::alloc_large(bytes,
                                                        bytes <= INTERNAL_WORK)) : nullptr;
@@ -1548,13 +1581,25 @@ bool days_json(Job &job) {
     }
     if (count) std::sort(days, days + count, std::greater<uint16_t>());
     start_json(job.body, revision() + 1, job.data_revision);
-    job.body.print("\"partial\":%s,\"days\":[", partial ? "true" : "false");
+    job.body.print("\"dataset\":\"%s\",\"partial\":%s,\"days\":[", dataset_id, partial ? "true" : "false");
     for (size_t n = 0; n < count;) {
         const uint16_t day = days[n];
         size_t end = n + 1;
         while (end < count && days[end] == day) ++end;
-        job.body.print("%s{\"day\":%u,\"session_count\":%u}", n ? "," : "", day,
+        job.body.print("%s{\"day\":%u,\"session_count\":%u", n ? "," : "", day,
                        static_cast<unsigned>(end - n));
+        char prefix[96]; uint8_t key[32];
+        publication_prefix(day, prefix);
+        Request request; request.day = day;
+        ReportArtifact::Document document;
+        if (publication_key(request, key) &&
+            ReportArtifact::document_lookup(session, prefix, nullptr, document) == ReportArtifact::Lookup::Ready) {
+            char digest[65];
+            aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+            job.body.print(",\"publication\":{\"day\":\"index\",\"digest\":\"%s\",\"bytes\":%u},\"stale\":%s",
+                digest, document.bytes, memcmp(key, document.key, 32) ? "true" : "false");
+        }
+        job.body.print("}");
         n = end;
     }
     job.body.print("]}");
@@ -2528,14 +2573,52 @@ void defer_job(Job *job) {
     xSemaphoreGive(mutex);
 }
 
+bool enqueue_backfill(const SdStorage::Session &session) {
+    if (!backfill_enabled || ExportSync::busy()) return false;
+    if (background_retry && int32_t(millis() - background_retry) < 0) return false;
+    if (background_retry) { background_retry = 0; backfill_before = UINT16_MAX; }
+    const uint32_t current = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
+    if (backfill_revision != current) { backfill_revision = current; backfill_before = UINT16_MAX; }
+    uint16_t day = 0;
+    for (size_t i = 0; i < index_count; ++i)
+        if (selected(index[i], 1, backfill_before - (backfill_before != 0))) day = std::max(day, index[i].day);
+    if (!day || !backfill_before) return false;
+    if (!dataset(session)) return false;
+    Request request; request.action = Action::Prepare; request.day = day;
+    char prefix[96]; uint8_t key[32];
+    publication_prefix(day, prefix);
+    if (!publication_key(request, key)) return false;
+    ReportArtifact::Document document;
+    const bool ready = ReportArtifact::document_lookup(session, prefix, key, document) == ReportArtifact::Lookup::Ready;
+    strcat(prefix, ".refused");
+    const bool refused = ReportArtifact::document_lookup(session, prefix, key, document) == ReportArtifact::Lookup::Ready;
+    if (ready || refused) { backfill_before = day; return true; }
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    Job *slot = nullptr;
+    for (auto &candidate : jobs) if (reusable(candidate) || evictable(candidate)) { slot = &candidate; break; }
+    if (slot) {
+        reset_job(*slot);
+        slot->request = request;
+        slot->id = next_id++;
+        if (!next_id) next_id = 1;
+        slot->state = JobState::Queued;
+        slot->background = true;
+        slot->foreground_epoch = __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
+        slot->consumers = 0;
+    }
+    xSemaphoreGive(mutex);
+    return slot != nullptr;
+}
+
 bool work_once() {
     static const char *reported_index_error = nullptr;
     Job *job = nullptr;
     xSemaphoreTake(mutex, portMAX_DELAY);
     for (auto &candidate : jobs) {
         if (candidate.state != JobState::Free && reusable(candidate)) reset_job(candidate);
-        if (candidate.state == JobState::Queued &&
-            (!job || int32_t(candidate.id - job->id) < 0)) job = &candidate;
+        if (candidate.state == JobState::Queued && (!job ||
+            (job->background && !candidate.background) || (job->background == candidate.background &&
+            int32_t(candidate.id - job->id) < 0))) job = &candidate;
     }
     if (job) job->state = JobState::Running;
     xSemaphoreGive(mutex);
@@ -2544,7 +2627,11 @@ bool work_once() {
     }
     if (!SdStorage::local_access_allowed()) { defer_job(job); publish(State::Blocked, "usb_storage"); return false; }
     if (!SdStorage::mounted()) { defer_job(job); publish(State::Blocked, "no_sd"); return false; }
-    if (!job && !dirty()) { publish(State::Ready); return false; }
+    if (job && job->background && ExportSync::busy()) {
+        defer_job(job); publish(State::WaitingStorage, "export_pending"); return false;
+    }
+    if (!job && !dirty() && (!backfill_enabled || !backfill_before || ExportSync::busy() ||
+        (background_retry && int32_t(millis() - background_retry) < 0))) { publish(State::Ready); return false; }
     SdStorage::Session session;
     if (!session.begin()) { defer_job(job); publish(State::WaitingStorage, "storage_busy"); return false; }
     JobTiming timing(job);
@@ -2588,9 +2675,10 @@ bool work_once() {
         reported_index_error = nullptr;
     }
     if (!job) {
+        const bool more = enqueue_backfill(session);
         session.end();
         publish(State::Ready);
-        return false;
+        return more;
     }
     xSemaphoreTake(mutex, portMAX_DELAY);
     job->state = JobState::Running;
@@ -2598,6 +2686,7 @@ bool work_once() {
     job->code = 0;
     job->error = job->issue = nullptr;
     job->issue_path[0] = 0;
+    job->foreground_epoch = __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
     xSemaphoreGive(mutex);
     bool success = false;
     if (__atomic_load_n(&job->cancelled, __ATOMIC_ACQUIRE)) error_body(*job, 410, "cancelled");
@@ -2610,7 +2699,7 @@ bool work_once() {
             success = history_json(session, *job, true);
             job->body.print("}");
         } else if (job->request.action == Action::Prepare) success = prepare_json(session, *job);
-        else success = job->request.action == Action::Days ? days_json(*job) :
+        else success = job->request.action == Action::Days ? days_json(session, *job) :
             job->request.action == Action::Summary ? summary_json(session, *job) : series_json(session, *job, timing);
         if (success) job->code = 200;
     }
@@ -2619,17 +2708,28 @@ bool work_once() {
     EdfCatalog::get_status(catalog);
     const bool changed = catalog.generation != catalog_generation || SdStorage::files_revision() != file_revision ||
         job->data_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
+    const bool yielded = job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
+    if (job->background && !interrupted && !changed && !yielded) {
+        backfill_before = job->request.day;
+        if (!success && job->issue && (!strcmp(job->issue, "partial_source") ||
+            !strcmp(job->issue, "source_header") || !strcmp(job->issue, "artifact_lookup"))) {
+            char prefix[96]; uint8_t key[32]; ReportArtifact::Document refused;
+            publication_prefix(job->request.day, prefix); strcat(prefix, ".refused");
+            if (publication_key(job->request, key)) ReportArtifact::document_publish(session, prefix, key,
+                reinterpret_cast<const uint8_t *>(job->issue), strlen(job->issue), refused);
+        } else if (!success && (!job->issue || strcmp(job->issue, "recording_headroom"))) background_retry = millis() + 30000;
+    }
     session.end();
     xSemaphoreTake(mutex, portMAX_DELAY);
     if (job->cancelled) error_body(*job, 410, "cancelled");
-    else if (interrupted || changed) {
+    else if (interrupted || changed || yielded) {
         job->body.~Payload();
         new (&job->body) Payload;
         job->state = JobState::Queued;
         job->code = 0;
         xSemaphoreGive(mutex);
         publish(interrupted ? State::Blocked : State::Building, interrupted ? "not_idle" : "");
-        return false;
+        return yielded;
     } else if (!success && !job->code) error_body(*job, 503, "report_build_failed");
     job->state = JobState::Complete;
     job->completed_ms = millis();
@@ -2651,7 +2751,7 @@ void worker(void *) {
         if (work_once()) continue;
         Status publication;
         get_status(publication);
-        xSemaphoreTake(wake, publication.state == State::WaitingStorage || publication.state == State::Blocked
+        xSemaphoreTake(wake, background_retry || publication.state == State::WaitingStorage || publication.state == State::Blocked
             ? pdMS_TO_TICKS(1000) : portMAX_DELAY);
     }
 }
@@ -2763,7 +2863,7 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     for (auto &job : jobs) {
         if (current_index && !job.cancelled && !job.issue && job.state == JobState::Complete && job.code == 200 &&
             job.data_revision == publication.data_revision && job.request == request &&
-            ((request.action != Action::Summary && request.action != Action::History) ||
+            ((request.action != Action::Summary && request.action != Action::History && request.action != Action::Days) ||
              job.cache_generation == __atomic_load_n(&cache_generation, __ATOMIC_ACQUIRE)) &&
             uint32_t(millis() - job.completed_ms) < RETAIN_MS) {
             if (job.consumers == UINT16_MAX) { xSemaphoreGive(mutex); return reject("busy"); }
@@ -2782,6 +2882,7 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
             if (job.consumers == UINT16_MAX) { xSemaphoreGive(mutex); return reject("busy"); }
             ++job.consumers;
             job.shared = true;
+            if (job.state == JobState::Queued) job.background = false;
             id = job.id;
             xSemaphoreGive(mutex);
             return true;
@@ -2802,6 +2903,7 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     slot->id = next_id++;
     if (!next_id) next_id = 1;
     slot->state = JobState::Queued;
+    __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
     id = slot->id;
     xSemaphoreGive(mutex);
     portENTER_CRITICAL(&status_mux);
@@ -2809,6 +2911,22 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     portEXIT_CRITICAL(&status_mux);
     xSemaphoreGive(wake);
     return true;
+}
+
+uint32_t prepare_before_export(const char *therapy_day) {
+    Request request; request.action = Action::Prepare;
+    if (!therapy_day || !catalog_day(therapy_day, request.day)) return 0;
+    uint32_t id = 0;
+    return submit(request, id) ? id : 0;
+}
+
+bool preparation_pending(uint32_t id) {
+    if (!id || !mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return false;
+    bool pending = false;
+    for (const auto &job : jobs) if (job.id == id)
+        pending = job.state == JobState::Queued || job.state == JobState::Running;
+    xSemaphoreGive(mutex);
+    return pending;
 }
 
 void cancel(uint32_t id) {
@@ -2833,6 +2951,7 @@ StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
     for (const char *p = digest; *p; ++p)
         if (!(*p >= '0' && *p <= '9') && !(*p >= 'a' && *p <= 'f')) return StorageBrowser::StartResult::BadRequest;
     if (root && !document) return StorageBrowser::StartResult::BadRequest;
+    __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
     operation.kind = StorageBrowser::Kind::Immutable;
     operation.selection[0] = 0;
     snprintf(operation.path, sizeof(operation.path), "%s/%s%s%s.%s", CACHE_DIR,
@@ -2898,6 +3017,8 @@ bool submit(const Request &, uint32_t &, const char **error) {
     return false;
 }
 void cancel(uint32_t) {}
+uint32_t prepare_before_export(const char *) { return 0; }
+bool preparation_pending(uint32_t) { return false; }
 StorageBrowser::StartResult open_artifact(const char *, const char *, bool, StorageBrowser::Request &,
     StorageBrowser::Ready, std::weak_ptr<StorageBrowser::Transfer> &) {
     return StorageBrowser::StartResult::Unavailable;
