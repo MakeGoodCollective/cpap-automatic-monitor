@@ -154,12 +154,12 @@ bool reserve_options_locked(uint16_t required) {
 query_result_t query_value(const char *command, char *response,
                            uint16_t response_size, const char *&value) {
     if (!command || !response || response_size < 2) return QUERY_TIMEOUT;
-    uint16_t timeout = ClinicalJobs::timeout_ms();
-    if (!timeout || loaded_generation != generation()) return QUERY_TIMEOUT;
+    uint16_t remaining = ClinicalJobs::remaining_ms();
+    if (!remaining || loaded_generation != generation()) return QUERY_TIMEOUT;
     response[0] = '\0';
     uint16_t response_len = response_size;
     bool ok = Arbiter::send_cmd(command, CMD_SRC_TCP, CMD_PRIO_NORMAL,
-                                response, &response_len, timeout);
+                                response, &response_len, 0, remaining);
     value = qframe_response_value(response);
     if (ok && value) return QUERY_OK;
     if (command[0] == 'G')
@@ -173,10 +173,10 @@ bool error_is(const char *value, const char *code) {
 }
 
 bool read_raw_locked(const char *name, uint32_t &value) {
-    uint16_t timeout = ClinicalJobs::timeout_ms();
-    if (!timeout || loaded_generation != generation()) return false;
+    uint16_t remaining = ClinicalJobs::remaining_ms();
+    if (!remaining || loaded_generation != generation()) return false;
     return Arbiter::read_var_hex(name, CMD_SRC_TCP, CMD_PRIO_NORMAL, value,
-                                 timeout, nullptr, timeout) ==
+                                 0, nullptr, remaining) ==
            Arbiter::VarResult::Ok;
 }
 

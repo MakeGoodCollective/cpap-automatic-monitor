@@ -80,9 +80,6 @@ static uint32_t stat_error = 0;
 static uint32_t next_ticket_id = 1;
 
 static constexpr uint32_t SILENT_FRAME_GUARD_MS = 80;
-// Delayed G S replies after OXH need a response allowance separate from queue
-// wait. The caller's hard deadline still bounds both phases together.
-static constexpr uint16_t SCALAR_TIMEOUT_MIN_MS = 320;
 static std::atomic<uint32_t> acquisition_until{0};
 static std::atomic<uint32_t> acquisition_oxh_from{0};
 
@@ -144,6 +141,24 @@ typedef struct {
 
 static prio_queue_t pq;
 
+static uint32_t transaction_remaining_ms(const uart_transaction_t *t) {
+    const uint32_t elapsed = millis() - t->queued_ms;
+    // TX can start between these reads; a newer TX timestamp has zero age.
+    const uint32_t sent_after = __atomic_load_n(&t->sent_after_ms, __ATOMIC_ACQUIRE);
+    const bool sent = sent_after != UINT32_MAX;
+    const uint32_t phase_elapsed = sent
+        ? (elapsed > sent_after ? elapsed - sent_after : 0) : elapsed;
+    const uint32_t phase_limit = sent ? t->policy.response_timeout_ms
+                                    : t->policy.queue_timeout_ms;
+    uint32_t remaining = phase_elapsed < phase_limit ? phase_limit - phase_elapsed : 0;
+    if (t->policy.overall_timeout_ms) {
+        const uint32_t hard_left = elapsed < t->policy.overall_timeout_ms
+            ? t->policy.overall_timeout_ms - elapsed : 0;
+        remaining = min(remaining, hard_left);
+    }
+    return remaining;
+}
+
 static void release_ticket(uart_transaction_t *t) {
     if (__atomic_sub_fetch(&t->references, 1, __ATOMIC_ACQ_REL) == 0) {
         if (t->done) vSemaphoreDelete(t->done);
@@ -196,9 +211,11 @@ static uart_transaction_t* pq_pop(TickType_t wait) {
             int64_t delay_us = candidate->send_window.not_before_us - now_us;
             if (candidate->send_window.outside_acquisition)
                 delay_us = max(delay_us, int64_t(acquisition_remaining_ms()) * 1000);
+            const uint32_t queue_left = transaction_remaining_ms(candidate);
             if (delay_us > 0 && !__atomic_load_n(&candidate->cancelled, __ATOMIC_ACQUIRE) &&
-                uint32_t(millis() - candidate->queued_ms) < candidate->policy.overall_timeout_ms) {
+                queue_left) {
                 const int64_t tick_us = int64_t(portTICK_PERIOD_MS) * 1000;
+                delay_us = min(delay_us, int64_t(queue_left) * 1000);
                 remaining = min(remaining, TickType_t((delay_us + tick_us - 1) / tick_us));
                 continue;
             }
@@ -747,9 +764,7 @@ static uint32_t transaction_wait_ms(const uart_transaction_t *t,
                                     bool *idle_wait) {
     uint32_t now = millis();
     uint32_t elapsed = (uint32_t)(now - started_ms);
-    uint32_t total_elapsed = (uint32_t)(now - t->queued_ms);
-    uint32_t overall_left = total_elapsed < t->policy.overall_timeout_ms
-                          ? t->policy.overall_timeout_ms - total_elapsed : 0;
+    uint32_t overall_left = transaction_remaining_ms(t);
     *idle_wait = false;
     if (!overall_left) return 0;
 
@@ -791,7 +806,7 @@ static void arbiter_task(void *param) {
             t = nullptr;
             continue;
         }
-        if ((uint32_t)(millis() - t->queued_ms) >= t->policy.overall_timeout_ms) {
+        if (!transaction_remaining_ms(t)) {
             t->result.timed_out = true;
             stat_timeout++;
             finish_ticket(t);
@@ -853,7 +868,10 @@ static void arbiter_task(void *param) {
         }
         if (t->send_window.before_us)
             t->result.send_lateness_us = int32_t(sent_us - t->send_window.not_before_us);
-        __atomic_store_n(&t->sent_after_ms, millis() - t->queued_ms, __ATOMIC_RELEASE);
+        // LCD keeps one response budget across its three dependent commands.
+        const uint32_t started_ms = millis();
+        if (__atomic_load_n(&t->sent_after_ms, __ATOMIC_ACQUIRE) == UINT32_MAX)
+            __atomic_store_n(&t->sent_after_ms, started_ms - t->queued_ms, __ATOMIC_RELEASE);
         uart->write(t->frame, t->frame_len);
         uart->flush();
         stat_tx++;
@@ -874,7 +892,6 @@ static void arbiter_task(void *param) {
             vTaskDelay(pdMS_TO_TICKS(SILENT_FRAME_GUARD_MS) + 1);
             t->result.success = true;
         } else {
-            uint32_t started_ms = millis();
             bool accepted_any = false;
             bool saw_success = false;
             uint32_t last_accepted_ms = started_ms;
@@ -993,9 +1010,12 @@ void Arbiter::init(HardwareSerial &serial, int rx_pin, int tx_pin) {
 }
 
 static uart_response_policy_t normalize_policy(uart_response_policy_t policy) {
+    if (!policy.queue_timeout_ms)
+        policy.queue_timeout_ms = policy.first_timeout_ms ? policy.first_timeout_ms
+            : Config::get().uart_cmd_timeout_ms;
     if (!policy.accepted_types) {
-        if (!policy.overall_timeout_ms)
-            policy.overall_timeout_ms = Config::get().uart_cmd_timeout_ms;
+        if (!policy.response_timeout_ms)
+            policy.response_timeout_ms = SILENT_FRAME_GUARD_MS + portTICK_PERIOD_MS;
         return policy;
     }
 
@@ -1005,10 +1025,10 @@ static uart_response_policy_t normalize_policy(uart_response_policy_t policy) {
     if (policy.complete_on_idle && !policy.interframe_timeout_ms) {
         policy.interframe_timeout_ms = 350;
     }
-    if (!policy.overall_timeout_ms) {
-        policy.overall_timeout_ms = policy.first_timeout_ms;
+    if (!policy.response_timeout_ms) {
+        policy.response_timeout_ms = policy.first_timeout_ms;
         if (policy.complete_on_idle) {
-            policy.overall_timeout_ms += max((uint32_t)1000,
+            policy.response_timeout_ms += max((uint32_t)1000,
                                              (uint32_t)policy.interframe_timeout_ms * 4);
         }
     }
@@ -1136,18 +1156,22 @@ bool Arbiter::transaction_done(const uart_transaction_t *transaction) {
 }
 
 bool Arbiter::transaction_expired(const uart_transaction_t *transaction) {
-    return transaction && static_cast<uint32_t>(millis() - transaction->queued_ms) >=
-                          transaction->policy.overall_timeout_ms;
+    return transaction && !transaction_remaining_ms(transaction);
 }
 
 static bool await_transaction(uart_transaction_t *transaction, uint32_t wait_ms) {
     if (!transaction) return false;
 
-    if (!__atomic_load_n(&transaction->completed, __ATOMIC_ACQUIRE)) {
-        if (!wait_ms ||
-            xSemaphoreTake(transaction->done, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
-            return false;
-        }
+    const uint32_t started = millis();
+    while (!__atomic_load_n(&transaction->completed, __ATOMIC_ACQUIRE)) {
+        const uint32_t elapsed = millis() - started;
+        const uint32_t caller_left = elapsed < wait_ms ? wait_ms - elapsed : 0;
+        const uint32_t remaining = min(caller_left, transaction_remaining_ms(transaction));
+        if (!remaining) return false;
+        // A queue-phase wait may expire after TX began; recheck the new phase.
+        const TickType_t ticks = pdMS_TO_TICKS(remaining) +
+            (remaining % portTICK_PERIOD_MS != 0);
+        xSemaphoreTake(transaction->done, ticks);
     }
     return true;
 }
@@ -1184,10 +1208,7 @@ bool Arbiter::transact_cmd(const char *cmd,
                                                 sink, sink_context, context_size);
     if (!transaction) return false;
 
-    uint32_t elapsed = (uint32_t)(millis() - transaction->queued_ms);
-    uint32_t wait_ms = elapsed < normalized.overall_timeout_ms
-        ? normalized.overall_timeout_ms - elapsed : 0;
-    if (!finish_transaction(transaction, result, wait_ms, sink_context, context_size)) {
+    if (!finish_transaction(transaction, result, UINT32_MAX, sink_context, context_size)) {
         cancel_transaction(transaction);
         if (result) { *result = {}; result->timed_out = true; }
         return false;
@@ -1256,8 +1277,8 @@ static uart_transaction_t *begin_read_command(const char *cmd, cmd_source_t src,
     policy.terminal_types = QFRAME_MASK_R | QFRAME_MASK_E;
     policy.success_types = QFRAME_MASK_R;
     policy.first_timeout_ms = timeout_ms;
-    policy.overall_timeout_ms = overall_timeout_ms ? overall_timeout_ms
-        : timeout_ms + uint32_t((delay_us + 999) / 1000);
+    policy.queue_timeout_ms = timeout_ms + uint32_t((delay_us + 999) / 1000);
+    policy.overall_timeout_ms = overall_timeout_ms;
 
     bool bdd = cmd && strncmp(cmd, "P S #BDD ", 9) == 0;
     uint16_t capacity = bdd ? max(output_capacity, (uint16_t)32) : output_capacity;
@@ -1343,10 +1364,11 @@ bool Arbiter::finish_cmd(uart_transaction_t *t, char *resp_buf, uint16_t *resp_l
 
 uart_transaction_t *Arbiter::begin_cmd(const char *cmd, cmd_source_t src,
                                      cmd_priority_t prio, uint16_t capacity,
-                                     uint16_t timeout_ms, const uart_send_window_t &window) {
+                                     uint16_t timeout_ms, const uart_send_window_t &window,
+                                     uint32_t hard_timeout_ms) {
     return begin_read_command(cmd, src, prio,
         capacity ? min(uint16_t(capacity - 1), uint16_t(QFRAME_MAX_PAYLOAD)) : 0,
-        timeout_ms, capture_single_response, window);
+        timeout_ms, capture_single_response, window, hard_timeout_ms);
 }
 
 static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
@@ -1361,10 +1383,7 @@ static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
     auto *t = begin_read_command(cmd, src, prio, capacity, timeout_ms, sink,
                                  {}, overall_timeout_ms);
     if (!t) { if (resp_len) *resp_len = 0; return false; }
-    uint32_t elapsed = millis() - t->queued_ms;
-    uint32_t remaining = elapsed < t->policy.overall_timeout_ms
-        ? t->policy.overall_timeout_ms - elapsed : 0;
-    const bool completed = await_transaction(t, remaining);
+    const bool completed = await_transaction(t, UINT32_MAX);
     if (trace) read_trace(t, completed, *trace);
     if (!completed) {
         Arbiter::cancel_transaction(t);
@@ -1380,9 +1399,10 @@ static bool read_command(const char *cmd, cmd_source_t src, cmd_priority_t prio,
 }
 
 bool Arbiter::send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
-                       char *resp_buf, uint16_t *resp_len, uint16_t timeout_ms) {
+                       char *resp_buf, uint16_t *resp_len, uint16_t timeout_ms,
+                       uint32_t hard_timeout_ms) {
     return read_command(cmd, src, prio, resp_buf, resp_len, timeout_ms,
-                         capture_single_response);
+                         capture_single_response, nullptr, nullptr, hard_timeout_ms);
 }
 
 uart_transaction_t *Arbiter::begin_var(const char *name, cmd_source_t src,
@@ -1394,11 +1414,9 @@ uart_transaction_t *Arbiter::begin_var(const char *name, cmd_source_t src,
     snprintf(command, sizeof(command), "G S #%s", name);
     if (!timeout_ms) timeout_ms = Config::get().uart_cmd_timeout_ms;
     timeout_ms = max(timeout_ms, SCALAR_TIMEOUT_MIN_MS);
-    const uint32_t overall_timeout_ms = hard_timeout_ms ? hard_timeout_ms
-        : 2u * timeout_ms;
     return begin_read_command(command, src, prio,
         min(uint16_t(capacity - 1), uint16_t(QFRAME_MAX_PAYLOAD)), timeout_ms,
-        capture_variable, window, overall_timeout_ms);
+        capture_variable, window, hard_timeout_ms);
 }
 
 Arbiter::VarResult Arbiter::finish_var(uart_transaction_t *t, char *out,
@@ -1433,10 +1451,7 @@ Arbiter::VarResult Arbiter::read_var(const char *name, cmd_source_t src,
     if (trace) *trace = {};
     auto *t = begin_var(name, src, prio, capacity, timeout_ms, {}, hard_timeout_ms);
     if (!t) return VarResult::Failed;
-    const uint32_t elapsed = millis() - t->queued_ms;
-    const uint32_t remaining = elapsed < t->policy.overall_timeout_ms
-        ? t->policy.overall_timeout_ms - elapsed : 0;
-    if (!await_transaction(t, remaining)) {
+    if (!await_transaction(t, UINT32_MAX)) {
         if (trace) read_trace(t, false, *trace);
         cancel_transaction(t);
         return VarResult::Failed;
@@ -1718,7 +1733,8 @@ static bool queue_lcd(const lcd_request_t &request, LcdStep step) {
     policy.accepted_types = policy.terminal_types = QFRAME_MASK_R | QFRAME_MASK_E;
     policy.success_types = QFRAME_MASK_R;
     policy.first_timeout_ms = Config::get().uart_cmd_timeout_ms;
-    policy.overall_timeout_ms = policy.first_timeout_ms * (step == LcdStep::Hide ? 3u : 1u);
+    policy.response_timeout_ms = policy.first_timeout_ms * (step == LcdStep::Hide ? 3u : 1u);
+    policy.queue_timeout_ms = policy.response_timeout_ms;
     return queue_transaction(frame, len, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
                              policy, nullptr, &request, true, sizeof(request), step) != nullptr;
 }

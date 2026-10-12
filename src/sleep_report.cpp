@@ -5,6 +5,7 @@
 #include "hex_util.h"
 #include "uart_arbiter.h"
 #include "board.h"
+#include <algorithm>
 #include <stdio.h>
 #include <string.h>
 
@@ -75,7 +76,7 @@ using Scalar = Arbiter::VarResult;
 Scalar read_scalar(const char *tag, uint32_t &value, uint16_t timeout) {
     if (!timeout) return Scalar::Failed;
     return Arbiter::read_var_hex(tag, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, value,
-                                 timeout, nullptr, timeout);
+                                 0, nullptr, timeout);
 }
 
 bool select_period(uint16_t selection, uint16_t timeout) {
@@ -84,7 +85,7 @@ bool select_period(uint16_t selection, uint16_t timeout) {
     snprintf(command, sizeof(command), "P S #SEP %04X", selection);
     uint16_t length = sizeof(response);
     if (!Arbiter::send_cmd(command, CMD_SRC_INTERNAL, CMD_PRIO_NORMAL,
-                           response, &length, timeout) || length >= sizeof(response)) return false;
+                           response, &length, 0, timeout) || length >= sizeof(response)) return false;
     char expected[40];
     snprintf(expected, sizeof(expected), "%s = %04X", command, selection);
     return strcmp(response, expected) == 0;
@@ -108,7 +109,10 @@ int collect_day(Snapshot &out, ReadBudget &budget) {
         return fail(out, "report_day_unavailable", 400);
     out.day = day;
     Air10Stored::Value value;
-    auto result = Air10Stored::read("LSD", out.day, value, budget(0));
+    uint16_t remaining = budget(0);
+    if (!remaining) return fail(out, "report_read_failed");
+    auto result = Air10Stored::read("LSD", out.day, value,
+        Config::get().uart_cmd_timeout_ms, false, remaining);
     if (result == Air10Stored::ReadResult::Unsupported)
         return fail(out, "report_history_unsupported", 422);
     if (result == Air10Stored::ReadResult::Failed)
@@ -123,7 +127,10 @@ int collect_day(Snapshot &out, ReadBudget &budget) {
         const Field *table = fields(View::Day, count);
         for (size_t i = 0; i < count + 2; i++) {
             const char *tag = i < count ? table[i].tag : i == count ? "ONT" : "OFT";
-            result = Air10Stored::read(tag, out.day, value, budget(0));
+            remaining = budget(0);
+            if (!remaining) return fail(out, "report_read_failed");
+            result = Air10Stored::read(tag, out.day, value,
+                Config::get().uart_cmd_timeout_ms, false, remaining);
             if (result == Air10Stored::ReadResult::Failed)
                 return fail(out, "report_read_failed");
             if (result == Air10Stored::ReadResult::Unsupported || !value.present) continue;
@@ -150,7 +157,8 @@ int collect_day(Snapshot &out, ReadBudget &budget) {
 int collect_period(Snapshot &out, ReadBudget &budget) {
     uint32_t original, current, noticed;
     // Reserve cleanup inside the existing job deadline, not after it expires.
-    uint32_t reserve = 3u * Config::get().uart_cmd_timeout_ms;
+    uint32_t reserve = 6u * std::max(Config::get().uart_cmd_timeout_ms,
+                                    Arbiter::SCALAR_TIMEOUT_MIN_MS);
     if (read_scalar("SEP", original, budget(reserve)) != Scalar::Ok || original > 5 ||
         read_scalar("DSD", current, budget(reserve)) != Scalar::Ok || current >= 0xFFFF)
         return fail(out, "report_read_failed");

@@ -42,6 +42,8 @@ private:
 };
 
 int poll(uint32_t id, Result &result);  // 202 pending, 410 expired, 503 busy
-uint16_t timeout_ms(uint32_t reserve_ms = 0);  // Remaining budget, capped per UART request
+// Job deadline minus reserve, independent of UART phase timeouts.
+// Outside the worker, no job deadline applies (returns UINT16_MAX).
+uint16_t remaining_ms(uint32_t reserve_ms = 0);
 
 }

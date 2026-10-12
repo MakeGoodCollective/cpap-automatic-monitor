@@ -69,7 +69,7 @@ void worker(void *) {
         xSemaphoreGive(mutex);
         String result;
         int code = 504;
-        if (timeout_ms()) {
+        if (remaining_ms()) {
             if (job->kind == Kind::Write) code = handler(body, result);
             else if (job->kind == Kind::Report) {
                 void *memory = aircannect::Memory::alloc_large(sizeof(SleepReport::Snapshot));
@@ -78,7 +78,7 @@ void worker(void *) {
                     result = "{\"error\":\"report_allocation_failed\"}";
                 } else {
                     job->report_snapshot = new (memory) SleepReport::Snapshot;
-                    code = SleepReport::collect(*job->report_snapshot, job->report, timeout_ms);
+                    code = SleepReport::collect(*job->report_snapshot, job->report, remaining_ms);
                     if (code == 200)
                         job->report_length = SleepReport::json_length(*job->report_snapshot);
                     else
@@ -89,7 +89,7 @@ void worker(void *) {
                 if (code != 200) result = job->snapshot.error();
             }
         }
-        if (!timeout_ms() && code == 200) code = 504;
+        if (!remaining_ms() && code == 200) code = 504;
         if (code == 504) {
             job->snapshot.reset();
             aircannect::Memory::free(job->report_snapshot);
@@ -269,11 +269,10 @@ int poll(uint32_t id, Result &result) {
     return code;
 }
 
-uint16_t timeout_ms(uint32_t reserve_ms) {
-    uint16_t limit = Config::get().uart_cmd_timeout_ms;
-    if (xTaskGetCurrentTaskHandle() != task.load()) return limit;
+uint16_t remaining_ms(uint32_t reserve_ms) {
+    if (xTaskGetCurrentTaskHandle() != task.load()) return UINT16_MAX;
     uint32_t elapsed = millis() - active_since;
     if (elapsed >= DEADLINE_MS || reserve_ms >= DEADLINE_MS - elapsed) return 0;
-    return min(uint32_t(limit), DEADLINE_MS - elapsed - reserve_ms);
+    return DEADLINE_MS - elapsed - reserve_ms;
 }
 }

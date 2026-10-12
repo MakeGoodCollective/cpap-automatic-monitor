@@ -36,11 +36,11 @@ void Snapshot::reset() {
 }
 
 bool read_raw(const char *cmd, int &value) {
-    uint16_t timeout = ClinicalJobs::timeout_ms();
-    if (!timeout) return false;
+    uint16_t remaining = ClinicalJobs::remaining_ms();
+    if (!remaining) return false;
     uint32_t raw;
     if (Arbiter::read_var_hex(cmd, CMD_SRC_TCP, CMD_PRIO_NORMAL, raw,
-                             timeout, nullptr, timeout) !=
+                             0, nullptr, remaining) !=
         Arbiter::VarResult::Ok || raw > INT_MAX) return false;
     value = static_cast<int>(raw);
     return true;

@@ -157,18 +157,16 @@ static uart_response_policy_t framed_response_policy(const qframe_t *request) {
     policy.terminal_types = QFRAME_MASK_R | QFRAME_MASK_E;
     policy.success_types = QFRAME_MASK_R;
     policy.first_timeout_ms = normal_timeout;
-    policy.overall_timeout_ms = normal_timeout;
 
     if (payload_starts_with(request, "G V ")) {
         policy.first_timeout_ms = max(normal_timeout, (uint16_t)1500);
-        policy.overall_timeout_ms = policy.first_timeout_ms;
     } else if (payload_starts_with(request, "G F ")) {
         policy.accepted_types = QFRAME_MASK_R | QFRAME_MASK_K | QFRAME_MASK_E;
         policy.terminal_types = QFRAME_MASK_E;
         policy.success_types = QFRAME_MASK_R | QFRAME_MASK_K;
         policy.first_timeout_ms = max(normal_timeout, (uint16_t)1500);
         policy.interframe_timeout_ms = 350;
-        policy.overall_timeout_ms = 15000;
+        policy.response_timeout_ms = 15000;
         policy.complete_on_idle = true;
     }
     return policy;

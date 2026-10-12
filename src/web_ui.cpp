@@ -137,14 +137,14 @@ static bool json_foreach_kv(const String &body, json_kv_fn fn, void *ctx) {
 
 
 static bool writeSetting(const char *cmd, int value) {
-    uint16_t timeout = ClinicalJobs::timeout_ms();
-    if (!timeout) return false;
+    uint16_t remaining = ClinicalJobs::remaining_ms();
+    if (!remaining) return false;
     char req[32];
     snprintf(req, sizeof(req), "P S #%s %04X", cmd, (uint16_t)value);
     char resp[64] = {};
     uint16_t resp_len = sizeof(resp);
     return Arbiter::send_cmd(req, CMD_SRC_TCP, CMD_PRIO_NORMAL,
-                              resp, &resp_len, timeout);
+                              resp, &resp_len, 0, remaining);
 }
 
 static void jsonQuote(String &out, const char *val) {

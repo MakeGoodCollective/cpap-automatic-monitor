@@ -41,9 +41,11 @@ typedef struct {
     qframe_type_mask_t accepted_types;
     qframe_type_mask_t terminal_types;
     qframe_type_mask_t success_types;
+    uint32_t queue_timeout_ms;       // Enqueue -> first TX; zero = first timeout/config.
     uint16_t first_timeout_ms;
     uint16_t interframe_timeout_ms;
-    uint32_t overall_timeout_ms;
+    uint32_t response_timeout_ms;    // First TX -> completion, including multi-frame replies.
+    uint32_t overall_timeout_ms;     // Optional caller deadline from enqueue; zero = none.
     bool complete_on_idle;
 } uart_response_policy_t;
 
@@ -71,6 +73,8 @@ typedef int8_t uart_frame_listener_t;
 
 namespace Arbiter {
     enum class VarResult { Ok, Missing, Failed };
+    // Observed late G S replies after OXH; caller deadlines still take precedence.
+    constexpr uint16_t SCALAR_TIMEOUT_MIN_MS = 320;
 
     // RX is matching-response handling, not wire arrival or device sample time.
     struct VarReadTrace {
@@ -102,22 +106,25 @@ namespace Arbiter {
 
     bool send_cmd(const char *cmd, cmd_source_t src, cmd_priority_t prio,
                   char *resp_buf, uint16_t *resp_len,
-                  uint16_t timeout_ms = 0);  // 0 = use cfg.uart_cmd_timeout_ms
+                  uint16_t timeout_ms = 0,
+                  uint32_t hard_timeout_ms = 0);  // 0 = no caller deadline
 
     // Async single R/E response. Capacity includes the terminating byte.
+    // Queue and response each get timeout_ms (zero = configured timeout).
+    // Scheduled TX adds its not-before delay to the queue allowance only.
     // Finish only after transaction_done(); otherwise cancel_transaction().
     uart_transaction_t *begin_cmd(const char *cmd, cmd_source_t src,
                                   cmd_priority_t prio, uint16_t capacity,
                                   uint16_t timeout_ms = 0,
-                                  const uart_send_window_t &window = {});
+                                  const uart_send_window_t &window = {},
+                                  uint32_t hard_timeout_ms = 0);
     bool finish_cmd(uart_transaction_t *transaction, char *out, uint16_t *length,
                     uart_transaction_result_t *result = nullptr,
                     VarReadTrace *trace = nullptr);
 
     // Return only the scalar value; a truncated value is a failed read.
-    // timeout_ms bounds response wait after TX (at least 320 ms). Total queue
-    // plus response time is capped by hard_timeout_ms, or twice that allowance
-    // if no hard deadline is supplied. A hard deadline can shorten either phase.
+    // Queue and response each get timeout_ms (at least 320 ms). The optional
+    // hard_timeout_ms caps both phases together and can shorten either phase.
     // Use it for caller-owned acquisition windows or remaining job deadlines.
     uart_transaction_t *begin_var(const char *name, cmd_source_t src,
                                   cmd_priority_t prio, uint16_t capacity,

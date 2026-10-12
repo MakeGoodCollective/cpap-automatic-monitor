@@ -28,7 +28,7 @@ bool capture_value(const qframe_t *frame, void *context) {
 }
 
 ReadResult read(const char *tag, uint16_t day, Value &out,
-                uint16_t timeout_ms, bool background) {
+                uint16_t timeout_ms, bool background, uint16_t hard_timeout_ms) {
     out = {};
     if (!tag || strlen(tag) != 3 || !timeout_ms) return ReadResult::Failed;
     char command[28];
@@ -38,7 +38,7 @@ ReadResult read(const char *tag, uint16_t day, Value &out,
     policy.terminal_types = policy.accepted_types;
     policy.success_types = QFRAME_MASK_R;
     policy.first_timeout_ms = timeout_ms;
-    policy.overall_timeout_ms = timeout_ms;
+    policy.overall_timeout_ms = hard_timeout_ms;
     Capture capture = {};
     memcpy(capture.tag, tag, 3);
     capture.day = day;

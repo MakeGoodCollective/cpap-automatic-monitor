@@ -17,7 +17,8 @@ struct Value {
 enum class ReadResult : uint8_t { Ok, Unsupported, Failed };
 // One UART transaction; retry/cancellation policy belongs to the caller.
 ReadResult read(const char *tag, uint16_t day, Value &out,
-                uint16_t timeout_ms, bool background = false);
+                uint16_t timeout_ms, bool background = false,
+                uint16_t hard_timeout_ms = 0);
 
 bool parse_value(const uint8_t *payload, size_t payload_len, Value &out);
 bool parse_response(const uint8_t *payload, size_t payload_len,
