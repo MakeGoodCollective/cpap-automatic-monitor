@@ -5,7 +5,8 @@
 
 namespace Air10StrTimeline {
 
-constexpr uint32_t RECORD_LIMIT = 365;
+// Local history outlives EEPROM retention; never trim the only remaining copy.
+constexpr uint32_t RECORD_LIMIT = UINT16_MAX;
 
 struct Scan {
     uint16_t header_start_day = 0;
@@ -21,7 +22,6 @@ struct Plan {
     uint16_t end_day = 0;
     uint32_t record_count = 0;
     uint32_t incoming_index = 0;
-    bool retention_applied = false;
 };
 
 struct Buffer {

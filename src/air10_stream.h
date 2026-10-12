@@ -29,6 +29,7 @@ void poll();
 
 // Prioritize a consumer's schema; safe outside the main-loop discovery owner.
 void request(const char *tag);
+bool requested_pending();
 // A recorder snapshot is complete; an individual schema is usable as soon as
 // resolved. Both reject stale identity generations.
 bool snapshot(uint32_t generation, Schema (&out)[SCHEMA_COUNT]);

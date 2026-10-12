@@ -127,11 +127,12 @@ void setup() {
     Log::logf(CAT_CONFIG, LOG_DEBUG, "Configuration loaded\n");
     OtaManager::init();
 
-    SdStorage::init();
-    CustomSettings::init();
-
     Arbiter::init(Serial1, PIN_AS10_RX, PIN_AS10_TX);
     Log::logf(CAT_ARB, LOG_DEBUG, "Initialization returned\n");
+    AirSenseState::poll();
+
+    SdStorage::init();
+    CustomSettings::init();
     LiveStream::init();
     LiveTce::register_parser();
 
@@ -203,14 +204,13 @@ void loop() {
     }
     prev_ota_active = ota_active;
 
+    AirSenseState::poll();
+    Air10Stream::poll();
     Air10Clock::handle();
 
     LiveWebConsumer::tick();
 
     OxiArbiter::poll();
-
-    AirSenseState::poll();
-    Air10Stream::poll();
 
     delay(10);
 }

@@ -73,10 +73,7 @@ bool make_plan(const Scan &scan, uint16_t incoming_day, Plan &plan) {
     if (end_day >= UINT16_MAX || end_day < start_day) return false;
 
     const uint32_t full_count = end_day - start_day + 1;
-    if (full_count > RECORD_LIMIT) {
-        start_day = end_day - RECORD_LIMIT + 1;
-        plan.retention_applied = true;
-    }
+    if (full_count > RECORD_LIMIT) return false;
     if (incoming_day < start_day) return false;
 
     plan.start_day = static_cast<uint16_t>(start_day);

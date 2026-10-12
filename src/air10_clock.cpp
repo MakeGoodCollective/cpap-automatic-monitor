@@ -24,6 +24,7 @@ static constexpr uint32_t CLOCK_POST_THERAPY_DELAY_MS = 60000;
 static constexpr uint8_t CLOCK_SYNC_AUTO = 1;
 static constexpr uint8_t CLOCK_SYNC_MANUAL = 2;
 static std::atomic<uint8_t> clock_sync_requests{CLOCK_SYNC_AUTO};
+static std::atomic<bool> priority_work{false};
 static bool clock_sync_pending = false;
 static bool clock_sync_manual = false;
 static bool clock_sync_settling = false;
@@ -554,7 +555,16 @@ static void handle_clock_sync() {
 void Air10Clock::handle() {
     // An eligible write invalidates phase: do it before acquiring that phase.
     // A deferred/refused write must not prevent independent RTC observation.
+    priority_work = (clock_sync_requests.load() || clock_sync_pending) &&
+        (Config::get().resmed_time || clock_sync_manual ||
+         (clock_sync_requests.load() & CLOCK_SYNC_MANUAL)) &&
+        !clock_sync_settling && AirSenseState::device_standby() &&
+        AirSenseState::present_recently() && WiFiSetup::time_synced() &&
+        (!clock_sync_attempted || millis() - clock_sync_attempt_ms >= 30000);
     handle_clock_sync();
     handle_calendar_read();
     handle_phase_measurement();
+    priority_work = priority_work.load() || clock_sync_ticket || calendar_step || phase_measuring;
 }
+
+bool Air10Clock::background_work_pending() { return priority_work.load(); }

@@ -37,6 +37,8 @@ bool phase_unchanged(const PhaseAnchor &anchor);
 
 // Main-loop maintenance: idle phase measurement/retry and deferred NTP writes.
 void handle();
+// Owner-published priority work; routine STR yields, mandatory journals do not.
+bool background_work_pending();
 // Manual requests bypass autosync, not standby/STR or post-therapy deferral.
 void request_sync(bool manual = false);
 // Main-loop notification of confirmed therapy end; starts a 60-second hold.

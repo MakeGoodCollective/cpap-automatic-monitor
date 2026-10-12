@@ -160,14 +160,26 @@ void request(const char *tag) {
         if (!strcmp(tag, SCHEMA_TAGS[i])) requested_mask.fetch_or(1u << i);
 }
 
+bool requested_pending() {
+    const uint32_t now = millis();
+    portENTER_CRITICAL(&cache_mux);
+    const uint8_t unresolved = requested_mask.load() & ~resolved_mask;
+    bool pending = false;
+    for (uint8_t i = 0; i < SCHEMA_COUNT; ++i)
+        if ((unresolved & (1u << i)) &&
+            (!query_failed[i] || now - failed_at_ms[i] >= RETRY_MS)) pending = true;
+    portEXIT_CRITICAL(&cache_mux);
+    return pending;
+}
+
 void poll() {
     const uint32_t generation = AirSenseState::identity_generation();
     if (generation != cache_generation) {
         if (query_ticket) Arbiter::cancel_transaction(query_ticket);
         query_ticket = nullptr;
         next_schema = 0;
-        memset(query_failed, 0, sizeof(query_failed));
         portENTER_CRITICAL(&cache_mux);
+        memset(query_failed, 0, sizeof(query_failed));
         memset(cached_schemas, 0, sizeof(cached_schemas));
         cache_generation = generation;
         cache_ready = false;
@@ -235,13 +247,15 @@ void poll() {
                   tag, ok ? "invalid_schema" : trace.outcome,
                   (unsigned long)trace.queue_ms, unsigned(trace.sent),
                   (unsigned long)trace.wait_ms, response);
+        portENTER_CRITICAL(&cache_mux);
         failed_at_ms[next_schema] = millis();
         query_failed[next_schema] = true;
+        portEXIT_CRITICAL(&cache_mux);
         return;
     }
 
-    query_failed[next_schema] = false;
     portENTER_CRITICAL(&cache_mux);
+    query_failed[next_schema] = false;
     cached_schemas[next_schema] = resolved;
     resolved_mask |= 1u << next_schema;
     cache_ready = resolved_mask == (1u << SCHEMA_COUNT) - 1;
