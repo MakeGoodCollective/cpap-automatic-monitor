@@ -707,7 +707,8 @@ static bool ensure_identification(const AirSenseState::Identity &identity) {
 
 static bool fetch_str_record(uint8_t *record, size_t capacity,
                               const Air10Stored::Value *date = nullptr,
-                              const Air10Stored::Value *mask_events = nullptr) {
+                              const Air10Stored::Value *mask_events = nullptr,
+                              const Air10Stored::Value *duration = nullptr) {
     const Air10Edf::Schema &schema = Air10Edf::str_schema();
     const size_t sample_count = Air10Edf::numeric_sample_count(schema);
     int16_t *samples = static_cast<int16_t *>(
@@ -719,7 +720,8 @@ static bool fetch_str_record(uint8_t *record, size_t capacity,
     memset(samples, 0xFF, sample_count * sizeof(int16_t));
 
     Air10Stored::Value therapy_duration = {};
-    if (!read_stored_value("THD", session_native_day, therapy_duration) ||
+    if (duration) therapy_duration = *duration;
+    if ((!duration && !read_stored_value("THD", session_native_day, therapy_duration)) ||
         !therapy_duration.present || therapy_duration.sample_count != 1) {
         aircannect::Memory::free(samples);
         post_error("STR duration unavailable");
@@ -983,7 +985,7 @@ static LocalStrRead read_local_str(const AirSenseState::Identity &identity,
         const uint16_t day = first + i;
         valid = file.read(work, record_size) == record_size && valid_str_record(work, record_size, day);
         if (!valid) break;
-        const bool filled = str_scalar(work, "MSE") != UINT16_MAX;
+        const bool filled = str_scalar(work, "THD") != UINT16_MAX;
         if (filled) last = day;
         else if (day <= wanted && gap == UINT16_MAX) gap = day;
         if (record && day == wanted && filled) { memcpy(record, work, record_size); found = true; }
@@ -1300,6 +1302,8 @@ static bool collect_str_summary(uint8_t *&record, uint32_t generation,
             return false;
         }
         Air10Stored::Value mask_events = {};
+        Air10Stored::Value duration = {};
+        bool duration_read = false;
         bool unchanged = false;
         if (compare_saved) {
             if (!read_stored_value("MSE", session_native_day, mask_events)) return false;
@@ -1316,9 +1320,20 @@ static bool collect_str_summary(uint8_t *&record, uint32_t generation,
                 mask_events.sample_count == 1 && uint16_t(mask_events.samples[0]) < 255 &&
                 !(mask_events.samples[0] & 1) && str_scalar(record, "THD") != UINT16_MAX &&
                 str_scalar(record, "MSE") == uint16_t(mask_events.samples[0]);
+            // EEPROM keeps settings on zero-therapy days with missing MSE.
+            // A filler has missing THD too; never mistake it for that record.
+            if ((!mask_events.present || (mask_events.sample_count == 1 &&
+                    uint16_t(mask_events.samples[0]) == UINT16_MAX)) &&
+                local == LocalStrRead::Ready && str_scalar(record, "THD") == 0 &&
+                str_scalar(record, "MSE") == UINT16_MAX) {
+                if (!read_stored_value("THD", session_native_day, duration)) return false;
+                duration_read = true;
+                unchanged = duration.present && duration.sample_count == 1 && duration.samples[0] == 0;
+            }
         }
         if (!unchanged && !fetch_str_record(record, record_size, &date,
-                                             compare_saved ? &mask_events : nullptr)) return false;
+                                             compare_saved ? &mask_events : nullptr,
+                                             duration_read ? &duration : nullptr)) return false;
         if (unchanged) trace.result = "unchanged";
     }
     trace.generation_read = read_u32_variable("ZEN", trace.generation);
