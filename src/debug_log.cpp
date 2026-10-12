@@ -25,7 +25,9 @@ static SemaphoreHandle_t log_mutex = nullptr;
 static portMUX_TYPE queue_mux = portMUX_INITIALIZER_UNLOCKED;
 static log_level_t cat_levels[CAT_COUNT];
 
-static constexpr size_t SYSLOG_QUEUE_DEPTH = 8;
+static constexpr size_t LOCAL_QUEUE_DEPTH = 8;
+// Network startup/reconnect can outlast several local sink drains.
+static constexpr size_t SYSLOG_QUEUE_DEPTH = 32;
 static constexpr size_t SYSLOG_SEND_BUDGET = 4;
 static constexpr uint32_t SYSLOG_RETRY_MS = 100;
 
@@ -85,7 +87,7 @@ static SyslogRecord boot_record() {
 void Log::init() {
     log_mutex = xSemaphoreCreateMutex();
     local_queue = static_cast<SyslogRecord *>(aircannect::Memory::alloc_large(
-        SYSLOG_QUEUE_DEPTH * sizeof(SyslogRecord)));
+        LOCAL_QUEUE_DEPTH * sizeof(SyslogRecord)));
     bool stored = open_optional_preferences(log_prefs, "log_levels");
     for (int i = 0; i < CAT_COUNT; i++) {
         log_level_t fallback = LOG_INFO;
@@ -100,28 +102,28 @@ void Log::init() {
 }
 
 // Count both rejected arrivals and lower-priority records evicted for them.
-static unsigned enqueue(SyslogRecord *queue, size_t &head, size_t &count,
+static unsigned enqueue(SyslogRecord *queue, size_t capacity, size_t &head, size_t &count,
                     const SyslogRecord &record) {
     if (!queue) return !record.loss_report;
     unsigned dropped = 0;
-    if (count == SYSLOG_QUEUE_DEPTH) {
+    if (count == capacity) {
         size_t victim = count;
         uint8_t lowest_priority = record.level;
         for (size_t i = 0; i < count; i++) {
-            uint8_t level = queue[(head + i) % SYSLOG_QUEUE_DEPTH].level;
+            uint8_t level = queue[(head + i) % capacity].level;
             if (level > lowest_priority) {
                 victim = i;
                 lowest_priority = level;
             }
         }
         if (victim == count) return !record.loss_report;
-        dropped = !queue[(head + victim) % SYSLOG_QUEUE_DEPTH].loss_report;
+        dropped = !queue[(head + victim) % capacity].loss_report;
         for (size_t i = victim; i + 1 < count; i++)
-            queue[(head + i) % SYSLOG_QUEUE_DEPTH] =
-                queue[(head + i + 1) % SYSLOG_QUEUE_DEPTH];
+            queue[(head + i) % capacity] =
+                queue[(head + i + 1) % capacity];
         count--;
     }
-    SyslogRecord &slot = queue[(head + count++) % SYSLOG_QUEUE_DEPTH];
+    SyslogRecord &slot = queue[(head + count++) % capacity];
     slot = record;
     slot.queue_id = ++next_queue_id;
     return dropped;
@@ -132,7 +134,7 @@ void Log::boot() {
     SyslogRecord record = boot_record();
     xSemaphoreTake(log_mutex, portMAX_DELAY);
     portENTER_CRITICAL(&queue_mux);
-    local_drops += enqueue(local_queue, local_head, local_count, record);
+    local_drops += enqueue(local_queue, LOCAL_QUEUE_DEPTH, local_head, local_count, record);
     boot_pending = true;
     portEXIT_CRITICAL(&queue_mux);
     xSemaphoreGive(log_mutex);
@@ -167,7 +169,7 @@ static void poll_local() {
             return;
         }
         SyslogRecord record = local_queue[local_head];
-        local_head = (local_head + 1) % SYSLOG_QUEUE_DEPTH;
+        local_head = (local_head + 1) % LOCAL_QUEUE_DEPTH;
         local_count--;
         portEXIT_CRITICAL(&queue_mux);
         char line[160];
@@ -251,11 +253,12 @@ static void report_losses() {
                 (unsigned long)udp_failure.largest, (unsigned long)udp_failure.at_ms);
         }
         portENTER_CRITICAL(&queue_mux);
-        if (local_count + slots <= SYSLOG_QUEUE_DEPTH &&
+        if (local_count + slots <= LOCAL_QUEUE_DEPTH &&
             (!syslog_queue || syslog_count + slots <= SYSLOG_QUEUE_DEPTH)) {
             for (size_t i = 0; i < slots; ++i) {
-                enqueue(local_queue, local_head, local_count, records[i]);
-                if (syslog_queue) enqueue(syslog_queue, syslog_head, syslog_count, records[i]);
+                enqueue(local_queue, LOCAL_QUEUE_DEPTH, local_head, local_count, records[i]);
+                if (syslog_queue)
+                    enqueue(syslog_queue, SYSLOG_QUEUE_DEPTH, syslog_head, syslog_count, records[i]);
             }
             if (level == LOG_WARN) {
                 local_drops -= lost_local;
@@ -524,9 +527,9 @@ static void log_dispatch(log_cat_t cat, log_level_t lvl,
 
     // Only bounded queue copies here, never formatting, allocation or sink I/O.
     portENTER_CRITICAL(&queue_mux);
-    local_drops += enqueue(local_queue, local_head, local_count, record);
+    local_drops += enqueue(local_queue, LOCAL_QUEUE_DEPTH, local_head, local_count, record);
     if (syslog_queue)
-        syslog_drops += enqueue(syslog_queue, syslog_head, syslog_count, record);
+        syslog_drops += enqueue(syslog_queue, SYSLOG_QUEUE_DEPTH, syslog_head, syslog_count, record);
     portEXIT_CRITICAL(&queue_mux);
 }
 
