@@ -42,6 +42,7 @@ struct ClockObservation {
     int64_t civil = 0;
     uint32_t sent_ms = 0;
     uint32_t received_ms = 0;
+    char date[9] = {};
 };
 
 // Shared clock observations; only handle() owns probe tickets.
@@ -110,6 +111,10 @@ bool Air10Clock::phase_unchanged(const PhaseAnchor &anchor) {
 static void observe_clock_read(const Air10Clock::Calendar &value,
                                 const Arbiter::VarReadTrace &trace) {
     const int64_t civil = Air10Clock::civil_seconds(value);
+    char date[9] = {}, text[20] = {};
+    snprintf(date, sizeof(date), "%02d%02d%04d", value.day, value.month, value.year);
+    snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
+             value.year, value.month, value.day, value.hour, value.minute);
     portENTER_CRITICAL(&device_time_mux);
     if (device_phase.generation &&
         (device_phase.native_at_ms(trace.received_ms) + device_phase.uncertainty_ms < civil * 1000 ||
@@ -118,6 +123,9 @@ static void observe_clock_read(const Air10Clock::Calendar &value,
         phase_generation++;
     }
     last_clock_read = {civil, trace.sent_ms, trace.received_ms};
+    memcpy(last_clock_read.date, date, sizeof(date));
+    memcpy(device_time, text, sizeof(text));
+    device_time_ms = trace.received_ms;
     portEXIT_CRITICAL(&device_time_mux);
 }
 
@@ -164,6 +172,20 @@ static void stop_calendar_read() {
     calendar_step = 0;
 }
 
+static bool start_phase_from_observation() {
+    portENTER_CRITICAL(&device_time_mux);
+    const bool fresh = last_clock_read.date[0] &&
+        millis() - last_clock_read.sent_ms <= PHASE_MAX_BRACKET_MS;
+    if (fresh) {
+        phase_previous = last_clock_read;
+        phase_probe_generation = phase_generation;
+        memcpy(phase_date, last_clock_read.date, sizeof(phase_date));
+    }
+    portEXIT_CRITICAL(&device_time_mux);
+    phase_measuring = fresh;
+    return fresh;
+}
+
 static void handle_calendar_read() {
     const auto state = Arbiter::get_state();
     portENTER_CRITICAL(&device_time_mux);
@@ -181,6 +203,11 @@ static void handle_calendar_read() {
     }
     if (phase_measuring) return;
     if (!calendar_step) {
+        // A fallback, session read or write verification may have satisfied it.
+        portENTER_CRITICAL(&device_time_mux);
+        if (device_time[0] != '-' && millis() - device_time_ms < DEVICE_TIME_POLL_INTERVAL_MS)
+            status_read_requested = false;
+        portEXIT_CRITICAL(&device_time_mux);
         calendar_for_phase = AB_STORAGE_HAS_SDCARD && phase_due &&
             AirSenseState::device_standby() &&
             (!phase_attempted || millis() - phase_attempt_ms >= PHASE_RETRY_INTERVAL_MS);
@@ -192,6 +219,10 @@ static void handle_calendar_read() {
         if (calendar_for_phase) {
             phase_attempted = true;
             phase_started_ms = phase_attempt_ms = millis();
+            if (start_phase_from_observation()) {
+                calendar_step = 0;
+                return;
+            }
         }
     }
     if (!calendar_ticket) {
@@ -228,18 +259,7 @@ static void handle_calendar_read() {
                 if (!strcmp(calendar_date, response) &&
                     Air10Clock::parse_calendar(calendar_date, calendar_tic, value)) {
                     observe_clock_read(value, calendar_trace);
-                    char text[20];
-                    snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
-                             value.year, value.month, value.day, value.hour, value.minute);
-                    publish_device_time(text);
-                    if (calendar_for_phase) {
-                        portENTER_CRITICAL(&device_time_mux);
-                        phase_previous = last_clock_read;
-                        phase_probe_generation = phase_generation;
-                        portEXIT_CRITICAL(&device_time_mux);
-                        memcpy(phase_date, calendar_date, sizeof(phase_date));
-                        phase_measuring = true;
-                    }
+                    if (calendar_for_phase) start_phase_from_observation();
                     calendar_step = 0;
                     return;
                 }
@@ -441,7 +461,6 @@ static bool finish_clock_sync() {
     char text[20];
     snprintf(text, sizeof(text), "%04d-%02d-%02d %02d:%02d",
              observed.year, observed.month, observed.day, observed.hour, observed.minute);
-    publish_device_time(text);
     // A wall-clock step while the ticket waited also requires a fresh attempt.
     struct timeval wall;
     gettimeofday(&wall, nullptr);
@@ -468,16 +487,14 @@ bool Air10Clock::pull_time(bool force) {
     return true;
 }
 
-void Air10Clock::handle() {
-    handle_calendar_read();
-    handle_phase_measurement();
+static void handle_clock_sync() {
     if (clock_sync_settling &&
         millis() - clock_sync_therapy_end_ms >= CLOCK_POST_THERAPY_DELAY_MS)
         clock_sync_settling = false;
 
     const bool auto_enabled = Config::get().resmed_time;
     static bool was_auto_enabled = true;
-    if (auto_enabled && !was_auto_enabled) request_sync();
+    if (auto_enabled && !was_auto_enabled) Air10Clock::request_sync();
     was_auto_enabled = auto_enabled;
 
     const uint8_t requests = clock_sync_requests.exchange(0);
@@ -526,4 +543,12 @@ void Air10Clock::handle() {
     clock_sync_attempted = true;
     push_time_to_resmed();
     if (!clock_sync_ticket) EdfRecorder::end_clock_write();
+}
+
+void Air10Clock::handle() {
+    // An eligible write invalidates phase: do it before acquiring that phase.
+    // A deferred/refused write must not prevent independent RTC observation.
+    handle_clock_sync();
+    handle_calendar_read();
+    handle_phase_measurement();
 }
