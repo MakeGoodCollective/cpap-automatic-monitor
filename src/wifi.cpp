@@ -299,8 +299,11 @@ static void clear_scan() {
     esp_wifi_clear_ap_list();
 }
 
-static void start_scan() {
+static void start_scan(bool background = false) {
     if (scan_pending.load(std::memory_order_acquire)) return;
+    // Arduino retries the first disconnect even with auto-reconnect disabled.
+    // Recovery owns STA; a roaming scan must keep the current association.
+    if (!background) stop_sta_attempt();
     scan_candidate_count = 0;
     scan_status.store(1, std::memory_order_relaxed);
     scan_done.store(false, std::memory_order_relaxed);
@@ -318,15 +321,19 @@ static void start_scan() {
     esp_err_t err = esp_wifi_scan_start(&scan, false);
     if (err != ESP_OK) {
         clear_scan();
-        Log::logf(CAT_WIFI, LOG_WARN, "Scan start failed (err=%d)\n", err);
+        Log::logf(CAT_WIFI, LOG_WARN, "Scan start failed: %s (%d)\n",
+                  esp_err_to_name(err), err);
     }
 }
 
 static int16_t scan_complete() {
     if (!scan_pending.load(std::memory_order_acquire)) return WIFI_SCAN_FAILED;
     if (scan_done.load(std::memory_order_acquire)) {
-        if (scan_status.load(std::memory_order_relaxed) == 0) return 0;
+        const uint32_t status = scan_status.load(std::memory_order_relaxed);
+        if (status == 0) return 0;
         clear_scan();
+        Log::logf(CAT_WIFI, LOG_WARN, "Scan failed status=%lu\n",
+                  (unsigned long)status);
         return WIFI_SCAN_FAILED;
     }
     if (millis() - scan_started_ms >= SCAN_TIMEOUT_MS) {
@@ -570,7 +577,6 @@ static void apply_network_config() {
     }
     WiFi.setHostname(cfg.hostname.c_str());
     apply_country_code();
-    stop_sta_attempt();
     got_ip = false;
     sta_disconnected = false;
     for (uint8_t i = 0; i < cfg.wifi_net_count; i++) {
@@ -579,6 +585,7 @@ static void apply_network_config() {
         set_state(WF_SCANNING);
         return;
     }
+    stop_sta_attempt();
     enter_ap_fallback();
 }
 
@@ -654,10 +661,13 @@ void WiFiSetup::check() {
 
     if (roaming_suspended) return;
 
-    if (sta_disconnected && wf_state == WF_CONNECTED) {
+    if (sta_disconnected && (wf_state == WF_CONNECTED || wf_state == WF_ROAM_SCAN)) {
         sta_disconnected = false;
-        Log::logf(CAT_WIFI, LOG_WARN, "Disconnected reason=%u, scanning...\n",
-                  (unsigned)last_disconnect_reason);
+        const auto reason = static_cast<wifi_err_reason_t>(last_disconnect_reason);
+        Log::logf(CAT_WIFI, LOG_WARN, "Disconnected reason=%u (%s), scanning...\n",
+                  (unsigned)reason, WiFi.STA.disconnectReasonName(reason));
+        if (scan_pending.load(std::memory_order_acquire)) esp_wifi_scan_stop();
+        clear_scan();
         start_scan();
         set_state(WF_SCANNING);
         return;
@@ -671,7 +681,6 @@ void WiFiSetup::check() {
     case WF_HINT_TRY:
         if (elapsed > HINT_TIMEOUT_MS) {
             Log::logf(CAT_WIFI, LOG_DEBUG, "Hint timeout, full scan\n");
-            stop_sta_attempt();
             start_scan();
             set_state(WF_SCANNING);
         }
@@ -687,7 +696,6 @@ void WiFiSetup::check() {
                 enter_ap_fallback();
             }
         } else if (result == WIFI_SCAN_FAILED) {
-            Log::logf(CAT_WIFI, LOG_WARN, "Scan failed\n");
             enter_ap_fallback();
         }
         break;
@@ -750,7 +758,7 @@ void WiFiSetup::check() {
                           rssi, low_rssi_count, ROAM_CONSECUTIVE_LOW);
                 if (low_rssi_count >= ROAM_CONSECUTIVE_LOW) {
                     Log::logf(CAT_WIFI, LOG_DEBUG, "Roaming: scanning for better AP\n");
-                    start_scan();
+                    start_scan(true);
                     set_state(WF_ROAM_SCAN);
                 }
             } else {
