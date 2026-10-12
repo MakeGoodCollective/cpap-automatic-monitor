@@ -372,6 +372,13 @@ size_t index_count = 0;
 uint32_t catalog_generation = 0, file_revision = 0;
 uint32_t invalidation_generation = 0, indexed_invalidation = 0;
 bool index_ready = false;
+struct IndexScan {
+    bool active = false, full = false;
+    bool detail_changed = false, summary_changed = false;
+    uint32_t catalog = 0, files = 0, invalidation = 0;
+    uint32_t started_ms = 0, resumes = 0;
+    size_t next = 0;
+} index_scan;
 bool cache_usage_known = false;
 uint64_t cache_bytes = 0;
 uint32_t cache_generation = 0;
@@ -509,38 +516,45 @@ bool refresh_index(const SdStorage::Session &session) {
     const bool invalidated = invalidation != indexed_invalidation;
     if (index_ready && !invalidated && changes.catalog.generation == catalog_generation && files == file_revision)
         return true;
-    const bool full = !index_ready || invalidated || !incremental || files != file_revision ||
-        changes.catalog.entries < index_count;
-    if (full) { invalidate_day(); invalidate_str(); dataset_id[0] = 0; }
-    if (!dataset(session)) { index_error = "dataset_identity"; return false; }
-    const size_t old_count = index_count;
-    index_error = "session_limit";
-    if (changes.catalog.entries > MAX_SESSION_COUNT) return false;
-    if (changes.catalog.entries != index_count) {
-        const size_t bytes = changes.catalog.entries * sizeof(IndexedSession);
-        if (!bytes) {
-            aircannect::Memory::free(index);
-            index = nullptr;
-        } else {
-            void *grown = aircannect::Memory::realloc_large(index, bytes, bytes <= INTERNAL_WORK);
-            if (!grown) { index_error = "index_alloc"; return false; }
-            index = static_cast<IndexedSession *>(grown);
+    const bool resume = index_scan.active && index_scan.catalog == changes.catalog.generation &&
+        index_scan.files == files && index_scan.invalidation == invalidation &&
+        changes.catalog.entries == index_count;
+    if (!resume) {
+        // A changed source invalidates the partially updated in-memory index.
+        // Mere SD/therapy preemption retains both the cursor and change flags.
+        const bool full = index_scan.active || !index_ready || invalidated || !incremental ||
+            files != file_revision || changes.catalog.entries < index_count;
+        if (full) { invalidate_day(); invalidate_str(); dataset_id[0] = 0; }
+        if (!dataset(session)) { index_error = "dataset_identity"; return false; }
+        const size_t old_count = index_count;
+        index_error = "session_limit";
+        if (changes.catalog.entries > MAX_SESSION_COUNT) return false;
+        if (changes.catalog.entries != index_count) {
+            const size_t bytes = changes.catalog.entries * sizeof(IndexedSession);
+            if (!bytes) {
+                aircannect::Memory::free(index);
+                index = nullptr;
+            } else {
+                void *grown = aircannect::Memory::realloc_large(index, bytes, bytes <= INTERNAL_WORK);
+                if (!grown) { index_error = "index_alloc"; return false; }
+                index = static_cast<IndexedSession *>(grown);
+            }
+            if (changes.catalog.entries > index_count)
+                for (size_t i = index_count; i < changes.catalog.entries; ++i)
+                    new (&index[i]) IndexedSession;
+            index_count = changes.catalog.entries;
         }
-        if (changes.catalog.entries > index_count)
-            for (size_t i = index_count; i < changes.catalog.entries; ++i)
-                new (&index[i]) IndexedSession;
-        index_count = changes.catalog.entries;
-    }
-    bool detail_changed = !index_ready || changes.catalog.entries < old_count;
-    bool summary_changed = false;
-    const size_t count = full ? index_count : changes.count;
-    for (size_t n = 0; n < count; ++n) {
+        index_scan = {true, full, !index_ready || changes.catalog.entries < old_count, false,
+                      changes.catalog.generation, files, invalidation, millis(), 0, 0};
+        index_ready = false;
+    } else ++index_scan.resumes;
+    const size_t count = index_scan.full ? index_count : changes.count;
+    for (; index_scan.next < count; ++index_scan.next) {
         if (aborted(nullptr, session)) {
             index_failure = IndexFailure::Preempted;
-            index_ready = false;
             return false;
         }
-        const size_t i = full ? n : changes.indexes[n];
+        const size_t i = index_scan.full ? index_scan.next : changes.indexes[index_scan.next];
         index_error_entry = i;
         index_error = "catalog_index";
         if (i >= index_count) return false;
@@ -550,14 +564,14 @@ bool refresh_index(const SdStorage::Session &session) {
         index_error = "catalog_day";
         if (!catalog_day(next.entry.therapy_day, next.day)) return false;
         // STR/Identification readiness is not a detail-data revision.
-        summary_changed |= index[i].entry.str_revision != next.entry.str_revision ||
+        index_scan.summary_changed |= index[i].entry.str_revision != next.entry.str_revision ||
             ((index[i].entry.flags ^ next.entry.flags) & EdfCatalog::ENTRY_STR_READY);
         const bool changed = strcmp(index[i].entry.file_prefix, next.entry.file_prefix) ||
             strcmp(index[i].entry.therapy_day, next.entry.therapy_day) ||
             ((index[i].entry.flags ^ next.entry.flags) & EdfCatalog::ENTRY_LIVE_COMPLETE);
-        if (full || changed) {
+        if (index_scan.full || changed) {
             index_error = "source_fingerprint";
-            if (!fingerprint(session, next)) { index_ready = false; return false; }
+            if (!fingerprint(session, next)) return false;
             const bool key_changed = !(index[i].key == next.key);
             if (changed || key_changed) {
                 if (index[i].day) invalidate_day(index[i].day);
@@ -566,7 +580,7 @@ bool refresh_index(const SdStorage::Session &session) {
             // A changed fingerprint is not proof that the sources can rebuild
             // the old cache. Its header rejects mismatches; retain the bytes
             // until a validated replacement is available.
-            detail_changed |= changed || key_changed;
+            index_scan.detail_changed |= changed || key_changed;
             if (!changed && !key_changed) {
                 next.start_ms = index[i].start_ms;
                 next.end_ms = index[i].end_ms;
@@ -584,15 +598,28 @@ bool refresh_index(const SdStorage::Session &session) {
         }
         index[i] = next;
     }
+    if (index_scan.full) {
+        cache_usage_known = false;
+        if (!migrate_cache(session)) {
+            index_error = "cache_migrate";
+            if (aborted(nullptr, session)) index_failure = IndexFailure::Preempted;
+            return false;
+        }
+    }
+    EdfCatalog::Status current;
+    EdfCatalog::get_status(current);
+    if (aborted(nullptr, session) || !current.ready || current.generation != index_scan.catalog ||
+        SdStorage::files_revision() != index_scan.files ||
+        __atomic_load_n(&invalidation_generation, __ATOMIC_ACQUIRE) != index_scan.invalidation) {
+        index_failure = IndexFailure::Preempted;
+        return false;
+    }
+    const bool detail_changed = index_scan.detail_changed, summary_changed = index_scan.summary_changed;
     if (summary_changed) invalidate_str();
     catalog_generation = changes.catalog.generation;
     file_revision = files;
     indexed_invalidation = invalidation;
     index_ready = true;
-    if (full) {
-        cache_usage_known = false;
-        if (!migrate_cache(session)) { index_ready = false; index_error = "cache_migrate"; return false; }
-    }
     if ((detail_changed || summary_changed) && !invalidated) __atomic_add_fetch(&data_revision, 1, __ATOMIC_RELEASE);
     portENTER_CRITICAL(&status_mux);
     status.catalog_generation = catalog_generation;
@@ -601,6 +628,10 @@ bool refresh_index(const SdStorage::Session &session) {
     status.data_revision = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
     if (detail_changed || summary_changed || invalidated) ++status.revision;
     portEXIT_CRITICAL(&status_mux);
+    Log::logf(CAT_REPORT, LOG_DEBUG, "EDF index ready entries=%u checked=%u resumes=%lu elapsed=%lums\n",
+        unsigned(index_count), unsigned(count), static_cast<unsigned long>(index_scan.resumes),
+        static_cast<unsigned long>(millis() - index_scan.started_ms));
+    index_scan = {};
     return true;
 }
 
@@ -1953,6 +1984,7 @@ bool migrate_cache(const SdStorage::Session &session) {
     bool end = false;
     SdStorage::Reader::Entry file;
     while (!end) {
+        if (aborted(nullptr, session)) return false;
         if (!directory.next(file, end)) return false;
         const char *base = nullptr;
         if (end || file.directory || !cache_name(file.name, base) || strstr(base, ".part")) continue;
