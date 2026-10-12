@@ -3039,16 +3039,16 @@ struct RoutineStrPass {
 };
 static RoutineStrPass routine_str;
 
-static void sync_pending() {
+static bool sync_pending() {
     EdfPending::Record selected;
     if (!pending_scanned || status.pending_str) {
-        if (!SdStorage::try_acquire(true)) return;
+        if (!SdStorage::try_acquire(true)) return false;
         const bool scanned = scan_pending(&selected);
         SdStorage::release();
-        if (!scanned) return;
+        if (!scanned) return false;
     }
     AirSenseState::Identity identity;
-    if (!AirSenseState::identity(identity)) return;
+    if (!AirSenseState::identity(identity)) return false;
     if (selected.prefix[0]) {
         if (strcmp(identity.srn, selected.srn)) {
             memcpy(pending_cursor, selected.prefix, sizeof(pending_cursor));
@@ -3056,28 +3056,30 @@ static void sync_pending() {
             snprintf(error, sizeof(error), "STR pending %s SRN mismatch: recorded=%s current=%s",
                      selected.prefix, selected.srn, identity.srn);
             post_error(error);
-            return;
+            return false;
         }
         uint32_t generation = 0;
         if (read_u32_variable("ZEN", generation) &&
-            refresh_str_day(selected.native_day, generation, identity, true, "pending"))
+            refresh_str_day(selected.native_day, generation, identity, true, "pending")) {
             memcpy(pending_cursor, selected.prefix, sizeof(pending_cursor));
-        return;
+            return true;
+        }
+        return false;
     } else if (status.pending_str) {
         pending_cursor[0] = 0;
-        return;
+        return true;
     }
     routine_processing = true;
-    if (post_processing_cancelled()) return;
+    if (post_processing_cancelled()) return false;
 
     // SD contention must not cause a ZEN/SSD probe loop before any useful work.
     const bool catch_up_pending = routine_str.active || !have_synced_generation ||
         synced_device_generation != identity.generation || synced_files_revision != SdStorage::files_revision();
-    if (!SdStorage::try_acquire(catch_up_pending)) return;
+    if (!SdStorage::try_acquire(catch_up_pending)) return false;
     SdStorage::release();
     const uint32_t device = identity.generation;
     uint32_t generation = 0, saved_day = 0, after = 0;
-    if (!read_u32_variable("ZEN", generation) || device != AirSenseState::identity_generation()) return;
+    if (!read_u32_variable("ZEN", generation) || device != AirSenseState::identity_generation()) return false;
     if (routine_str.active && (routine_str.device != device ||
         routine_str.generation != generation || routine_str.files != SdStorage::files_revision())) {
         routine_str = {};
@@ -3087,19 +3089,19 @@ static void sync_pending() {
         synced_files_revision == SdStorage::files_revision();
     if (!routine_str.active && same_device && generation == synced_str_generation) {
         request_summary_export();
-        return;
+        return false;
     }
     if (!routine_str.active) {
         if (!read_u32_variable("SSD", saved_day) ||
-            !read_u32_variable("ZEN", after) || after != generation) return;
+            !read_u32_variable("ZEN", after) || after != generation) return false;
         if (saved_day >= 0x1000 && saved_day < UINT16_MAX) {
-            if (!SdStorage::try_acquire(true)) return;
+            if (!SdStorage::try_acquire(true)) return false;
             uint16_t last = 0, gap = UINT16_MAX;
             const auto local = read_local_str(identity, saved_day, nullptr, last, gap);
             SdStorage::release();
             if (local == LocalStrRead::Failed) {
                 if (!post_processing_cancelled()) post_error("existing STR validation failed");
-                return;
+                return false;
             }
             const uint16_t oldest = max(uint32_t(0x1000), saved_day - min(saved_day, uint32_t(364)));
             uint16_t first = same_device ? min(uint32_t(synced_saved_day), saved_day)
@@ -3115,9 +3117,9 @@ static void sync_pending() {
     if (routine_str.active) {
         if (!refresh_str_day(routine_str.next_day, generation, identity, false,
                              "catch_up", routine_str.compare_saved ||
-                             uint32_t(routine_str.next_day) + 1 < routine_str.saved_day)) return;
+                             uint32_t(routine_str.next_day) + 1 < routine_str.saved_day)) return false;
         routine_str.files = SdStorage::files_revision();
-        if (routine_str.next_day++ < routine_str.saved_day) return;
+        if (routine_str.next_day++ < routine_str.saved_day) return true;
         saved_day = routine_str.saved_day;
         routine_str.active = false;
     }
@@ -3131,11 +3133,13 @@ static void sync_pending() {
         clear_str_collection();
         request_summary_export();
     }
+    return false;
 }
 
 static void process_pending() {
     if (status.active || post_processing_cancelled() ||
-        (next_pending_ms && int32_t(millis() - next_pending_ms) < 0)) return;
+        (next_pending_ms && int32_t(millis() - next_pending_ms) < 0) ||
+        !SdStorage::maintenance_ready()) return;
     portENTER_CRITICAL(&status_mux);
     if (clock_write_active) {
         portEXIT_CRITICAL(&status_mux);
@@ -3144,10 +3148,14 @@ static void process_pending() {
     status.post_processing = true;
     portEXIT_CRITICAL(&status_mux);
     routine_processing = false;
-    sync_pending();
+    const bool more = sync_pending();
+    const bool yielded = post_processing_cancelled();
     SdStorage::finish_maintenance();
     routine_processing = false;
-    next_pending_ms = millis() + STR_GENERATION_POLL_MS;
+    // Poll only when caught up or after a failure. Continuations use the
+    // existing recorder loop; an SD reservation waits for owner availability.
+    next_pending_ms = more || yielded || SdStorage::maintenance_pending()
+        ? 0 : millis() + STR_GENERATION_POLL_MS;
     portENTER_CRITICAL(&status_mux);
     status.post_processing = false;
     portEXIT_CRITICAL(&status_mux);

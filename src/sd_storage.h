@@ -93,6 +93,9 @@ bool try_acquire(bool reserve_next = false);
 void finish_maintenance();
 void cancel_acquire();
 bool maintenance_pending();
+// Nonblocking admission hint for the reserving owner's existing work loop.
+// A true result still requires try_acquire; it does not take the card.
+bool maintenance_ready();
 void release();
 
 class Session {

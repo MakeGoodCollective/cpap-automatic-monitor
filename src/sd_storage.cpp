@@ -723,6 +723,17 @@ bool maintenance_pending() {
 #endif
 }
 
+bool maintenance_ready() {
+#if AB_STORAGE_HAS_SDCARD
+    const TaskHandle_t waiting = __atomic_load_n(&maintenance_waiter, __ATOMIC_ACQUIRE);
+    return !waiting || (waiting == xTaskGetCurrentTaskHandle() &&
+        !__atomic_load_n(&active_session, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&direct_owner, __ATOMIC_ACQUIRE));
+#else
+    return false;
+#endif
+}
+
 void release() {
 #if AB_STORAGE_HAS_SDCARD
     Request request = {};
