@@ -23,7 +23,7 @@ uint32_t last_rop_poll = 0, last_health_poll = 0, last_mhr_poll = 0;
 uint32_t consecutive_timeouts = 0, airsense_seen_ms = 0;
 bool airsense_present = false;
 std::atomic<int> cached_rop{-1}, cached_mhr{-1}, cached_mop{-1};
-std::atomic<bool> refresh_requested{false};
+std::atomic<bool> refresh_requested{true};
 DeviceUptime::Tracker device_uptime;
 Identity device_identity;
 portMUX_TYPE identity_mux = portMUX_INITIALIZER_UNLOCKED;
