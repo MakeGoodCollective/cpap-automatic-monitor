@@ -27,7 +27,8 @@ static log_level_t cat_levels[CAT_COUNT];
 
 static constexpr size_t LOCAL_QUEUE_DEPTH = 8;
 // Network startup/reconnect can outlast several local sink drains.
-static constexpr size_t SYSLOG_QUEUE_DEPTH = 32;
+static constexpr size_t SYSLOG_QUEUE_PSRAM_DEPTH = 32;
+static constexpr size_t SYSLOG_QUEUE_INTERNAL_DEPTH = 16;
 static constexpr size_t SYSLOG_SEND_BUDGET = 4;
 static constexpr uint32_t SYSLOG_RETRY_MS = 100;
 
@@ -46,6 +47,7 @@ static size_t local_head = 0;
 static size_t local_count = 0;
 
 static SyslogRecord *syslog_queue = nullptr;
+static size_t syslog_capacity = 0;
 static size_t syslog_head = 0;
 static size_t syslog_count = 0;
 static sockaddr_in syslog_remote = {};
@@ -254,11 +256,11 @@ static void report_losses() {
         }
         portENTER_CRITICAL(&queue_mux);
         if (local_count + slots <= LOCAL_QUEUE_DEPTH &&
-            (!syslog_queue || syslog_count + slots <= SYSLOG_QUEUE_DEPTH)) {
+            (!syslog_queue || syslog_count + slots <= syslog_capacity)) {
             for (size_t i = 0; i < slots; ++i) {
                 enqueue(local_queue, LOCAL_QUEUE_DEPTH, local_head, local_count, records[i]);
                 if (syslog_queue)
-                    enqueue(syslog_queue, SYSLOG_QUEUE_DEPTH, syslog_head, syslog_count, records[i]);
+                    enqueue(syslog_queue, syslog_capacity, syslog_head, syslog_count, records[i]);
             }
             if (level == LOG_WARN) {
                 local_drops -= lost_local;
@@ -297,21 +299,30 @@ bool Log::configure_syslog(bool enabled, const char *host, uint16_t port,
         portENTER_CRITICAL(&queue_mux);
         SyslogRecord *retired = syslog_queue;
         syslog_queue = nullptr;
+        syslog_capacity = 0;
         syslog_head = syslog_count = 0;
         portEXIT_CRITICAL(&queue_mux);
         aircannect::Memory::free(retired);
     } else {
         SyslogRecord *queue = syslog_queue;
+        size_t capacity = syslog_capacity;
         if (!queue) {
+            capacity = SYSLOG_QUEUE_PSRAM_DEPTH;
             queue = static_cast<SyslogRecord *>(
                 aircannect::Memory::alloc_large(
-                    SYSLOG_QUEUE_DEPTH * sizeof(SyslogRecord)));
+                    capacity * sizeof(SyslogRecord), false));
+            if (!queue) {
+                capacity = SYSLOG_QUEUE_INTERNAL_DEPTH;
+                queue = static_cast<SyslogRecord *>(
+                    aircannect::Memory::alloc_large(capacity * sizeof(SyslogRecord)));
+            }
         }
         const bool changed = syslog_remote.sin_addr.s_addr != remote.sin_addr.s_addr ||
             syslog_remote.sin_port != remote.sin_port ||
             strcmp(syslog_hostname, name) != 0;
         portENTER_CRITICAL(&queue_mux);
         syslog_queue = queue;
+        syslog_capacity = queue ? capacity : 0;
         if (changed) syslog_head = syslog_count = 0;
         portEXIT_CRITICAL(&queue_mux);
         syslog_remote = remote;
@@ -416,7 +427,7 @@ void Log::poll() {
         } else if (syslog_queue && syslog_count &&
                    syslog_queue[syslog_head].queue_id == record.queue_id) {
             // Enqueue eviction or reconfiguration may have replaced the head.
-            syslog_head = (syslog_head + 1) % SYSLOG_QUEUE_DEPTH;
+            syslog_head = (syslog_head + 1) % syslog_capacity;
             syslog_count--;
         }
         portEXIT_CRITICAL(&queue_mux);
@@ -529,7 +540,7 @@ static void log_dispatch(log_cat_t cat, log_level_t lvl,
     portENTER_CRITICAL(&queue_mux);
     local_drops += enqueue(local_queue, LOCAL_QUEUE_DEPTH, local_head, local_count, record);
     if (syslog_queue)
-        syslog_drops += enqueue(syslog_queue, SYSLOG_QUEUE_DEPTH, syslog_head, syslog_count, record);
+        syslog_drops += enqueue(syslog_queue, syslog_capacity, syslog_head, syslog_count, record);
     portEXIT_CRITICAL(&queue_mux);
 }
 
