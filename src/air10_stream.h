@@ -27,7 +27,10 @@ struct Frame {
 // Main-loop discovery once per device identity generation, without blocking RX.
 void poll();
 
-// Read-only copies. Partial discovery and stale identity generations fail.
+// Prioritize a consumer's schema; safe outside the main-loop discovery owner.
+void request(const char *tag);
+// A recorder snapshot is complete; an individual schema is usable as soon as
+// resolved. Both reject stale identity generations.
 bool snapshot(uint32_t generation, Schema (&out)[SCHEMA_COUNT]);
 bool schema(const char *tag, Schema &out);
 

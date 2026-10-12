@@ -68,7 +68,8 @@ void release_internal(internal_handle_t h);
 bool suspend();
 bool suspend_for_ota();
 void resume();
-void resync();
+// A schema-ready notification retries only that stream, outside UART RX.
+void resync(const char *tag = nullptr);
 void reattach();
 
 // Fed by uart_arbiter rx_task on every QFRAME_TYPE_L frame.

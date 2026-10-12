@@ -328,11 +328,12 @@ void resume() {
     }
 }
 
-void resync() {
+void resync(const char *tag) {
     if (!initialized) return;
     ControlGuard guard;
     for (int i = 0; i < LIVE_STREAMS_MAX; i++) {
         if (!streams[i].in_use) continue;
+        if (tag && strcmp(streams[i].tag, tag)) continue;
         if (streams[i].ref_count > 0 &&
             (!streams[i].subscribed || streams[i].sync_pending)) {
             if (device_subscribe(i, true)) {

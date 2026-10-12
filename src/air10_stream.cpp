@@ -1,12 +1,14 @@
 #include "air10_stream.h"
 
 #include <limits.h>
+#include <atomic>
 #include <string.h>
 
 #include "airsense_state.h"
 #include "debug_log.h"
 #include "hex_util.h"
 #include "uart_arbiter.h"
+#include "live_stream.h"
 
 namespace Air10Stream {
 namespace {
@@ -15,15 +17,17 @@ constexpr const char *SCHEMA_TAGS[SCHEMA_COUNT] = {"TCE", "APN", "CSN", "PBT", "
 constexpr uint32_t RETRY_MS = 5000;
 constexpr uint16_t RESPONSE_SIZE = 160;
 
-// Five bounded layouts (230 bytes); readers only see a complete generation.
+// Publish each bounded layout independently; recording takes a complete set.
 Schema cached_schemas[SCHEMA_COUNT];
 portMUX_TYPE cache_mux = portMUX_INITIALIZER_UNLOCKED;
 uint32_t cache_generation = 0;
 bool cache_ready = false;
+uint8_t resolved_mask = 0;
+std::atomic<uint8_t> requested_mask{0};
 uint8_t next_schema = 0;
 uart_transaction_t *query_ticket = nullptr;
-uint32_t failed_at_ms = 0;
-bool query_failed = false;
+uint32_t failed_at_ms[SCHEMA_COUNT] = {};
+bool query_failed[SCHEMA_COUNT] = {};
 
 static void reset_schema(Schema &schema, const char *tag) {
     memset(&schema, 0, sizeof(schema));
@@ -151,17 +155,23 @@ bool fallback_schema(Schema &schema, const char *tag, uint16_t mid, uint16_t vid
     return set_schema(schema, tag, definition);
 }
 
+void request(const char *tag) {
+    for (uint8_t i = 0; i < SCHEMA_COUNT; ++i)
+        if (!strcmp(tag, SCHEMA_TAGS[i])) requested_mask.fetch_or(1u << i);
+}
+
 void poll() {
     const uint32_t generation = AirSenseState::identity_generation();
     if (generation != cache_generation) {
         if (query_ticket) Arbiter::cancel_transaction(query_ticket);
         query_ticket = nullptr;
         next_schema = 0;
-        query_failed = false;
+        memset(query_failed, 0, sizeof(query_failed));
         portENTER_CRITICAL(&cache_mux);
         memset(cached_schemas, 0, sizeof(cached_schemas));
         cache_generation = generation;
         cache_ready = false;
+        resolved_mask = 0;
         portEXIT_CRITICAL(&cache_mux);
     }
     if (cache_ready) return;
@@ -174,7 +184,18 @@ void poll() {
     }
     AirSenseState::Identity identity;
     if (!AirSenseState::identity(identity) || identity.generation != generation) return;
-    if (query_failed && millis() - failed_at_ms < RETRY_MS) return;
+    if (!query_ticket) {
+        int selected = -1;
+        const uint8_t demand = requested_mask.load();
+        for (uint8_t i = 0; i < SCHEMA_COUNT; ++i) {
+            if ((resolved_mask & (1u << i)) ||
+                (query_failed[i] && millis() - failed_at_ms[i] < RETRY_MS)) continue;
+            if (selected < 0 || (demand & (1u << i))) selected = i;
+            if (demand & (1u << i)) break;
+        }
+        if (selected < 0) return;
+        next_schema = selected;
+    }
 
     const char *tag = SCHEMA_TAGS[next_schema];
     Arbiter::VarReadTrace trace;
@@ -209,23 +230,25 @@ void poll() {
         // An absent optional stock stream is resolved, not a discovery failure.
         fallback_schema(resolved, tag, identity.mid, identity.vid);
     } else if (!ok || length >= sizeof(response) || !parse_schema(resolved, tag, response)) {
-        Log::logf(CAT_STREAM, query_failed ? LOG_DEBUG : LOG_WARN,
+        Log::logf(CAT_STREAM, query_failed[next_schema] ? LOG_DEBUG : LOG_WARN,
                   "%s schema failed result=%s queue=%lums sent=%u wait=%lums response=%s\n",
                   tag, ok ? "invalid_schema" : trace.outcome,
                   (unsigned long)trace.queue_ms, unsigned(trace.sent),
                   (unsigned long)trace.wait_ms, response);
-        failed_at_ms = millis();
-        query_failed = true;
+        failed_at_ms[next_schema] = millis();
+        query_failed[next_schema] = true;
         return;
     }
 
-    query_failed = false;
+    query_failed[next_schema] = false;
     portENTER_CRITICAL(&cache_mux);
-    cached_schemas[next_schema++] = resolved;
-    cache_ready = next_schema == SCHEMA_COUNT;
+    cached_schemas[next_schema] = resolved;
+    resolved_mask |= 1u << next_schema;
+    cache_ready = resolved_mask == (1u << SCHEMA_COUNT) - 1;
     portEXIT_CRITICAL(&cache_mux);
     Log::logf(CAT_STREAM, LOG_DEBUG, "%s schema from %s (%u fields)\n",
               tag, resolved.from_firmware ? "firmware" : "stock", resolved.field_count);
+    LiveStream::resync(tag);
 }
 
 bool snapshot(uint32_t generation, Schema (&out)[SCHEMA_COUNT]) {
@@ -242,7 +265,7 @@ bool schema(const char *tag, Schema &out) {
     const uint32_t generation = AirSenseState::identity_generation();
     bool found = false;
     portENTER_CRITICAL(&cache_mux);
-    if (cache_ready && cache_generation == generation) {
+    if (cache_generation == generation) {
         for (const Schema &entry : cached_schemas) {
             if (entry.field_count && !strcmp(entry.tag, tag)) {
                 out = entry;

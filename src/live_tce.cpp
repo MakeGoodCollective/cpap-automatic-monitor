@@ -9,6 +9,7 @@ const char TAG[4] = "TCE";
 const uint16_t SAMPLE_SIZE = sizeof(Sample);
 
 static bool prepare() {
+    Air10Stream::request(TAG);
     Air10Stream::Schema current;
     return Air10Stream::schema(TAG, current);
 }
