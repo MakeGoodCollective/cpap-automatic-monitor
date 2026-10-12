@@ -148,6 +148,7 @@ static bool recording_storage_owned = false;
 static uint32_t next_pending_ms = 0;
 static bool pending_scanned = false;
 static bool clock_write_active = false;
+static uint32_t clock_write_generation = 0;
 static bool routine_processing = false;
 static const char *pending_scan_error = nullptr;
 static uint32_t synced_device_generation = 0;
@@ -705,34 +706,44 @@ static bool ensure_identification(const AirSenseState::Identity &identity) {
     return success;
 }
 
-static bool fetch_str_record(uint8_t *record, size_t capacity,
+struct StrReadCursor {
+    Air10Stored::Value date = {}, mask_events = {}, duration = {};
+    bool date_read = false, mask_events_read = false, duration_read = false;
+    bool compared = false, unchanged = false;
+    int16_t *samples = nullptr;
+    size_t offset = 0;
+    uint8_t signal = 0;
+};
+
+static bool fetch_str_record(uint8_t *record, size_t capacity, StrReadCursor &cursor,
                               const Air10Stored::Value *date = nullptr,
-                              const Air10Stored::Value *mask_events = nullptr,
-                              const Air10Stored::Value *duration = nullptr) {
+                              const Air10Stored::Value *mask_events = nullptr) {
     const Air10Edf::Schema &schema = Air10Edf::str_schema();
     const size_t sample_count = Air10Edf::numeric_sample_count(schema);
-    int16_t *samples = static_cast<int16_t *>(
-        aircannect::Memory::alloc_large(sample_count * sizeof(int16_t)));
+    auto &samples = cursor.samples;
+    if (!samples) {
+        samples = static_cast<int16_t *>(aircannect::Memory::alloc_large(sample_count * sizeof(int16_t)));
+        if (samples) memset(samples, 0xFF, sample_count * sizeof(int16_t));
+    }
     if (!samples) {
         post_error("STR sample allocation failed");
         return false;
     }
-    memset(samples, 0xFF, sample_count * sizeof(int16_t));
-
-    Air10Stored::Value therapy_duration = {};
-    if (duration) therapy_duration = *duration;
-    if ((!duration && !read_stored_value("THD", session_native_day, therapy_duration)) ||
+    auto &therapy_duration = cursor.duration;
+    if (!cursor.duration_read)
+        cursor.duration_read = read_stored_value("THD", session_native_day, therapy_duration);
+    if (!cursor.duration_read ||
         !therapy_duration.present || therapy_duration.sample_count != 1) {
-        aircannect::Memory::free(samples);
-        post_error("STR duration unavailable");
+        cursor.duration_read = false;
+        if (!post_processing_cancelled()) post_error("STR duration unavailable");
         return false;
     }
 
-    size_t offset = 0;
+    auto &offset = cursor.offset;
     bool complete = true;
     const char *failed_tag = "";
     const char *failure = "render failed";
-    for (uint8_t signal = 0; signal + 1 < schema.signal_count; signal++) {
+    for (auto &signal = cursor.signal; signal + 1 < schema.signal_count; signal++) {
         if (post_processing_cancelled()) {
             complete = false;
             break;
@@ -800,7 +811,6 @@ static bool fetch_str_record(uint8_t *record, size_t capacity,
         Air10Edf::render_numeric_record(schema, samples, sample_count,
                                         record, capacity, written) &&
         written == Air10Edf::record_size(schema);
-    aircannect::Memory::free(samples);
     if (!rendered && !post_processing_cancelled()) {
         char error[96];
         snprintf(error, sizeof(error), "STR day=%04X tag=%s: %s",
@@ -1282,31 +1292,33 @@ struct StrReadTrace {
 };
 
 static bool collect_str_summary(uint8_t *&record, uint32_t generation,
-                                StrReadTrace &trace, bool compare_saved,
+                                StrReadTrace &trace, StrReadCursor &cursor, bool compare_saved,
                                 const AirSenseState::Identity &identity) {
-    record = nullptr;
     trace.result = "read_failed";
-    Air10Stored::Value date = {};
-    if (!read_stored_value("LSD", session_native_day, date)) return false;
+    auto &date = cursor.date;
+    if (!cursor.date_read) cursor.date_read = read_stored_value("LSD", session_native_day, date);
+    if (!cursor.date_read) return false;
     if (date.present) {
         if (date.sample_count != 1 || uint16_t(date.samples[0]) != session_native_day) {
+            cursor.date_read = false;
             trace.result = "date_mismatch";
             return false;
         }
         const size_t record_size =
             Air10Edf::record_size(Air10Edf::str_schema());
-        record = static_cast<uint8_t *>(aircannect::Memory::alloc_large(record_size));
+        if (!record) record = static_cast<uint8_t *>(aircannect::Memory::alloc_large(record_size));
         if (!record) {
             trace.result = "no_memory";
             post_error("STR record allocation failed");
             return false;
         }
-        Air10Stored::Value mask_events = {};
-        Air10Stored::Value duration = {};
-        bool duration_read = false;
-        bool unchanged = false;
-        if (compare_saved) {
-            if (!read_stored_value("MSE", session_native_day, mask_events)) return false;
+        auto &mask_events = cursor.mask_events;
+        auto &duration = cursor.duration;
+        auto &unchanged = cursor.unchanged;
+        if (compare_saved && !cursor.compared) {
+            if (!cursor.mask_events_read)
+                cursor.mask_events_read = read_stored_value("MSE", session_native_day, mask_events);
+            if (!cursor.mask_events_read) return false;
             if (!SdStorage::try_acquire()) { trace.result = "storage_busy"; return false; }
             uint16_t last = 0, gap = 0;
             const auto local = read_local_str(identity, session_native_day, record, last, gap);
@@ -1326,14 +1338,15 @@ static bool collect_str_summary(uint8_t *&record, uint32_t generation,
                     uint16_t(mask_events.samples[0]) == UINT16_MAX)) &&
                 local == LocalStrRead::Ready && str_scalar(record, "THD") == 0 &&
                 str_scalar(record, "MSE") == UINT16_MAX) {
-                if (!read_stored_value("THD", session_native_day, duration)) return false;
-                duration_read = true;
+                if (!cursor.duration_read)
+                    cursor.duration_read = read_stored_value("THD", session_native_day, duration);
+                if (!cursor.duration_read) return false;
                 unchanged = duration.present && duration.sample_count == 1 && duration.samples[0] == 0;
             }
+            cursor.compared = true;
         }
-        if (!unchanged && !fetch_str_record(record, record_size, &date,
-                                             compare_saved ? &mask_events : nullptr,
-                                             duration_read ? &duration : nullptr)) return false;
+        if (!unchanged && !fetch_str_record(record, record_size, cursor, &date,
+                                             compare_saved ? &mask_events : nullptr)) return false;
         if (unchanged) trace.result = "unchanged";
     }
     trace.generation_read = read_u32_variable("ZEN", trace.generation);
@@ -2778,14 +2791,17 @@ static void stop_session(const ControlEvent &event) {
 struct StrCollected {
     uint16_t day = 0;
     uint32_t device = 0, generation = 0, files = 0;
+    uint32_t clock = 0;
     uint8_t *record = nullptr;
     StrReadTrace trace;
+    StrReadCursor cursor;
     bool ready = false;
 };
 static StrCollected str_collected;
 
 static void clear_str_collection() {
     aircannect::Memory::free(str_collected.record);
+    aircannect::Memory::free(str_collected.cursor.samples);
     str_collected = {};
 }
 
@@ -2821,7 +2837,8 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
 
     session_native_day = day;
     if (str_collected.day != day || str_collected.device != identity.generation ||
-        str_collected.generation != generation || str_collected.files != SdStorage::files_revision())
+        str_collected.generation != generation || str_collected.files != SdStorage::files_revision() ||
+        str_collected.clock != __atomic_load_n(&clock_write_generation, __ATOMIC_ACQUIRE))
         clear_str_collection();
     auto &trace = str_collected.trace;
     auto &record = str_collected.record;
@@ -2829,13 +2846,13 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
     bool success = ensure_identification(identity);
     const bool read_attempted = success && !str_collected.ready;
     if (read_attempted) {
-        clear_str_collection();
         str_collected.day = day;
         str_collected.device = identity.generation;
         str_collected.generation = generation;
         str_collected.files = SdStorage::files_revision();
+        str_collected.clock = __atomic_load_n(&clock_write_generation, __ATOMIC_ACQUIRE);
         str_collected.ready = collect_str_summary(record, generation, trace,
-                                                  compare_saved && !required, identity);
+                                                  str_collected.cursor, compare_saved && !required, identity);
     }
     bool summary_ready = success && str_collected.ready;
     if (summary_ready && !read_attempted) {
@@ -2937,7 +2954,7 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
               (unsigned long)read_ms,
               (unsigned long)(snapshot_ms + millis() - publish_started));
     aircannect::Memory::free(entries);
-    if (!str_collected.ready) clear_str_collection();
+    if (trace.generation_read && trace.generation != generation) clear_str_collection();
     if (success && summary_ready && post_error_active) {
         post_error_active = false;
         Log::logf(CAT_EDF, LOG_INFO, "STR processing recovered day=%04X\n", day);
@@ -3193,6 +3210,7 @@ static void poll_recording_state() {
 
 static void recorder_task(void *) {
     while (true) {
+        if (str_collected.day && !AirSenseState::device_standby()) clear_str_collection();
         if (!SdStorage::local_access_allowed()) {
             clear_str_collection();
             routine_str = {};
@@ -3363,6 +3381,7 @@ bool begin_clock_write(const char **reason) {
 
 void end_clock_write() {
     portENTER_CRITICAL(&status_mux);
+    __atomic_add_fetch(&clock_write_generation, 1, __ATOMIC_RELEASE);
     clock_write_active = false;
     portEXIT_CRITICAL(&status_mux);
 }
