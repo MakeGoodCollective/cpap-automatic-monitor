@@ -84,8 +84,12 @@ void notify_files_changed();
 // Recorder/recovery only. Waits for current local I/O, never for a network
 // consumer; acquisition invalidates all previously admitted background work.
 bool acquire();
-// Maintenance never revokes an auxiliary session.
-bool try_acquire();
+// Maintenance never revokes an auxiliary session. reserve_next keeps the next
+// free slot for this caller after a miss, until acquisition or cancel_acquire.
+// Existing sessions remain valid so cooperative workers can checkpoint first.
+bool try_acquire(bool reserve_next = false);
+void cancel_acquire();
+bool maintenance_pending();
 void release();
 
 class Session {

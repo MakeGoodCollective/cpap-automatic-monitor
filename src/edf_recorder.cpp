@@ -680,7 +680,7 @@ static bool write_identification(const uint8_t *content, size_t content_len) {
 }
 
 static bool ensure_identification(const AirSenseState::Identity &identity) {
-    if (!SdStorage::try_acquire()) return false;
+    if (!SdStorage::try_acquire(true)) return false;
     const bool current = identification_verified && identification_device == identity.generation &&
         storage->exists("/Identification.tgt") && storage->exists("/Identification.crc");
     SdStorage::release();
@@ -691,7 +691,7 @@ static bool ensure_identification(const AirSenseState::Identity &identity) {
     bool success = collect_identification(identity, content, size) &&
         !post_processing_cancelled() &&
         identity.generation == AirSenseState::identity_generation();
-    if (success && SdStorage::try_acquire()) {
+    if (success && SdStorage::try_acquire(true)) {
         success = write_identification(content, size);
         SdStorage::release();
         if (success) {
@@ -1319,7 +1319,7 @@ static bool collect_str_summary(uint8_t *&record, uint32_t generation,
             if (!cursor.mask_events_read)
                 cursor.mask_events_read = read_stored_value("MSE", session_native_day, mask_events);
             if (!cursor.mask_events_read) return false;
-            if (!SdStorage::try_acquire()) { trace.result = "storage_busy"; return false; }
+            if (!SdStorage::try_acquire(true)) { trace.result = "storage_busy"; return false; }
             uint16_t last = 0, gap = 0;
             const auto local = read_local_str(identity, session_native_day, record, last, gap);
             SdStorage::release();
@@ -2816,7 +2816,7 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
              date.tm_year + 1900, date.tm_mon + 1, date.tm_mday);
 
     const uint32_t snapshot_started = millis();
-    if (!SdStorage::try_acquire()) return false;
+    if (!SdStorage::try_acquire(true)) return false;
     EdfCatalog::Entry *entries = nullptr;
     uint32_t count = 0;
     const bool valid = EdfCatalog::snapshot_day(day_text, entries, count);
@@ -2870,7 +2870,7 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
     if (post_processing_cancelled()) trace.result = "interrupted";
     success = success && !post_processing_cancelled() &&
         identity.generation == AirSenseState::identity_generation();
-    if (success && SdStorage::try_acquire()) {
+    if (success && SdStorage::try_acquire(true)) {
         uint32_t revision = 0;
         bool catalog_changed = false;
         if (summary_ready && record) {
@@ -2896,7 +2896,11 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
             entry.flags |= EdfCatalog::ENTRY_IDENTIFICATION_READY;
             if (summary_ready && record) {
                 entry.flags |= EdfCatalog::ENTRY_STR_READY;
-                if (i == latest_index) entry.str_revision = revision;
+                // An old token may include older Identification metadata.
+                // Do not invalidate reports/exports merely by checking a day.
+                // Pending intent still repairs a reset between STR and catalog.
+                if (i == latest_index && (file_changed || required ||
+                    !(old_flags & EdfCatalog::ENTRY_STR_READY))) entry.str_revision = revision;
             }
             if (old_flags != entry.flags || old_revision != entry.str_revision) {
                 success = EdfCatalog::commit(entry);
@@ -3038,7 +3042,7 @@ static RoutineStrPass routine_str;
 static void sync_pending() {
     EdfPending::Record selected;
     if (!pending_scanned || status.pending_str) {
-        if (!SdStorage::try_acquire()) return;
+        if (!SdStorage::try_acquire(true)) return;
         const bool scanned = scan_pending(&selected);
         SdStorage::release();
         if (!scanned) return;
@@ -3067,7 +3071,9 @@ static void sync_pending() {
     if (post_processing_cancelled()) return;
 
     // SD contention must not cause a ZEN/SSD probe loop before any useful work.
-    if (!SdStorage::try_acquire()) return;
+    const bool catch_up_pending = routine_str.active || !have_synced_generation ||
+        synced_device_generation != identity.generation || synced_files_revision != SdStorage::files_revision();
+    if (!SdStorage::try_acquire(catch_up_pending)) return;
     SdStorage::release();
     const uint32_t device = identity.generation;
     uint32_t generation = 0, saved_day = 0, after = 0;
@@ -3087,7 +3093,7 @@ static void sync_pending() {
         if (!read_u32_variable("SSD", saved_day) ||
             !read_u32_variable("ZEN", after) || after != generation) return;
         if (saved_day >= 0x1000 && saved_day < UINT16_MAX) {
-            if (!SdStorage::try_acquire()) return;
+            if (!SdStorage::try_acquire(true)) return;
             uint16_t last = 0, gap = UINT16_MAX;
             const auto local = read_local_str(identity, saved_day, nullptr, last, gap);
             SdStorage::release();
@@ -3210,6 +3216,9 @@ static void poll_recording_state() {
 
 static void recorder_task(void *) {
     while (true) {
+        if (post_processing_cancelled() || (!status.pending_str &&
+            (Air10Clock::background_work_pending() || Air10Stream::requested_pending())))
+            SdStorage::cancel_acquire();
         if (str_collected.day && !AirSenseState::device_standby()) clear_str_collection();
         if (!SdStorage::local_access_allowed()) {
             clear_str_collection();

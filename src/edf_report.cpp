@@ -429,7 +429,7 @@ bool aborted(const Job *job, const SdStorage::Session &session) {
     static uint32_t batch_us = 0;
     const uint32_t now = micros();
     if (uint32_t(now - batch_us) >= 4000) { vTaskDelay(1); batch_us = micros(); }
-    if (__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE)) {
+    if (__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) || SdStorage::maintenance_pending()) {
         if (job) job->artifact_preempted = true;
         return true;
     }

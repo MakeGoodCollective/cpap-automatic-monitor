@@ -61,6 +61,7 @@ QueueHandle_t requests = nullptr;
 uint32_t generation = 1;
 uint32_t active_session = 0;
 uint32_t recorder_waiting = 0;
+TaskHandle_t maintenance_waiter = nullptr;
 TaskHandle_t worker = nullptr;
 TaskHandle_t direct_owner = nullptr;
 Request wake_request = {};
@@ -159,7 +160,7 @@ void process_request(Request &value) {
         done(result == ESP_OK);
 #endif
     } else if (request->kind == Request::Begin) {
-        if (!direct_owner && !active_session && mounted() && background_allowed()) {
+        if (!direct_owner && !active_session && !maintenance_pending() && mounted() && background_allowed()) {
             if (++generation == 0) ++generation;
             __atomic_store_n(&active_session, generation, __ATOMIC_RELEASE);
             request->generation = generation;
@@ -666,6 +667,7 @@ bool acquire() {
     Request request = {};
     request.kind = Request::Acquire;
     const bool taken = dispatch(request, true);
+    cancel_acquire();
     __atomic_sub_fetch(&recorder_waiting, 1, __ATOMIC_ACQ_REL);
     return taken;
 #else
@@ -673,11 +675,38 @@ bool acquire() {
 #endif
 }
 
-bool try_acquire() {
+bool try_acquire(bool reserve_next) {
 #if AB_STORAGE_HAS_SDCARD
+    const TaskHandle_t caller = xTaskGetCurrentTaskHandle();
+    const TaskHandle_t waiting = __atomic_load_n(&maintenance_waiter, __ATOMIC_ACQUIRE);
+    if (waiting && waiting != caller) return false;
+    if (reserve_next) {
+        TaskHandle_t expected = nullptr;
+        if (!__atomic_compare_exchange_n(&maintenance_waiter, &expected, caller,
+            false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && expected != caller) return false;
+    }
     Request request = {};
     request.kind = Request::TryAcquire;
-    return dispatch(request, false);
+    const bool taken = dispatch(request, false);
+    if (taken || !local_access_allowed() || !mounted()) cancel_acquire();
+    return taken;
+#else
+    (void)reserve_next;
+    return false;
+#endif
+}
+
+void cancel_acquire() {
+#if AB_STORAGE_HAS_SDCARD
+    TaskHandle_t expected = xTaskGetCurrentTaskHandle();
+    __atomic_compare_exchange_n(&maintenance_waiter, &expected, nullptr,
+        false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+#endif
+}
+
+bool maintenance_pending() {
+#if AB_STORAGE_HAS_SDCARD
+    return __atomic_load_n(&maintenance_waiter, __ATOMIC_ACQUIRE) != nullptr;
 #else
     return false;
 #endif
