@@ -212,6 +212,28 @@ static uart_transaction_t* pq_pop(TickType_t wait) {
             if (candidate->send_window.outside_acquisition)
                 delay_us = max(delay_us, int64_t(acquisition_remaining_ms()) * 1000);
             const uint32_t queue_left = transaction_remaining_ms(candidate);
+            if (queue_left && !__atomic_load_n(&candidate->cancelled, __ATOMIC_ACQUIRE)) {
+                // Do not start non-preemptible work across an admitted TX window.
+                // Higher-priority safety work may still cause a window to miss.
+                const int64_t wire_us = current_baud
+                    ? (int64_t(candidate->frame_len) * 10000000 + current_baud - 1) / current_baud : 0;
+                const int64_t busy_us = wire_us +
+                    int64_t(candidate->policy.response_timeout_ms + portTICK_PERIOD_MS) * 1000;
+                for (int j = 0; j < pq.count; ++j) {
+                    const auto *reserved = pq.tickets[j];
+                    if (reserved == candidate || !reserved->send_window.before_us ||
+                        (candidate->send_window.before_us &&
+                         candidate->send_window.before_us <= reserved->send_window.before_us) ||
+                        reserved->send_window.before_us <= now_us ||
+                        reserved->priority < candidate->priority ||
+                        (reserved->send_window.idle_only && sys_state != SYS_IDLE) ||
+                        __atomic_load_n(&reserved->cancelled, __ATOMIC_ACQUIRE) ||
+                        !transaction_remaining_ms(reserved)) continue;
+                    const int64_t edge = reserved->send_window.not_before_us;
+                    if (edge > now_us && now_us + busy_us >= edge)
+                        delay_us = max(delay_us, edge - now_us);
+                }
+            }
             if (delay_us > 0 && !__atomic_load_n(&candidate->cancelled, __ATOMIC_ACQUIRE) &&
                 queue_left) {
                 const int64_t tick_us = int64_t(portTICK_PERIOD_MS) * 1000;
@@ -219,10 +241,14 @@ static uart_transaction_t* pq_pop(TickType_t wait) {
                 remaining = min(remaining, TickType_t((delay_us + tick_us - 1) / tick_us));
                 continue;
             }
-            // Highest eligible priority wins, then FIFO. Future work does not reserve UART.
+            // At equal priority, an open TX window precedes ordinary FIFO work.
+            const bool timed = candidate->send_window.before_us != 0;
+            const bool best_timed = best >= 0 && pq.tickets[best]->send_window.before_us != 0;
             if (best < 0 || candidate->priority > pq.tickets[best]->priority ||
                 (candidate->priority == pq.tickets[best]->priority &&
-                 candidate->ticket_id < pq.tickets[best]->ticket_id)) best = i;
+                 ((timed && !best_timed) || (timed == best_timed &&
+                  (timed ? candidate->send_window.before_us < pq.tickets[best]->send_window.before_us
+                         : candidate->ticket_id < pq.tickets[best]->ticket_id))))) best = i;
         }
         if (best >= 0) {
             auto *t = pq.tickets[best];

@@ -30,6 +30,7 @@ static bool clock_sync_settling = false;
 static uint32_t clock_sync_therapy_end_ms = 0;
 static uint32_t clock_sync_attempt_ms = 0;
 static bool clock_sync_attempted = false;
+static uint8_t clock_sync_window_retries = 0;
 static uart_transaction_t *clock_sync_ticket = nullptr;
 static time_t clock_sync_target = 0;
 static int64_t clock_sync_edge_us = 0;
@@ -431,7 +432,10 @@ static bool finish_clock_sync() {
     bool ok = Arbiter::finish_cmd(clock_sync_ticket, response, &length, &result, &trace);
     clock_sync_ticket = nullptr;
     if (result.send_window_missed) {
-        Log::logf(CAT_TIME, LOG_DEBUG, "ResMed clock TX window missed; will retry\n");
+        const bool retry_edge = clock_sync_window_retries++ < 2;
+        if (retry_edge) clock_sync_attempted = false;
+        Log::logf(CAT_TIME, LOG_DEBUG, "ResMed clock TX window missed; retry=%s\n",
+                  retry_edge ? "next edge" : "backoff");
         return false;
     }
     Log::logf(CAT_TIME, LOG_DEBUG,
@@ -508,6 +512,7 @@ static void handle_clock_sync() {
                             (clock_sync_pending && clock_sync_manual);
         clock_sync_pending = true;
         clock_sync_attempted = false;
+        clock_sync_window_retries = 0;
     }
     if (!clock_sync_pending) return;
     const bool disabled = !auto_enabled && !clock_sync_manual;
@@ -530,6 +535,7 @@ static void handle_clock_sync() {
         return;
     }
     if (clock_sync_attempted && millis() - clock_sync_attempt_ms < 30000) return;
+    if (clock_sync_attempted) clock_sync_window_retries = 0;
     static const char *last_blocked = nullptr;
     const char *blocked = nullptr;
     if (!EdfRecorder::begin_clock_write(&blocked)) {

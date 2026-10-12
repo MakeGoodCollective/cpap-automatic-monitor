@@ -60,7 +60,9 @@ typedef struct {
     int32_t send_lateness_us;
 } uart_transaction_result_t;
 
-// Optional monotonic (esp_timer) TX window; zero disables scheduling.
+// Optional monotonic (esp_timer) TX window; zero disables scheduling. Pending
+// windows reserve response-budget clearance from equal/lower-priority work.
+// Already active transactions and higher-priority work are not preempted.
 struct uart_send_window_t {
     int64_t not_before_us = 0;
     int64_t before_us = 0;
