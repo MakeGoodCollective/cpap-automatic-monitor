@@ -2854,6 +2854,26 @@ function reportArtifactValue(channel, time) {
   return null;
 }
 
+function reportTimeTicks(view, width) {
+  const span = view[1]-view[0], day = 86400000;
+  const spacing = span >= day ? 120 : 90;
+  const rough = span/Math.max(3,Math.floor(width/spacing));
+  const seconds = [0.1,0.2,0.5,1,2,5,10,15,30,60,120,300,600,900,1800,
+    3600,7200,10800,21600,43200,86400];
+  const step = (seconds.find(s => s*1000 >= rough) || Math.ceil(rough/day)*86400)*1000;
+  const ticks = [];
+  // Published timestamps encode device wall time; never apply browser timezone.
+  for (let time = Math.ceil(view[0]/step)*step; time <= view[1]; time += step) {
+    const text = reportTime(time);
+    const label = step < 1000 ? new Date(time).toISOString().slice(11,23)
+      : step < 60000 ? text.slice(11,19)
+      : step >= day ? text.slice(5,10)
+      : span >= day ? text.slice(5,16) : text.slice(11,16);
+    ticks.push({time,label});
+  }
+  return ticks;
+}
+
 function drawEdfChart(canvas, channel, data, color) {
   const {ctx,W,H} = prepareReportCanvas(canvas);
   const members = (Array.isArray(channel) ? channel : [channel]).filter(Boolean);
@@ -2883,13 +2903,15 @@ function drawEdfChart(canvas, channel, data, color) {
     for (const segment of member.segments || []) drawArtifactSegment(ctx,segment,x,y,member.id === 'Flow');
   }
   drawReportEventMarkers(ctx,data?.events,view,x,pad,gh,members.length > 0);
-  ctx.restore(); ctx.fillStyle = '#9aa0b5';
-  const ticks = W < 480 ? 2 : 4;
-  for (let i = 0; i <= ticks; i++) {
-    const time = view[0]+(view[1]-view[0])*i/ticks;
-    ctx.textAlign = i === 0 ? 'left' : i === ticks ? 'right' : 'center';
-    const text = reportTime(time);
-    ctx.fillText(view[1]-view[0] >= 86400000 ? text.slice(5,16) : text.slice(11,19),x(time),H-5);
+  ctx.restore(); ctx.fillStyle = '#9aa0b5'; ctx.strokeStyle = '#50546b';
+  ctx.textAlign = 'center';
+  let lastLabelRight = -Infinity;
+  for (const {time,label} of reportTimeTicks(view,gw)) {
+    const at = x(time), half = ctx.measureText(label).width/2;
+    ctx.beginPath(); ctx.moveTo(at,H-pad.b); ctx.lineTo(at,H-pad.b+4); ctx.stroke();
+    if (at-half < 0 || at+half > W || at-half < lastLabelRight+8) continue;
+    ctx.fillText(label,at,H-5);
+    lastLabelRight = at+half;
   }
 }
 
