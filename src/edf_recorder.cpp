@@ -3145,6 +3145,7 @@ static void process_pending() {
     portEXIT_CRITICAL(&status_mux);
     routine_processing = false;
     sync_pending();
+    SdStorage::finish_maintenance();
     routine_processing = false;
     next_pending_ms = millis() + STR_GENERATION_POLL_MS;
     portENTER_CRITICAL(&status_mux);

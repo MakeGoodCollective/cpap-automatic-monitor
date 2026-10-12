@@ -62,6 +62,7 @@ uint32_t generation = 1;
 uint32_t active_session = 0;
 uint32_t recorder_waiting = 0;
 TaskHandle_t maintenance_waiter = nullptr;
+bool maintenance_granted = false;
 TaskHandle_t worker = nullptr;
 TaskHandle_t direct_owner = nullptr;
 Request wake_request = {};
@@ -688,7 +689,9 @@ bool try_acquire(bool reserve_next) {
     Request request = {};
     request.kind = Request::TryAcquire;
     const bool taken = dispatch(request, false);
-    if (taken || !local_access_allowed() || !mounted()) cancel_acquire();
+    if (taken && __atomic_load_n(&maintenance_waiter, __ATOMIC_ACQUIRE) == caller)
+        __atomic_store_n(&maintenance_granted, true, __ATOMIC_RELEASE);
+    if (!local_access_allowed() || !mounted()) cancel_acquire();
     return taken;
 #else
     (void)reserve_next;
@@ -696,9 +699,17 @@ bool try_acquire(bool reserve_next) {
 #endif
 }
 
+void finish_maintenance() {
+#if AB_STORAGE_HAS_SDCARD
+    if (__atomic_load_n(&maintenance_granted, __ATOMIC_ACQUIRE)) cancel_acquire();
+#endif
+}
+
 void cancel_acquire() {
 #if AB_STORAGE_HAS_SDCARD
     TaskHandle_t expected = xTaskGetCurrentTaskHandle();
+    if (__atomic_load_n(&maintenance_waiter, __ATOMIC_ACQUIRE) != expected) return;
+    __atomic_store_n(&maintenance_granted, false, __ATOMIC_RELEASE);
     __atomic_compare_exchange_n(&maintenance_waiter, &expected, nullptr,
         false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 #endif

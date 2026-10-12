@@ -85,9 +85,12 @@ void notify_files_changed();
 // consumer; acquisition invalidates all previously admitted background work.
 bool acquire();
 // Maintenance never revokes an auxiliary session. reserve_next keeps the next
-// free slot for this caller after a miss, until acquisition or cancel_acquire.
+// free slot for this caller after a miss, through all steps of its maintenance
+// pass. finish_maintenance releases an admitted pass; an ungranted reservation
+// remains for retry. cancel_acquire abandons it even before admission.
 // Existing sessions remain valid so cooperative workers can checkpoint first.
 bool try_acquire(bool reserve_next = false);
+void finish_maintenance();
 void cancel_acquire();
 bool maintenance_pending();
 void release();
