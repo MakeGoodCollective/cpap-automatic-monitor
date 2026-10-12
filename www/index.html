@@ -2589,7 +2589,7 @@ function presentReportChannels(data) {
           });
           head.append(legend);
         }
-        const canvas = document.createElement('canvas'); canvas.height = 120;
+        const canvas = document.createElement('canvas'); canvas.height = 220;
         canvas.setAttribute('aria-label', group.map(c => c.label).join(', ') + ' EDF plot'); canvas.tabIndex = 0;
         card.append(head,canvas); plots.append(card);
         bindReportPlot(canvas);
@@ -2698,17 +2698,18 @@ function reportAxes(channels, view) {
       : channel.unit === 'mL' ? 200 : id === 'flow' || id === 'pulse' ? 20
       : id === 'leak' || channel.unit === 'bpm' ? 10 : channel.unit === 'L/min' ? 5 : 1;
     if (!Number.isFinite(low)) { low = channel.unit === '%' ? 95 : 0; high = id === 'flow' ? 0 : low+minimum; }
-    const center = (low+high)/2, span = Math.max(minimum,(high-low)*1.16);
-    low = center-span/2; high = center+span/2;
     if (id === 'flow') {
-      const extent = Math.max(Math.abs(low),Math.abs(high),minimum/2);
-      const power = 10**Math.floor(Math.log10(extent/2)), quantum = power/2;
-      // Fine bounds retain padding without rounding to the coarser major ticks.
+      // Pad the symmetric extent once, independently of the major ticks.
+      const extent = Math.max(Math.max(Math.abs(low),Math.abs(high))*1.08,minimum/2);
+      const quantum = 10**Math.floor(Math.log10(extent))/5;
       high = Math.ceil(extent/quantum)*quantum; low = -high;
+      const power = 10**Math.floor(Math.log10(high/2));
       const step = [10,5,2.5,2,1].find(n => n*power <= high/2)*power;
       axes[channel.id] = {low,high,step};
       continue;
     }
+    const center = (low+high)/2, span = Math.max(minimum,(high-low)*1.16);
+    low = center-span/2; high = center+span/2;
     if (low < 0) { high -= low; low = 0; }
     if (channel.unit === '%' && high > 100) { low = Math.max(0,low-(high-100)); high = 100; }
     const rough = (high-low)/4, power = 10**Math.floor(Math.log10(rough));
@@ -2864,11 +2865,12 @@ function drawEdfChart(canvas, channel, data, color) {
     || reportAxes(data?.channels || [],view)[firstChannel?.id] || {low:0,high:1,step:0.25};
   const y = value => pad.t + gh*(1-(value-low)/(high-low));
   ctx.clearRect(0,0,W,H); ctx.fillStyle = '#08081a'; ctx.fillRect(0,0,W,H);
-  ctx.font = '10px sans-serif'; ctx.lineWidth = 1;
-  ctx.strokeStyle = '#1a1a3a'; ctx.fillStyle = '#777'; ctx.textAlign = 'right';
-  ctx.setLineDash([2,4]);
+  ctx.font = '11px sans-serif'; ctx.lineWidth = 1;
+  ctx.fillStyle = '#9aa0b5'; ctx.textAlign = 'right';
   for (let i = Math.floor(high/step); members.length && i >= Math.ceil(low/step); i--) {
     const v = step*i, yy = y(v);
+    ctx.strokeStyle = v === 0 ? '#50546b' : '#25283d';
+    ctx.setLineDash(v === 0 ? [] : [2,4]);
     ctx.beginPath(); ctx.moveTo(pad.l,yy); ctx.lineTo(W-pad.r,yy); ctx.stroke();
     ctx.fillText(reportNumber(v),pad.l-4,yy+3);
   }
@@ -2881,7 +2883,7 @@ function drawEdfChart(canvas, channel, data, color) {
     for (const segment of member.segments || []) drawArtifactSegment(ctx,segment,x,y,member.id === 'Flow');
   }
   drawReportEventMarkers(ctx,data?.events,view,x,pad,gh,members.length > 0);
-  ctx.restore(); ctx.fillStyle = '#777';
+  ctx.restore(); ctx.fillStyle = '#9aa0b5';
   const ticks = W < 480 ? 2 : 4;
   for (let i = 0; i <= ticks; i++) {
     const time = view[0]+(view[1]-view[0])*i/ticks;
