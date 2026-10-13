@@ -358,9 +358,13 @@ static bool clock_write_applied(const char *command, bool ok, const char *respon
 
     const bool rejected = !ok && response[0];
     if (rejected) clock_sync_pending = false;
-    Log::logf(CAT_TIME, LOG_WARN, "ResMed clock write %s: %s -> %s\n",
-              rejected ? "rejected (use TIMESYNC to retry)" : "not applied; will retry",
-              command, response[0] ? response : "timeout");
+    Log::logf(CAT_TIME, LOG_WARN, "ResMed clock %s write %s\n",
+              strncmp(command, "P S #DAC ", 9) == 0 ? "date" : "time",
+              rejected ? "rejected; use TIMESYNC to retry" :
+              !ok ? "failed without a response; will retry" :
+              value ? "not applied; will retry" : "not confirmed; will retry");
+    Log::logf(CAT_TIME, LOG_DEBUG, "Clock write request=%s response=%s\n",
+              command, response[0] ? response : "none");
     if (ok && value && Log::get_cat_level(CAT_TIME) >= LOG_DEBUG) {
         // Native setters may leave the value unchanged despite an R reply.
         // Observe their state guards after refusal, without inferring a cause.

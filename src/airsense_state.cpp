@@ -128,7 +128,7 @@ static void accept_read(const char *text, Arbiter::VarResult result,
             break;
         case ReadStep::Stk:
             if (ok && DeviceUptime::parse(text, raw) && device_uptime.observe(raw, millis())) {
-                Log::logf(CAT_HEALTH, LOG_INFO, "AirSense restart detected by STK\n");
+                Log::logf(CAT_HEALTH, LOG_INFO, "AirSense restart detected\n");
                 invalidate_identity();
                 Air10Clock::invalidate();
                 CustomSettings::invalidate("STK reset");

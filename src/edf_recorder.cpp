@@ -2947,21 +2947,22 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
         snprintf(after, sizeof(after), "%lu", (unsigned long)trace.generation);
     const bool interrupted = post_processing_cancelled();
     if (interrupted) trace.result = "interrupted";
-    const bool unchanged = success && summary_ready &&
-        !identification_changed && !ready_changed && !content_changed && !file_changed;
-    Log::logf(CAT_EDF, read_attempted && !interrupted && !unchanged ? LOG_INFO : LOG_DEBUG,
-              "STR %s %s ZEN=%lu>%s %s "
-              "ident+=%u ready+=%u token=%u file=%u read=%lu sd=%lums\n",
-              day_text, reason, (unsigned long)generation, after, trace.result,
-              unsigned(identification_changed), unsigned(ready_changed), unsigned(content_changed),
-              unsigned(file_changed),
+    Log::logf(CAT_EDF, LOG_DEBUG,
+              "STR refresh day=%.4s-%.2s-%.2s source=%s result=%s read=%lums sd=%lums\n",
+              day_text, day_text + 4, day_text + 6, reason, trace.result,
               (unsigned long)read_ms,
               (unsigned long)(snapshot_ms + millis() - publish_started));
+    Log::logf(CAT_EDF, LOG_DEBUG,
+              "STR changes day=%.4s-%.2s-%.2s ZEN=%lu->%s identification=%u ready=%u revision=%u file=%u\n",
+              day_text, day_text + 4, day_text + 6, (unsigned long)generation, after,
+              unsigned(identification_changed), unsigned(ready_changed), unsigned(content_changed),
+              unsigned(file_changed));
     aircannect::Memory::free(entries);
     if (trace.generation_read && trace.generation != generation) clear_str_collection();
     if (success && summary_ready && post_error_active) {
         post_error_active = false;
-        Log::logf(CAT_EDF, LOG_INFO, "STR processing recovered day=%04X\n", day);
+        Log::logf(CAT_EDF, LOG_INFO, "STR processing recovered for %.4s-%.2s-%.2s\n",
+                  day_text, day_text + 4, day_text + 6);
     }
     return success && summary_ready;
 }
