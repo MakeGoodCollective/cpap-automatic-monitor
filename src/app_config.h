@@ -45,6 +45,7 @@ struct AirBridgeConfig {
     uint16_t    http_port;
     String      http_user;
     String      http_pass;
+    String      auth_whitelist;
 
     String      update_url;          // release manifest, empty disables checks
 

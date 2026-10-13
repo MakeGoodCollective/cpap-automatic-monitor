@@ -13,6 +13,7 @@
 
 namespace aircannect {
 
+void trim_ascii(char *text);
 void copy_cstr(char *dst, size_t size, const char *src);
 
 #if AIRCANNECT_STRING_UTIL_HAS_ARDUINO

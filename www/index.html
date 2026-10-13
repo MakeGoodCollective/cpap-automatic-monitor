@@ -3404,6 +3404,7 @@ const CFG_SECTIONS = /* CONFIG_SECTIONS */ [];
 const CFG_META = {
     hostname:['DHCP hostname and AP SSID prefix'],wifi_mode:['Operating mode'],wifi_roam:['Enable hysteresis-based roaming'],wifi_country:['ISO 3166 country code (01 = worldwide)'],
     http_port:['Web server port'],http_user:['Web UI username'],http_pass:['Web UI password'],
+    auth_whitelist:['Skip web login for trusted IPv4 addresses, CIDR networks or IP ranges, separated by commas. Empty = none; * = all IPv4 clients. Max 160 characters.'],
     update_url:['Release manifest URL (empty disables automatic checks)'],
     ntp_server:['NTP server (empty = DHCP or pool.ntp.org)'],tz:['POSIX timezone string'],
     resmed_time:['Automatically synchronize the ResMed clock from NTP'],
@@ -3428,6 +3429,8 @@ function renderConfigFields(root, d) {
   };
   const entries = Object.entries(d).sort((a,b) => category(a[0]) - category(b[0]));
   for (const [k,v] of entries) {
+    // Setup completion accepts only credentials; advanced access stays in Config.
+    if (root.id === 'setup-access' && !['http_user','http_pass'].includes(k)) continue;
     const categoryInfo = CFG_SECTIONS[category(k)];
     if (!configStorageSupported && ['smb','sleephq'].includes(categoryInfo?.id)) continue;
     const group = categoryInfo?.label || 'Other';

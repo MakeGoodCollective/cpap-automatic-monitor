@@ -62,6 +62,7 @@ log warning and the previous setting stays in effect.
 | `http_port` | 80 | Web server port |
 | `http_user` | admin | Web UI username |
 | `http_pass` | airbridge | Web UI password |
+| `auth_whitelist` | *(empty)* | Trusted IPv4 addresses that bypass web login. Comma-separated addresses, CIDR networks, start-end ranges or `*`; maximum 160 characters |
 
 ### OTA
 

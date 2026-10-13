@@ -1,4 +1,5 @@
 #include "app_config.h"
+#include "auth_utils.h"
 #include "network_hints.h"
 #include "debug_log.h"
 #include <Preferences.h>
@@ -76,6 +77,7 @@ static const KVEntry kv_table[] = {
     KV_U16("http_port", "http_port", http_port, 80, Access),
     KV_STR("http_user", "http_user", http_user, "admin", Access),
     KV_SECRET("http_pass", "http_pass", http_pass, "airbridge", Access),
+    KV_STR("auth_whitelist", "auth_wl", auth_whitelist, "", Access),
     KV_STR("update_url", "update_url", update_url, AB_DEFAULT_UPDATE_URL, Updates),
     KV_STR("ntp_server", "ntp_server", ntp_server, "", Time),
     KV_STR("tz", "tz", tz, "UTC0", Time),
@@ -374,7 +376,9 @@ bool Config::is_sensitive(const char *key) {
 }
 
 bool Config::set_value(const char *key, const char *value) {
-    if (strcasecmp(key, "syslog_host") == 0 && *value) {
+    if (strcasecmp(key, "auth_whitelist") == 0) {
+        if (!aircannect::valid_auth_whitelist(value)) return false;
+    } else if (strcasecmp(key, "syslog_host") == 0 && *value) {
         in_addr address;
         if (inet_pton(AF_INET, value, &address) != 1) return false;
     } else if (strcasecmp(key, "syslog_port") == 0) {

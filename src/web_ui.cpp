@@ -9,6 +9,7 @@
 #include "debug_log.h"
 #include "crash_diagnostics.h"
 #include "app_config.h"
+#include "auth_utils.h"
 #include "build_info.h"
 #include "wifi_setup.h"
 #include "network_hints.h"
@@ -109,6 +110,8 @@ static bool checkAuth(AsyncWebServerRequest *request) {
     if (request->getResponse()) return false;
     auto &cfg = Config::get();
     if (cfg.http_user.isEmpty() && cfg.http_pass.isEmpty()) return true;
+    if (request->client() && aircannect::auth_whitelist_matches(
+            request->client()->remoteIP(), cfg.auth_whitelist.c_str())) return true;
     if (!request->authenticate(cfg.http_user.c_str(), cfg.http_pass.c_str())) {
         request->requestAuthentication();
         return false;

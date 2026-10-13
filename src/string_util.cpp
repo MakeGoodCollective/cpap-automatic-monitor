@@ -3,8 +3,20 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 namespace aircannect {
+
+void trim_ascii(char *text) {
+    if (!text) return;
+    char *start = text;
+    while (*start && isspace(static_cast<unsigned char>(*start))) start++;
+    if (start != text) memmove(text, start, strlen(start) + 1);
+    size_t len = strlen(text);
+    while (len && isspace(static_cast<unsigned char>(text[len - 1]))) {
+        text[--len] = 0;
+    }
+}
 
 void copy_cstr(char *dst, size_t size, const char *src) {
     if (!dst || size == 0) return;

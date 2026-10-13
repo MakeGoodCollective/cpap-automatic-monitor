@@ -66,17 +66,6 @@ bool header_value_has_token(const char *value, const char *token) {
     return false;
 }
 
-void trim_ascii(char *text) {
-    if (!text) return;
-    char *start = text;
-    while (*start && isspace(static_cast<unsigned char>(*start))) start++;
-    if (start != text) memmove(text, start, strlen(start) + 1);
-    size_t len = strlen(text);
-    while (len && isspace(static_cast<unsigned char>(text[len - 1]))) {
-        text[--len] = 0;
-    }
-}
-
 const char *json_string_or_empty(JsonVariantConst value) {
     return value.is<const char *>() ? value.as<const char *>() : "";
 }
