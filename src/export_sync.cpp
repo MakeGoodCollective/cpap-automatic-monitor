@@ -43,7 +43,8 @@ constexpr size_t UPLOAD_BUFFER_FALLBACK = 4 * 1024;
 constexpr uint32_t OPERATION_IDLE_TIMEOUT_MS = 60000;
 constexpr uint32_t SLEEPHQ_IDLE_TIMEOUT_MS = 5 * 60 * 1000UL;
 constexpr uint32_t DNS_TIMEOUT_MS = 15000;
-constexpr uint16_t EXPORT_TASK_STACK = 8192;
+// Upload callers stay on the stack during TLS certificate verification.
+constexpr uint16_t EXPORT_TASK_STACK = 12 * 1024;
 static const char *const SESSION_SUFFIXES[] = {"BRP", "PLD", "SAD", "EVE", "CSL"};
 static const char *const ROOT_FILES[] = {"/Identification.tgt", "/Identification.crc", "/STR.edf"};
 
@@ -1076,6 +1077,9 @@ static void run_logged(const Request &request, const char *name,
                   name, result.files_uploaded, result.files_skipped,
                   (unsigned long long)result.bytes_uploaded, (unsigned)(millis() - started));
     }
+    Log::logf(CAT_EXPORT, LOG_DEBUG, "[%s] Worker stack minimum free=%u/%u bytes\n",
+              name, (unsigned)uxTaskGetStackHighWaterMark(nullptr),
+              (unsigned)EXPORT_TASK_STACK);
 }
 
 static void export_task(void *) {
