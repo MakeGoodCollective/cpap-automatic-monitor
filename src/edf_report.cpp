@@ -282,6 +282,7 @@ struct Job {
     Request request;
     JobState state = JobState::Free;
     uint32_t id = 0, completed_ms = 0, data_revision = 0, cache_generation = 0;
+    uint32_t artifact_revision = 0;
     uint16_t readers = 0;
     uint16_t consumers = 1, deliveries = 0;
     bool delivered = false, cancelled = false, shared = false;
@@ -375,6 +376,17 @@ uint16_t backfill_before = UINT16_MAX;
 uint8_t backfill_period = 0;
 constexpr uint16_t PERIODS[] = {1, 7, 30, 90, 180, 365};
 uint32_t published_index_data = 0, published_index_artifacts = UINT32_MAX;
+bool index_commit_pending = false;
+
+struct CachedPublication {
+    ReportArtifact::Document document;
+    uint16_t day = 0, period = 0;
+    ReportArtifact::Lookup state = ReportArtifact::Lookup::Failed;
+};
+CachedPublication *publications = nullptr;
+size_t publication_count = 0, publication_capacity = 0;
+uint32_t publication_files_revision = 0;
+
 uint32_t background_retry = 0;
 bool backfill_enabled = true;
 IndexedSession *index = nullptr;
@@ -400,6 +412,85 @@ bool migrate_cache(const SdStorage::Session &session);
 bool artifact_headroom(const SdStorage::Session &session, uint16_t day);
 void invalidate_str();
 bool dataset(const SdStorage::Session &session);
+
+void invalidate_publications() {
+    aircannect::Memory::free(publications);
+    publications = nullptr;
+    publication_count = publication_capacity = 0;
+    publication_files_revision = SdStorage::files_revision();
+}
+
+CachedPublication *publication_entry(uint16_t day, uint16_t period) {
+    if (publication_files_revision != SdStorage::files_revision()) invalidate_publications();
+    // Descending days followed by periods: normal cold discovery appends, and
+    // index serialization finds retained metadata without another linear scan.
+    const uint32_t key = period ? 65536u + period : 65535u - day;
+    size_t slot = 0, end = publication_count;
+    while (slot < end) {
+        const size_t mid = slot + (end - slot) / 2;
+        const auto &entry = publications[mid];
+        const uint32_t candidate = entry.period ? 65536u + entry.period : 65535u - entry.day;
+        if (candidate < key) slot = mid + 1;
+        else end = mid;
+    }
+    if (slot < publication_count && publications[slot].period == period &&
+        (period || publications[slot].day == day)) {
+        auto &entry = publications[slot];
+        // Only the selected end date is retained for each of the six periods.
+        if (entry.day != day) entry = {};
+        entry.day = day;
+        entry.period = period;
+        return &entry;
+    }
+    if (publication_count == publication_capacity) {
+        const size_t capacity = std::min(index_count + sizeof(PERIODS) / sizeof(PERIODS[0]),
+            std::max(size_t(16), publication_capacity * 2));
+        if (capacity <= publication_capacity) return nullptr;
+        const size_t bytes = capacity * sizeof(CachedPublication);
+        auto *grown = static_cast<CachedPublication *>(aircannect::Memory::realloc_large(
+            publications, bytes, bytes <= INTERNAL_WORK));
+        if (!grown) return nullptr;
+        publications = grown;
+        publication_capacity = capacity;
+    }
+    memmove(publications + slot + 1, publications + slot,
+        (publication_count - slot) * sizeof(CachedPublication));
+    auto *entry = new (&publications[slot]) CachedPublication;
+    ++publication_count;
+    entry->day = day;
+    entry->period = period;
+    return entry;
+}
+
+void remember_publication(uint16_t day, uint16_t period, const ReportArtifact::Document &document) {
+    if (auto *entry = publication_entry(day, period)) {
+        entry->document = document;
+        entry->state = ReportArtifact::Lookup::Ready;
+    }
+}
+
+ReportArtifact::Lookup lookup_publication(const SdStorage::Session &session,
+    uint16_t day, uint16_t period, const char *prefix, ReportArtifact::Document &document) {
+    if (!session.valid()) return ReportArtifact::Lookup::Failed;
+    auto *entry = publication_entry(day, period);
+    if (entry && entry->state != ReportArtifact::Lookup::Failed) {
+        document = entry->document;
+        return entry->state;
+    }
+    const auto state = ReportArtifact::document_lookup(session, prefix, nullptr, document);
+    if (state == ReportArtifact::Lookup::Ready) {
+        Payload verified;
+        // Validate old publications once, including fallback to an older slot.
+        // A failed read may be transient; never memoize it as missing.
+        if (!ReportArtifact::document_read(session, prefix, document, verified, nullptr))
+            return ReportArtifact::Lookup::Failed;
+    }
+    if (entry && session.valid()) {
+        entry->document = document;
+        entry->state = state;
+    }
+    return state;
+}
 
 void publish(State state, const char *error = "") {
     portENTER_CRITICAL(&status_mux);
@@ -1520,6 +1611,7 @@ bool prepare_period(const SdStorage::Session &session, Job &job) {
     if (!ReportArtifact::document_publish(session, prefix, key,
         reinterpret_cast<const uint8_t *>(job.body.c_str()), job.body.length(), document))
         return note_issue(job, "publication_write", prefix);
+    remember_publication(last_day(job.request), job.request.period, document);
     portENTER_CRITICAL(&status_mux);
     ++status.artifact_revision;
     ++status.revision;
@@ -1700,6 +1792,7 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
     if (!ReportArtifact::document_publish(session, manifest, manifest_key,
         reinterpret_cast<const uint8_t *>(job.body.c_str()), job.body.length(), saved))
         return note_issue(job, "publication_write", manifest);
+    remember_publication(day, 0, saved);
     if (auto *cached = cached_day_entry(day, true)) {
         memcpy(cached->artifact_key, manifest_key, sizeof(manifest_key));
         cached->artifacts_checked = true;
@@ -1744,10 +1837,8 @@ bool days_json(const SdStorage::Session &session, Job &job) {
         publication_prefix(day, prefix);
         Request request; request.day = day;
         ReportArtifact::Document document;
-        Payload verified;
         if (publication_key(request, key) &&
-            ReportArtifact::document_lookup(session, prefix, nullptr, document) == ReportArtifact::Lookup::Ready &&
-            ReportArtifact::document_read(session, prefix, document, verified, nullptr)) {
+            lookup_publication(session, day, 0, prefix, document) == ReportArtifact::Lookup::Ready) {
             char digest[65], identity[65];
             aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
             aircannect::hex_encode(document.key, 32, identity, sizeof(identity), aircannect::HexCase::Lower);
@@ -1764,10 +1855,8 @@ bool days_json(const SdStorage::Session &session, Job &job) {
         char prefix[96]; uint8_t key[32];
         period_prefix(request, prefix);
         ReportArtifact::Document document;
-        Payload verified;
-        if (!publication_key(request, key) || ReportArtifact::document_lookup(session, prefix, nullptr, document)
-            != ReportArtifact::Lookup::Ready ||
-            !ReportArtifact::document_read(session, prefix, document, verified, nullptr)) continue;
+        if (!publication_key(request, key) ||
+            lookup_publication(session, last_day(request), period, prefix, document) != ReportArtifact::Lookup::Ready) continue;
         char digest[65];
         aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
         job.body.print("%s{\"period\":%u,\"day\":\"%.8s\",\"digest\":\"%s\",\"bytes\":%u,\"stale\":%s}",
@@ -1783,7 +1872,10 @@ bool days_json(const SdStorage::Session &session, Job &job) {
 bool publish_index(const SdStorage::Session &session) {
     const uint32_t artifacts = status.artifact_revision;
     const uint32_t data = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
-    if (published_index_data == data && published_index_artifacts == artifacts) return true;
+    if (published_index_data == data && published_index_artifacts == artifacts) {
+        index_commit_pending = false;
+        return true;
+    }
     Job snapshot;
     snapshot.data_revision = data;
     if (!days_json(session, snapshot)) return false;
@@ -1794,6 +1886,7 @@ bool publish_index(const SdStorage::Session &session) {
             reinterpret_cast<const uint8_t *>(snapshot.body.c_str()), snapshot.body.length(), document)) return false;
     published_index_data = data;
     published_index_artifacts = artifacts;
+    index_commit_pending = false;
     return true;
 }
 
@@ -2241,9 +2334,13 @@ bool enqueue_backfill(const SdStorage::Session &session) {
     }
     if (!publication_key(request, key)) return false;
     ReportArtifact::Document document;
-    const bool ready = ReportArtifact::document_lookup(session, prefix, key, document) == ReportArtifact::Lookup::Ready;
-    strcat(prefix, ".refused");
-    const bool refused = ReportArtifact::document_lookup(session, prefix, key, document) == ReportArtifact::Lookup::Ready;
+    const bool ready = lookup_publication(session, last_day(request), day ? 0 : request.period,
+        prefix, document) == ReportArtifact::Lookup::Ready && !memcmp(key, document.key, sizeof(key));
+    bool refused = false;
+    if (!ready) {
+        strcat(prefix, ".refused");
+        refused = ReportArtifact::document_lookup(session, prefix, key, document) == ReportArtifact::Lookup::Ready;
+    }
     if (ready || refused) {
         if (day) backfill_before = day; else ++backfill_period;
         return true;
@@ -2288,7 +2385,7 @@ bool work_once() {
     if (job && job->background && ExportSync::busy()) {
         defer_job(job); publish(State::WaitingStorage, "export_pending"); return false;
     }
-    if (!job && !dirty() && published_index_artifacts == status.artifact_revision &&
+    if (!job && !dirty() && !index_commit_pending && published_index_artifacts == status.artifact_revision &&
         (!backfill_enabled || (!backfill_before && backfill_period >= sizeof(PERIODS) / sizeof(PERIODS[0])) || ExportSync::busy() ||
         (background_retry && int32_t(millis() - background_retry) < 0))) { publish(State::Ready); return false; }
     SdStorage::Session session;
@@ -2347,8 +2444,14 @@ bool work_once() {
         reported_index_error = nullptr;
     }
     if (!job) {
-        if (!publish_index(session)) Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
+        const bool checkpoint = index_commit_pending && !ExportSync::busy();
+        if (checkpoint && !publish_index(session))
+            Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
         const bool more = enqueue_backfill(session);
+        // Backfill publishes each day independently. Persist the derived list
+        // only when this run finishes or safely pauses, not after every day.
+        if (!more && !checkpoint && !ExportSync::busy() && !publish_index(session))
+            Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
         session.end();
         publish(State::Ready);
         return more;
@@ -2385,6 +2488,13 @@ bool work_once() {
         job->data_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE));
     const bool yielded = job->artifact_preempted || __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) ||
         (job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE));
+    if (success && !job->background && job->request.action == Action::Prepare &&
+        !interrupted && !changed && !yielded) {
+        // Includes post-therapy preparation before export. Failure to checkpoint
+        // must not invalidate an independently committed day publication.
+        index_commit_pending = true;
+        if (!publish_index(session)) Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
+    }
     if (job->background && !interrupted && !changed && !yielded) {
         if (job->request.view == View::Period) ++backfill_period;
         else backfill_before = job->request.day;
@@ -2414,6 +2524,7 @@ bool work_once() {
     job->state = JobState::Complete;
     job->completed_ms = millis();
     job->cache_generation = __atomic_load_n(&cache_generation, __ATOMIC_ACQUIRE);
+    job->artifact_revision = status.artifact_revision;
     const int code = job->code;
     const size_t bytes = job->body.length();
     log_result(*job);
@@ -2548,6 +2659,7 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     for (auto &job : jobs) {
         if (current_index && !job.cancelled && !job.issue && job.state == JobState::Complete && job.code == 200 &&
             job.data_revision == publication.data_revision && job.request == request &&
+            (request.action != Action::Days || job.artifact_revision == publication.artifact_revision) &&
             ((request.action != Action::Summary && request.action != Action::History && request.action != Action::Days) ||
              job.cache_generation == __atomic_load_n(&cache_generation, __ATOMIC_ACQUIRE)) &&
             uint32_t(millis() - job.completed_ms) < RETAIN_MS) {
