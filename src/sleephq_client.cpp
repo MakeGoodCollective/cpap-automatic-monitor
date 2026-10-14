@@ -54,10 +54,6 @@ static const char *SLEEPHQ_TRUST_ANCHOR_GTS_ROOT_R4_CA =
     "p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD\n"
     "-----END CERTIFICATE-----\n";
 
-const char *json_string_or_empty(JsonVariantConst value) {
-    return value.is<const char *>() ? value.as<const char *>() : "";
-}
-
 void note_operation_progress(
     const BackgroundOperationControl *operation) {
     if (operation) {
@@ -945,7 +941,8 @@ bool SleepHqClient::list_team_files(uint32_t team_id,
                                     void *ctx,
                                     size_t &count,
                                     bool &has_more,
-                                    const BackgroundOperationControl *operation) {
+                                    const BackgroundOperationControl *operation,
+                                    const char *name) {
     count = 0;
     has_more = false;
     if (!team_id || !callback || per_page == 0 || per_page > 100) {
@@ -963,6 +960,51 @@ bool SleepHqClient::list_team_files(uint32_t team_id,
         set_error("bad_file_list_request");
         return false;
     }
+    LargeTextBuffer filtered;
+    if (name && name[0]) {
+        if (!filtered.append(path) || !filtered.append("&name=") ||
+            !form_encode_append(filtered, name)) {
+            set_error("request_alloc_failed");
+            return false;
+        }
+    }
+    return read_list(filtered.length() ? filtered.c_str() : path,
+                     parser, count, has_more, operation);
+}
+
+bool SleepHqClient::list_import_files(uint32_t import_id, uint32_t page,
+    SleepHqRemoteFileCallback callback, void *ctx, size_t &count,
+    bool &has_more, const BackgroundOperationControl *operation) {
+    char path[96];
+    snprintf(path, sizeof(path), "/api/v1/imports/%lu/files?page=%lu&per_page=100",
+             (unsigned long)import_id, (unsigned long)page);
+    SleepHqRemoteFileListStreamParser parser;
+    if (!import_id || !parser.begin(100, callback, ctx)) {
+        set_error("bad_file_list_request");
+        return false;
+    }
+    return read_list(path, parser, count, has_more, operation);
+}
+
+bool SleepHqClient::list_imports(uint32_t team_id, uint32_t page,
+    SleepHqImportCallback callback, void *ctx, size_t &count,
+    bool &has_more, const BackgroundOperationControl *operation) {
+    char path[96];
+    snprintf(path, sizeof(path), "/api/v1/teams/%lu/imports?page=%lu&per_page=16",
+             (unsigned long)team_id, (unsigned long)page);
+    SleepHqRemoteFileListStreamParser parser;
+    if (!team_id || !parser.begin_imports(16, callback, ctx)) {
+        set_error("bad_import_list_request");
+        return false;
+    }
+    return read_list(path, parser, count, has_more, operation);
+}
+
+bool SleepHqClient::read_list(const char *path,
+    SleepHqRemoteFileListStreamParser &parser, size_t &count, bool &has_more,
+    const BackgroundOperationControl *operation) {
+    count = 0;
+    has_more = false;
     auto feed_parser = [](void *parser_ctx, const uint8_t *data,
                           size_t size) -> bool {
         SleepHqRemoteFileListStreamParser *stream_parser =
@@ -1101,27 +1143,11 @@ bool SleepHqClient::parse_machine_date(const SleepHqHttpResponse &response,
 
 bool SleepHqClient::parse_import(const SleepHqHttpResponse &response,
                                  SleepHqImportInfo &out) {
-    JsonAllocator allocator;
-    JsonDocument doc(&allocator);
-    DeserializationError err = deserializeJson(doc, response.body.c_str());
-    if (err) {
-        set_error("import_json_parse");
-        return false;
-    }
-
-    out = SleepHqImportInfo{};
-    JsonVariantConst id = doc["data"]["id"];
-    if (!json_variant_to_uint32(id, out.id)) {
-        set_error("import_id_missing");
-        return false;
-    }
-    copy_cstr(out.status, sizeof(out.status),
-              json_string_or_empty(doc["data"]["attributes"]["status"]));
-    copy_cstr(out.failed_reason, sizeof(out.failed_reason),
-              json_string_or_empty(
-                  doc["data"]["attributes"]["failed_reason"]));
-    set_error("");
-    return true;
+    char error[AC_SLEEPHQ_ERROR_MAX] = {};
+    const bool ok = sleephq_parse_import_json(response.body.c_str(), out,
+                                             error, sizeof(error));
+    set_error(error);
+    return ok;
 }
 
 }  // namespace aircannect

@@ -24,12 +24,6 @@ struct SleepHqConfig {
     char device_id[AC_SLEEPHQ_ID_MAX] = {};
 };
 
-struct SleepHqImportInfo {
-    uint32_t id = 0;
-    char status[AC_SLEEPHQ_STATUS_MAX] = {};
-    char failed_reason[AC_SLEEPHQ_ERROR_MAX] = {};
-};
-
 struct SleepHqUploadRequest {
     uint32_t import_id = 0;
     const char *name = nullptr;
@@ -95,7 +89,16 @@ public:
                          void *ctx,
                          size_t &count,
                          bool &has_more,
-                         const BackgroundOperationControl *operation = nullptr);
+                         const BackgroundOperationControl *operation = nullptr,
+                         const char *name = nullptr);
+    bool list_import_files(uint32_t import_id, uint32_t page,
+                           SleepHqRemoteFileCallback callback, void *ctx,
+                           size_t &count, bool &has_more,
+                           const BackgroundOperationControl *operation = nullptr);
+    bool list_imports(uint32_t team_id, uint32_t page,
+                      SleepHqImportCallback callback, void *ctx,
+                      size_t &count, bool &has_more,
+                      const BackgroundOperationControl *operation = nullptr);
     bool list_team_machines(uint32_t team_id,
                             uint32_t page,
                             uint32_t per_page,
@@ -117,6 +120,9 @@ public:
         const BackgroundOperationControl *operation = nullptr);
 
 private:
+    bool read_list(const char *path, SleepHqRemoteFileListStreamParser &parser,
+                   size_t &count, bool &has_more,
+                   const BackgroundOperationControl *operation);
     bool request(const char *method,
                  const char *path,
                  const char *body,

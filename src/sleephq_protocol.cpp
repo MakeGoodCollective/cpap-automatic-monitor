@@ -68,12 +68,28 @@ bool parse_remote_file_item(JsonVariantConst item, SleepHqRemoteFile &file) {
     return true;
 }
 
+bool parse_import_item(JsonVariantConst item, SleepHqImportInfo &out) {
+    out = {};
+    JsonVariantConst attr = item["attributes"];
+    if (!json_variant_to_uint32(item["id"], out.id))
+        json_variant_to_uint32(attr["id"], out.id);
+    json_variant_to_uint32(attr["team_id"], out.team_id);
+    json_variant_to_uint32(attr["machine_id"], out.machine_id);
+    copy_cstr(out.status, sizeof(out.status), json_string_or_empty(attr["status"]));
+    copy_cstr(out.processed_at, sizeof(out.processed_at),
+              json_string_or_empty(attr["processed_at"]));
+    copy_cstr(out.failed_reason, sizeof(out.failed_reason),
+              json_string_or_empty(attr["failed_reason"]));
+    return out.id != 0;
+}
+
 }  // namespace
 
 bool SleepHqRemoteFileListStreamParser::begin(
     uint32_t per_page, SleepHqRemoteFileCallback callback, void *ctx) {
     per_page_ = per_page;
     callback_ = callback;
+    import_callback_ = nullptr;
     ctx_ = ctx;
     count_ = 0;
     stage_ = Stage::SeekData;
@@ -90,6 +106,14 @@ bool SleepHqRemoteFileListStreamParser::begin(
 
     if (per_page == 0 || !callback) return fail("bad_file_list_request");
     return true;
+}
+
+bool SleepHqRemoteFileListStreamParser::begin_imports(
+    uint32_t per_page, SleepHqImportCallback callback, void *ctx) {
+    if (!begin(per_page, [](void *, const SleepHqRemoteFile &) { return true; }, ctx))
+        return false;
+    import_callback_ = callback;
+    return callback || fail("bad_import_list_request");
 }
 
 bool SleepHqRemoteFileListStreamParser::fail(const char *error) {
@@ -184,9 +208,15 @@ bool SleepHqRemoteFileListStreamParser::publish_item() {
     const DeserializationError err = deserializeJson(doc, item_.c_str());
     if (err) return fail("file_list_json_parse");
 
-    SleepHqRemoteFile file;
-    parse_remote_file_item(doc.as<JsonVariantConst>(), file);
-    if (!callback_(ctx_, file)) return fail("file_list_callback_failed");
+    if (import_callback_) {
+        SleepHqImportInfo import;
+        if (!parse_import_item(doc.as<JsonVariantConst>(), import) ||
+            !import_callback_(ctx_, import)) return fail("import_list_item_failed");
+    } else {
+        SleepHqRemoteFile file;
+        parse_remote_file_item(doc.as<JsonVariantConst>(), file);
+        if (!callback_(ctx_, file)) return fail("file_list_callback_failed");
+    }
     count_++;
     item_.clear();
     stage_ = Stage::SeekItem;
@@ -308,6 +338,22 @@ SleepHqImportStatusKind sleephq_classify_import_status(const char *status) {
         return SleepHqImportStatusKind::Failure;
     }
     return SleepHqImportStatusKind::Unknown;
+}
+
+bool sleephq_parse_import_json(const char *json, SleepHqImportInfo &out,
+                              char *error, size_t error_size) {
+    JsonAllocator allocator;
+    JsonDocument doc(&allocator);
+    if (deserializeJson(doc, json)) {
+        set_error(error, error_size, "import_json_parse");
+        return false;
+    }
+    if (!parse_import_item(doc["data"], out)) {
+        set_error(error, error_size, "import_id_missing");
+        return false;
+    }
+    set_error(error, error_size, "");
+    return true;
 }
 
 bool sleephq_parse_machine_list_json(const char *json,
