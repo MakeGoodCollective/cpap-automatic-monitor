@@ -371,12 +371,15 @@ Status status;
 uint32_t next_id = 1, data_revision = 1;
 uint32_t foreground_epoch = 0;
 uint32_t artifact_reads = 0;
+bool index_deleting = false;
 uint32_t backfill_revision = 0;
 uint16_t backfill_before = UINT16_MAX;
 uint8_t backfill_period = 0;
 constexpr uint16_t PERIODS[] = {1, 7, 30, 90, 180, 365};
 uint32_t published_index_data = 0, published_index_artifacts = UINT32_MAX;
 bool index_commit_pending = false;
+ReportArtifact::Document retired_index;
+uint32_t retired_index_files = 0;
 
 struct CachedPublication {
     ReportArtifact::Document document;
@@ -1869,7 +1872,34 @@ bool days_json(const SdStorage::Session &session, Job &job) {
     return job.body.good();
 }
 
+bool discard_index(const SdStorage::Session &session, const uint8_t digest[32]) {
+    // Pair admission with open_artifact: a reader cannot enter between the
+    // last active-read check and removal. No I/O runs under the critical lock.
+    portENTER_CRITICAL(&status_mux);
+    const bool admitted = !__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) && !index_deleting;
+    if (admitted) index_deleting = true;
+    portEXIT_CRITICAL(&status_mux);
+    if (!admitted) return false;
+    const bool removed = ReportArtifact::index_discard(session, digest);
+    portENTER_CRITICAL(&status_mux);
+    index_deleting = false;
+    portEXIT_CRITICAL(&status_mux);
+    return removed;
+}
+
+bool retire_index(const SdStorage::Session &session) {
+    if (!retired_index.bytes) return true;
+    if (retired_index_files != SdStorage::files_revision()) {
+        retired_index = {};
+        return true; // External edits invalidate provenance; leave it for discovery.
+    }
+    if (!discard_index(session, retired_index.digest)) return false;
+    retired_index = {};
+    return true;
+}
+
 bool publish_index(const SdStorage::Session &session) {
+    if (!retire_index(session)) return false;
     const uint32_t artifacts = status.artifact_revision;
     const uint32_t data = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
     if (published_index_data == data && published_index_artifacts == artifacts) {
@@ -1882,11 +1912,13 @@ bool publish_index(const SdStorage::Session &session) {
     ReportArtifact::Document document;
     uint8_t key[32];
     if (!ReportArtifact::fingerprint(reinterpret_cast<const uint8_t *>(snapshot.body.c_str()), snapshot.body.length(), key) ||
-        !ReportArtifact::document_publish(session, "/airbridge/report/index", key,
-            reinterpret_cast<const uint8_t *>(snapshot.body.c_str()), snapshot.body.length(), document)) return false;
+        !ReportArtifact::index_publish(session, key,
+            reinterpret_cast<const uint8_t *>(snapshot.body.c_str()), snapshot.body.length(), document, retired_index)) return false;
     published_index_data = data;
     published_index_artifacts = artifacts;
+    retired_index_files = SdStorage::files_revision();
     index_commit_pending = false;
+    retire_index(session);
     return true;
 }
 
@@ -2385,7 +2417,7 @@ bool work_once() {
     if (job && job->background && ExportSync::busy()) {
         defer_job(job); publish(State::WaitingStorage, "export_pending"); return false;
     }
-    if (!job && !dirty() && !index_commit_pending && published_index_artifacts == status.artifact_revision &&
+    if (!job && !dirty() && !index_commit_pending && !retired_index.bytes && published_index_artifacts == status.artifact_revision &&
         (!backfill_enabled || (!backfill_before && backfill_period >= sizeof(PERIODS) / sizeof(PERIODS[0])) || ExportSync::busy() ||
         (background_retry && int32_t(millis() - background_retry) < 0))) { publish(State::Ready); return false; }
     SdStorage::Session session;
@@ -2750,7 +2782,13 @@ StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
     if (root && !document) return StorageBrowser::StartResult::BadRequest;
     // Keep priority until the reader releases SD, not just until backfill
     // observes an epoch change and immediately starts its next attempt.
+    portENTER_CRITICAL(&status_mux);
+    if (index_deleting) {
+        portEXIT_CRITICAL(&status_mux);
+        return StorageBrowser::StartResult::Busy;
+    }
     __atomic_add_fetch(&artifact_reads, 1, __ATOMIC_ACQ_REL);
+    portEXIT_CRITICAL(&status_mux);
     __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
     operation.kind = StorageBrowser::Kind::Immutable;
     operation.selection[0] = 0;

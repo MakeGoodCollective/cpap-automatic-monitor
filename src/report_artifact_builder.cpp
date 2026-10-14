@@ -161,7 +161,8 @@ Lookup document_head(const SdStorage::Session &session, const char *prefix, unsi
 }
 
 Lookup lookup_document(const SdStorage::Session &session, const char *prefix,
-                       const uint8_t *key, Document &out, char (&path)[PATH_BYTES]) {
+                       const uint8_t *key, Document &out, char (&path)[PATH_BYTES],
+                       Document *replaced = nullptr) {
     Document heads[2];
     const Lookup a = document_head(session, prefix, 0, heads[0], path);
     const Lookup b = document_head(session, prefix, 1, heads[1], path);
@@ -170,7 +171,11 @@ Lookup lookup_document(const SdStorage::Session &session, const char *prefix,
         if ((i ? b : a) != Lookup::Ready || (key && memcmp(key, heads[i].key, 32))) continue;
         if (chosen < 0 || int32_t(heads[i].generation - heads[chosen].generation) > 0) chosen = i;
     }
-    if (chosen >= 0) { out = heads[chosen]; return Lookup::Ready; }
+    if (chosen >= 0) {
+        out = heads[chosen];
+        if (replaced && (chosen ? a : b) == Lookup::Ready) *replaced = heads[chosen ^ 1];
+        return Lookup::Ready;
+    }
     if (a == Lookup::Failed || b == Lookup::Failed) return Lookup::Failed;
     if (a == Lookup::Invalid || b == Lookup::Invalid) return Lookup::Invalid;
     return Lookup::Missing;
@@ -203,16 +208,17 @@ bool document_read(const SdStorage::Session &session, const char *prefix,
     return true;
 }
 
-bool document_publish(const SdStorage::Session &session, const char *prefix,
-                      const uint8_t key[32], const uint8_t *data, size_t length, Document &out) {
+static bool publish_document(const SdStorage::Session &session, const char *prefix,
+    const uint8_t key[32], const uint8_t *data, size_t length, Document &out, Document *retired) {
+    if (retired) *retired = {};
     if (!length || length > UINT32_MAX) return false;
     void *memory = aircannect::Memory::alloc_large(sizeof(DocumentScratch));
     if (!memory) return false;
     std::unique_ptr<DocumentScratch, decltype(&aircannect::Memory::free)> scratch(
         new (memory) DocumentScratch, aircannect::Memory::free);
     // Only heads are needed to choose the next generation and inactive slot.
-    Document previous;
-    const Lookup old = lookup_document(session, prefix, nullptr, previous, scratch->path);
+    Document previous, replaced;
+    const Lookup old = lookup_document(session, prefix, nullptr, previous, scratch->path, &replaced);
     if (old == Lookup::Failed || old == Lookup::Invalid) return false;
     out = {};
     out.bytes = length;
@@ -265,10 +271,36 @@ bool document_publish(const SdStorage::Session &session, const char *prefix,
         reader.read(block, sizeof(head)) != sizeof(head) || memcmp(block, head, sizeof(head))) return false;
     reader.close();
     snprintf(path, sizeof(path), "%s.head%u", prefix, unsigned(out.generation & 1));
-    return session.run([&](fs::FS &fs) {
+    const bool committed = session.run([&](fs::FS &fs) {
         // Only the inactive head is replaced. The previous content/head survive.
         return (!fs.exists(path) || fs.remove(path)) && fs.rename(part, path);
     });
+    if (committed && retired) *retired = replaced;
+    return committed;
+}
+
+bool document_publish(const SdStorage::Session &session, const char *prefix,
+                      const uint8_t key[32], const uint8_t *data, size_t length, Document &out) {
+    return publish_document(session, prefix, key, data, length, out, nullptr);
+}
+
+bool index_publish(const SdStorage::Session &session, const uint8_t key[32],
+                   const uint8_t *data, size_t length, Document &out, Document &retired) {
+    return publish_document(session, "/airbridge/report/index", key, data, length, out, &retired);
+}
+
+bool index_discard(const SdStorage::Session &session, const uint8_t digest[32]) {
+    char path[PATH_BYTES];
+    for (const char *prefix : {"/airbridge/report/index", "/airbridge/report/dataset", "/airbridge/report/rebuild"}) {
+        for (unsigned slot = 0; slot < 2; ++slot) {
+            Document retained;
+            const auto state = document_head(session, prefix, slot, retained, path);
+            if (state == Lookup::Failed || state == Lookup::Invalid) return false;
+            if (state == Lookup::Ready && !memcmp(retained.digest, digest, 32)) return true;
+        }
+    }
+    if (!document_path("/airbridge/report/index", digest, path)) return false;
+    return session.run([&](fs::FS &fs) { return !fs.exists(path) || fs.remove(path); });
 }
 
 struct Producer::Work {

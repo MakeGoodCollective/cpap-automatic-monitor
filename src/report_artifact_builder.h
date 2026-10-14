@@ -46,6 +46,14 @@ bool document_publish(const SdStorage::Session &session, const char *prefix,
                       const uint8_t key[32], const uint8_t *data, size_t length,
                       Document &out);
 
+// Root index only. Return the displaced head after a successful commit; the
+// report owner retires it separately, excluding active byte-read admissions.
+bool index_publish(const SdStorage::Session &session, const uint8_t key[32],
+                   const uint8_t *data, size_t length, Document &out, Document &retired);
+// Never removes content referenced by either index, dataset or rebuild head.
+// Caller proves the candidate is an index and excludes readers until return.
+bool index_discard(const SdStorage::Session &session, const uint8_t digest[32]);
+
 // One source, one record traversal, all selected tracks. Scratch lives in PSRAM
 // and is independent of duration. Base transposition and x4 passes read the
 // private binary spool, never source EDF again. No global state or new worker.
