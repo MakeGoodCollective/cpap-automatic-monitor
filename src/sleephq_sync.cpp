@@ -767,6 +767,7 @@ bool Run::sync_session(SdStorage::Session &storage,
         }
         progress.import_id = journal.import_id;
         progress.phase = "resume_import";
+        progress.import_status[0] = 0;
         if (journal.phase == PHASE_UPLOADING) {
             SleepHqImportInfo info;
             if (!fetch_import(storage, paths, client, journal, operation, info,
@@ -800,6 +801,7 @@ bool Run::sync_session(SdStorage::Session &storage,
 
     progress.phase = "resolve_team";
     progress.import_id = 0;
+    progress.import_status[0] = 0;
     if (!team_id_ && !client.resolve_team_id(team_id_, &operation)) {
         set_error(error, error_size, client.last_error());
         return false;
@@ -817,6 +819,7 @@ bool Run::sync_session(SdStorage::Session &storage,
     operation.note_progress(millis());
 
     journal = {};
+    copy_cstr(progress.import_status, sizeof(progress.import_status), import.status);
     // A new STR generation does not invalidate the immutable detailed files.
     if (marker_valid(storage, paths, entry, false)) {
         journal.uploaded_mask = ((1u << FILE_COUNT) - 1) & ~7u;

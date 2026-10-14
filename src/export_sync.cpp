@@ -114,6 +114,7 @@ struct SleepHqRetry {
     uint32_t config_revision;
     uint32_t due_ms;
     uint8_t attempt;
+    uint8_t heap_attempt;
     bool pending;
     bool blocked;
 };
@@ -784,13 +785,14 @@ static bool snapshot_sleephq_config(SleepHqSync::Config &out,
     return true;
 }
 
-static uint32_t sleephq_retry_delay(const char *error, uint8_t attempt) {
+static uint32_t sleephq_retry_delay(const char *error, uint8_t attempt,
+                                   uint8_t heap_attempt) {
     bool retryable = false;
     if (strncmp(error, "http_", 5) == 0) {
         unsigned code = 0;
         char extra = 0;
         retryable = sscanf(error, "http_%u%c", &code, &extra) == 1 &&
-            (code == 408 || code == 429 || (code >= 500 && code <= 599));
+            (code == 404 || code == 408 || code == 429 || (code >= 500 && code <= 599));
     } else {
         static const char *const transient[] = {
             "connect_failed", "write_failed", "response_header_failed",
@@ -807,7 +809,7 @@ static uint32_t sleephq_retry_delay(const char *error, uint8_t attempt) {
     }
     if (!retryable) return 0;
     // Brief heap pressure gets three short retries, then normal backoff.
-    if (strcmp(error, "tls_heap_guard") == 0 && attempt < 3) return 10000;
+    if (strcmp(error, "tls_heap_guard") == 0 && heap_attempt < 3) return 10000;
     constexpr uint32_t delays[] = {15 * 60 * 1000UL, 60 * 60 * 1000UL, 6 * 60 * 60 * 1000UL};
     return delays[attempt < 3 ? attempt : 2];
 }
@@ -830,8 +832,10 @@ static void reset_sleephq_retry(uint32_t revision) {
 
 static void sleephq_failed(const char *error, const SleepHqSync::Progress &progress = {},
                            const char *request = "") {
-    const uint32_t delay_ms = sleephq_retry_delay(error, sleephq_retry.attempt);
-    if (sleephq_retry.attempt < UINT8_MAX) ++sleephq_retry.attempt;
+    const uint32_t delay_ms = sleephq_retry_delay(
+        error, sleephq_retry.attempt, sleephq_retry.heap_attempt);
+    if (delay_ms == 10000) ++sleephq_retry.heap_attempt;
+    else if (delay_ms && sleephq_retry.attempt < UINT8_MAX) ++sleephq_retry.attempt;
     sleephq_retry.pending = delay_ms != 0;
     sleephq_retry.blocked = !delay_ms;
     sleephq_retry.due_ms = millis() + delay_ms;
