@@ -986,6 +986,7 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
     }
     const bool migrating = old == JournalLoad::Valid && !strcmp(legacy.therapy_day, day);
     const bool unfinished = loaded == JournalLoad::Valid && state.phase != 0;
+    const bool reconcile_objects = repair || migrating || unfinished;
     bool confirmed = loaded == JournalLoad::Valid && state.phase == 0 && state.import_id;
     for (uint32_t i = 0; confirmed && i < snapshot.count; ++i)
         confirmed = marker_valid(storage, legacy_paths, snapshot.entries[i]);
@@ -1050,8 +1051,8 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
         }
     }
 
-    // Discovery is necessary on migration/repair, not on every unchanged boot.
-    if (!state.import_id || repair || migrating || unfinished) {
+    // Find a day destination or recover remote state; confirmed days skip discovery.
+    if (!state.import_id || reconcile_objects) {
         progress.phase = "discover_imports";
         if (!inventory_->load(client_, team_id_, operation, error, error_size)) return false;
         for (size_t offset = 0; offset < inventory_->imports.length(); offset += sizeof(Inventory::Import)) {
@@ -1142,7 +1143,9 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
             attach.content_hash = f.hash;
             SleepHqUploadResult result;
             struct HashMatch { const DayFile *file; bool found; } match{&f, f.available || inventory_->known(f)};
-            bool more = !match.found;
+            // Normal day appends upload unknown objects without a per-file search.
+            // Recovery can still find accepted objects missing their association.
+            bool more = reconcile_objects && !match.found;
             for (uint32_t page = 1; more && !match.found; ++page) {
                 size_t count = 0;
                 if (!client_.list_team_files(team_id_, page, 100,
