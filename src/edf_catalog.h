@@ -33,13 +33,17 @@ struct Changes {
     uint32_t count;
 };
 
+// Recorder/storage worker only, with SD ownership. Reloads after a filesystem
+// revision (including remount); does not reconstruct a missing existing catalog.
 void init();
+// Data APIs also require SD ownership: stale snapshots reload before access.
 bool commit(const Entry &entry);
 bool read(uint32_t index, Entry &entry);
 bool find(const char *file_prefix, Entry &entry);
 bool snapshot_prefixes(char *out, size_t out_size, uint32_t &count);
 // Caller releases the matching entries with Memory::free, including on errors.
 bool snapshot_day(const char *day, Entry *&out, uint32_t &count);
+// Memory-only publication; ready is false until a changed filesystem is loaded.
 void get_status(Status &out);
 uint32_t revision();
 // False requires a full snapshot (startup or the change history was exceeded).

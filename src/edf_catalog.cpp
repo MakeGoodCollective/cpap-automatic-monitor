@@ -6,6 +6,7 @@
 
 #include <Arduino.h>
 #include <FS.h>
+#include <algorithm>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -42,6 +43,10 @@ static uint32_t changed_indexes[32] = {};
 static uint32_t change_count = 0;
 static SemaphoreHandle_t mutex = nullptr;
 static fs::FS *storage = nullptr;
+// Keep the 32-byte wire representation: 4096 entries occupy at most 128 KiB.
+static uint8_t *entries = nullptr;
+static uint32_t validated_files_revision = 0;
+static bool initialized = false;
 
 static void set_error(const char *message) {
     portENTER_CRITICAL(&status_mux);
@@ -129,19 +134,71 @@ static bool read_header(fs::File &file, Header &header) {
     return true;
 }
 
-static bool read_valid_header(fs::File &file, Header &header) {
-    if (!read_header(file, header)) return false;
-    uint8_t entry[ENTRY_SIZE];
+static bool read_valid_entries(fs::File &file, const Header &header, uint8_t *destination = nullptr) {
+    const size_t length = size_t(header.count) * ENTRY_SIZE;
+    const size_t block_size = std::min(length, SdStorage::READ_CHUNK_BYTES);
+    auto *scratch = !destination && block_size ? static_cast<uint8_t *>(
+        aircannect::Memory::alloc_large(block_size)) : nullptr;
+    if (!destination && block_size && !scratch) return false;
     uint32_t crc = crc32_ieee_initial();
-    for (uint32_t i = 0; i < header.count; i++) {
-        Entry decoded;
-        if (file.read(entry, sizeof(entry)) != sizeof(entry) ||
-            !decode_entry(entry, decoded)) {
-            return false;
+    bool valid = true;
+    for (size_t at = 0; valid && at < length; at += block_size) {
+        const size_t count = std::min(block_size, length - at);
+        uint8_t *block = destination ? destination + at : scratch;
+        valid = file.read(block, count) == count;
+        if (!valid) break;
+        crc = crc32_ieee_update(crc, block, count);
+        for (size_t i = 0; valid && i < count; i += ENTRY_SIZE) {
+            Entry decoded;
+            valid = decode_entry(block + i, decoded);
         }
-        crc = crc32_ieee_update(crc, entry, sizeof(entry));
     }
-    return crc32_ieee_finish(crc) == header.entries_crc;
+    aircannect::Memory::free(scratch);
+    return valid && crc32_ieee_finish(crc) == header.entries_crc;
+}
+
+static bool read_valid_header(fs::File &file, Header &header) {
+    return read_header(file, header) && read_valid_entries(file, header);
+}
+
+// Called only under the catalog mutex and the caller's SD ownership.
+static bool load_catalog() {
+    const uint32_t revision = SdStorage::files_revision();
+    if (status.ready && validated_files_revision == revision) return true;
+    storage = SdStorage::filesystem();
+    if (!storage) return false;
+    fs::File file = storage->open(CATALOG_PATH, FILE_READ);
+    Header header;
+    if (!read_header(file, header)) {
+        set_error("validation failed");
+        return false;
+    }
+    const size_t bytes = size_t(header.count) * ENTRY_SIZE;
+    auto *loaded = bytes ? static_cast<uint8_t *>(
+        aircannect::Memory::alloc_large(bytes, bytes <= 4096)) : nullptr;
+    if (bytes && !loaded) {
+        set_error("catalog allocation failed");
+        return false;
+    }
+    if (!read_valid_entries(file, header, loaded) ||
+        revision != SdStorage::files_revision()) {
+        aircannect::Memory::free(loaded);
+        set_error("validation failed");
+        return false;
+    }
+    aircannect::Memory::free(entries);
+    entries = loaded;
+    portENTER_CRITICAL(&status_mux);
+    status.ready = true;
+    initialized = true;
+    validated_files_revision = revision;
+    change_count = 0;
+    status.entries = header.count;
+    status.generation = header.generation;
+    status.error[0] = 0;
+    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
+    portEXIT_CRITICAL(&status_mux);
+    return true;
 }
 
 static bool write_empty_catalog() {
@@ -185,17 +242,13 @@ static void recover_catalog() {
             set_error("backup recovery failed");
             return;
         }
-    } else if (storage->exists(CATALOG_PATH) &&
-               storage->exists(CATALOG_BACKUP)) {
-        storage->remove(CATALOG_BACKUP);
     }
-    if (storage->exists(CATALOG_PART)) storage->remove(CATALOG_PART);
 }
 
 }  // namespace
 
 void init() {
-    if (status.ready) return;
+    if (status.ready && validated_files_revision == SdStorage::files_revision()) return;
     portENTER_CRITICAL(&status_mux);
     status.error[0] = 0;
     __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
@@ -207,116 +260,89 @@ void init() {
         set_error("mutex allocation failed");
         return;
     }
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(2000)) != pdTRUE) return;
     if (!storage->exists(CATALOG_DIR) && !storage->mkdir(CATALOG_DIR)) {
         set_error("directory creation failed");
+        xSemaphoreGive(mutex);
         return;
     }
     recover_catalog();
-    if (status.error[0]) return;
-    if (!storage->exists(CATALOG_PATH) && !write_empty_catalog()) {
+    if (status.error[0]) { xSemaphoreGive(mutex); return; }
+    if (!initialized && !storage->exists(CATALOG_PATH) && !write_empty_catalog()) {
         set_error("initialization failed");
+        xSemaphoreGive(mutex);
         return;
     }
-
-    fs::File file = storage->open(CATALOG_PATH, FILE_READ);
-    Header header;
-    if (!read_valid_header(file, header)) {
-        if (file) file.close();
-        set_error("validation failed");
+    if (!load_catalog()) {
+        xSemaphoreGive(mutex);
         return;
     }
-    file.close();
-    portENTER_CRITICAL(&status_mux);
-    status.ready = true;
-    change_count = 0;
-    status.entries = header.count;
-    status.generation = header.generation;
-    status.error[0] = 0;
-    __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
-    portEXIT_CRITICAL(&status_mux);
+    // Only discard recovery copies after the published catalog is validated.
+    if (storage->exists(CATALOG_BACKUP)) storage->remove(CATALOG_BACKUP);
+    if (storage->exists(CATALOG_PART)) storage->remove(CATALOG_PART);
+    xSemaphoreGive(mutex);
     Log::logf(CAT_EDF, LOG_INFO,
               "catalog ready entries=%u generation=%u\n",
               status.entries, status.generation);
 }
 
 bool commit(const Entry &entry) {
-    if (!status.ready || !mutex || !valid_entry(entry) ||
+    if (!mutex || !valid_entry(entry) ||
         xSemaphoreTake(mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
         return false;
     }
-
-    fs::File input = storage->open(CATALOG_PATH, FILE_READ);
-    Header old_header = {};
-    bool success = read_valid_header(input, old_header) && input.seek(HEADER_SIZE);
-    bool found = false;
-    uint32_t changed_index = old_header.count;
-    uint8_t bytes[ENTRY_SIZE];
-    if (success) {
-        for (uint32_t i = 0; i < old_header.count; i++) {
-            Entry decoded;
-            if (input.read(bytes, sizeof(bytes)) != sizeof(bytes) ||
-                !decode_entry(bytes, decoded)) {
-                success = false;
-                break;
-            }
-            if (strcmp(decoded.file_prefix, entry.file_prefix) == 0) {
-                found = true;
-                changed_index = i;
-                break;
-            }
+    if (!load_catalog()) { xSemaphoreGive(mutex); return false; }
+    uint32_t changed_index = status.entries;
+    for (uint32_t i = 0; i < status.entries; ++i) {
+        if (!memcmp(entries + i * ENTRY_SIZE + 8, entry.file_prefix, 15)) {
+            changed_index = i;
+            break;
         }
     }
-    if (success && !found && old_header.count >= MAX_ENTRIES) success = false;
-    if (success) success = input.seek(HEADER_SIZE);
-
-    storage->remove(CATALOG_PART);
-    fs::File output = success ? storage->open(CATALOG_PART, FILE_WRITE)
-                              : fs::File();
     Header new_header = {
-        old_header.count + (found ? 0u : 1u),
-        old_header.generation + 1,
+        status.entries + (changed_index == status.entries ? 1u : 0u),
+        status.generation + 1,
         0,
     };
-    uint8_t header_bytes[HEADER_SIZE] = {};
-    if (!output || !SdStorage::write_exact(output, header_bytes, sizeof(header_bytes)))
-        success = false;
-
-    uint32_t crc = crc32_ieee_initial();
-    for (uint32_t i = 0; success && i < old_header.count; i++) {
-        Entry decoded;
-        if (input.read(bytes, sizeof(bytes)) != sizeof(bytes) ||
-            !decode_entry(bytes, decoded)) {
-            success = false;
-            break;
-        }
-        if (strcmp(decoded.file_prefix, entry.file_prefix) == 0)
-            encode_entry(entry, bytes);
-        if (!SdStorage::write_exact(output, bytes, sizeof(bytes))) {
-            success = false;
-            break;
-        }
-        crc = crc32_ieee_update(crc, bytes, sizeof(bytes));
-    }
-    if (success && !found) {
-        encode_entry(entry, bytes);
-        success = SdStorage::write_exact(output, bytes, sizeof(bytes));
-        if (success) crc = crc32_ieee_update(crc, bytes, sizeof(bytes));
-    }
-    new_header.entries_crc = crc32_ieee_finish(crc);
+    const size_t size = size_t(new_header.count) * ENTRY_SIZE;
+    auto *next = new_header.count <= MAX_ENTRIES ? static_cast<uint8_t *>(
+        aircannect::Memory::alloc_large(size, size <= 4096)) : nullptr;
+    if (!next) { xSemaphoreGive(mutex); return false; }
+    if (status.entries) memcpy(next, entries, size_t(status.entries) * ENTRY_SIZE);
+    encode_entry(entry, next + changed_index * ENTRY_SIZE);
+    new_header.entries_crc = crc32_ieee(next, size);
+    uint8_t header_bytes[HEADER_SIZE];
     encode_header(new_header, header_bytes);
-    if (success && (!output.seek(0) ||
-                    !SdStorage::write_exact(output, header_bytes, sizeof(header_bytes)))) {
-        success = false;
+
+    storage->remove(CATALOG_PART);
+    fs::File output = storage->open(CATALOG_PART, FILE_WRITE);
+    bool success = output && SdStorage::write_exact(output, header_bytes, sizeof(header_bytes));
+    for (size_t at = 0; success && at < size;) {
+        const size_t count = std::min(size - at, SdStorage::WRITE_CHUNK_BYTES);
+        success = SdStorage::write_exact(output, next + at, count);
+        at += count;
     }
     if (output) {
         output.flush();
         output.close();
     }
-    if (input) input.close();
-    if (success) success = publish_catalog();
+    if (success) {
+        fs::File check = storage->open(CATALOG_PART, FILE_READ);
+        Header verified;
+        success = read_valid_header(check, verified) &&
+            verified.count == new_header.count && verified.generation == new_header.generation &&
+            verified.entries_crc == new_header.entries_crc;
+    }
+    if (success && !publish_catalog()) {
+        success = false;
+        set_error("publication failed");
+    }
     if (!success) storage->remove(CATALOG_PART);
 
     if (success) {
+        aircannect::Memory::free(entries);
+        entries = next;
+        next = nullptr;
         portENTER_CRITICAL(&status_mux);
         status.entries = new_header.count;
         status.generation = new_header.generation;
@@ -328,85 +354,57 @@ bool commit(const Entry &entry) {
                   "catalog commit %s entries=%u generation=%u\n",
                   entry.file_prefix, status.entries, status.generation);
     }
+    aircannect::Memory::free(next);
     xSemaphoreGive(mutex);
     return success;
 }
 
 bool read(uint32_t index, Entry &entry) {
-    if (!status.ready || !mutex ||
+    if (!mutex ||
         xSemaphoreTake(mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
         return false;
     }
-    if (index >= status.entries) {
-        xSemaphoreGive(mutex);
-        return false;
-    }
-    fs::File file = storage->open(CATALOG_PATH, FILE_READ);
-    const size_t offset = HEADER_SIZE + static_cast<size_t>(index) * ENTRY_SIZE;
-    uint8_t bytes[ENTRY_SIZE];
-    const bool success = file && file.seek(offset) &&
-                         file.read(bytes, sizeof(bytes)) == sizeof(bytes) &&
-                         decode_entry(bytes, entry);
-    if (file) file.close();
+    const bool success = load_catalog() && index < status.entries &&
+        decode_entry(entries + size_t(index) * ENTRY_SIZE, entry);
     xSemaphoreGive(mutex);
     return success;
 }
 
 bool find(const char *file_prefix, Entry &entry) {
-    if (!status.ready || !mutex || !file_prefix ||
+    if (!mutex || !file_prefix ||
         strlen(file_prefix) != 15 ||
         xSemaphoreTake(mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
         return false;
     }
 
-    fs::File file = storage->open(CATALOG_PATH, FILE_READ);
-    Header header = {};
     bool found = false;
-    uint8_t bytes[ENTRY_SIZE];
-    if (read_valid_header(file, header) && file.seek(HEADER_SIZE)) {
-        for (uint32_t i = 0; i < header.count; i++) {
-            Entry decoded;
-            if (file.read(bytes, sizeof(bytes)) != sizeof(bytes) ||
-                !decode_entry(bytes, decoded)) {
-                break;
-            }
-            if (strcmp(decoded.file_prefix, file_prefix) == 0) {
-                entry = decoded;
-                found = true;
+    if (load_catalog()) {
+        for (uint32_t i = 0; i < status.entries; i++) {
+            const auto *bytes = entries + size_t(i) * ENTRY_SIZE;
+            if (!memcmp(bytes + 8, file_prefix, 15)) {
+                found = decode_entry(bytes, entry);
                 break;
             }
         }
     }
-    if (file) file.close();
     xSemaphoreGive(mutex);
     return found;
 }
 
 bool snapshot_prefixes(char *out, size_t out_size, uint32_t &count) {
     count = 0;
-    if (!status.ready || !mutex ||
+    if (!mutex ||
         xSemaphoreTake(mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
         return false;
     }
 
-    fs::File file = storage->open(CATALOG_PATH, FILE_READ);
-    Header header = {};
-    bool success = read_valid_header(file, header) &&
-                   header.count <= out_size / 16 &&
-                   (header.count == 0 || out) && file.seek(HEADER_SIZE);
-    uint8_t bytes[ENTRY_SIZE];
-    for (uint32_t i = 0; success && i < header.count; i++) {
-        Entry decoded;
-        if (file.read(bytes, sizeof(bytes)) != sizeof(bytes) ||
-            !decode_entry(bytes, decoded)) {
-            success = false;
-            break;
-        }
-        memcpy(out + static_cast<size_t>(i) * 16,
-               decoded.file_prefix, 16);
+    const bool success = load_catalog() && status.entries <= out_size / 16 &&
+        (!status.entries || out);
+    for (uint32_t i = 0; success && i < status.entries; i++) {
+        memcpy(out + size_t(i) * 16, entries + size_t(i) * ENTRY_SIZE + 8, 15);
+        out[size_t(i) * 16 + 15] = 0;
     }
-    if (success) count = header.count;
-    if (file) file.close();
+    if (success) count = status.entries;
     xSemaphoreGive(mutex);
     return success;
 }
@@ -414,22 +412,17 @@ bool snapshot_prefixes(char *out, size_t out_size, uint32_t &count) {
 bool snapshot_day(const char *day, Entry *&out, uint32_t &count) {
     out = nullptr;
     count = 0;
-    if (!status.ready || !mutex || !day || !valid_digits(day, 8) ||
+    if (!mutex || !day || !valid_digits(day, 8) ||
         xSemaphoreTake(mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
 
-    fs::File file = storage->open(CATALOG_PATH, FILE_READ);
-    Header header = {};
-    bool success = read_header(file, header);
+    bool success = load_catalog();
     uint32_t capacity = 0;
-    uint32_t crc = crc32_ieee_initial();
-    uint8_t bytes[ENTRY_SIZE];
-    for (uint32_t i = 0; success && i < header.count; i++) {
+    for (uint32_t i = 0; success && i < status.entries; i++) {
+        const auto *bytes = entries + size_t(i) * ENTRY_SIZE;
+        if (memcmp(bytes, day, 8)) continue;
         Entry entry;
-        success = file.read(bytes, sizeof(bytes)) == sizeof(bytes) &&
-                  decode_entry(bytes, entry);
+        success = decode_entry(bytes, entry);
         if (!success) break;
-        crc = crc32_ieee_update(crc, bytes, sizeof(bytes));
-        if (strcmp(entry.therapy_day, day)) continue;
         if (count == capacity) {
             const uint32_t next = capacity ? capacity * 2 : 4;
             // A typical day needs only a few entries; large days require PSRAM.
@@ -441,8 +434,6 @@ bool snapshot_day(const char *day, Entry *&out, uint32_t &count) {
         }
         out[count++] = entry;
     }
-    success = success && crc32_ieee_finish(crc) == header.entries_crc;
-    if (file) file.close();
     xSemaphoreGive(mutex);
     if (!success) {
         aircannect::Memory::free(out);
@@ -455,6 +446,7 @@ bool snapshot_day(const char *day, Entry *&out, uint32_t &count) {
 void get_status(Status &out) {
     portENTER_CRITICAL(&status_mux);
     out = status;
+    out.ready &= validated_files_revision == SdStorage::files_revision();
     portEXIT_CRITICAL(&status_mux);
 }
 
@@ -465,8 +457,9 @@ uint32_t revision() {
 bool changes_since(uint32_t generation, Changes &out) {
     portENTER_CRITICAL(&status_mux);
     out.catalog = status;
+    out.catalog.ready &= validated_files_revision == SdStorage::files_revision();
     const uint32_t distance = status.generation - generation;
-    const bool complete = status.ready && distance <= change_count;
+    const bool complete = out.catalog.ready && distance <= change_count;
     out.count = complete ? distance : 0;
     for (uint32_t i = 0; i < out.count; ++i)
         out.indexes[i] = changed_indexes[(generation + i + 1) % 32];

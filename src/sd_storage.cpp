@@ -458,6 +458,8 @@ void mount_card() {
     status.total_bytes = total_bytes;
     status.used_bytes = used_bytes;
     status.error[0] = 0;
+    // Also covers a USB round trip missed by consumers observing mounted=true.
+    __atomic_add_fetch(&file_mutation_revision, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&status.mounted, true, __ATOMIC_RELEASE);
     portEXIT_CRITICAL(&status_mux);
     Log::logf(CAT_STORAGE, LOG_INFO,

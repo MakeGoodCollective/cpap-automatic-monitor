@@ -3164,7 +3164,18 @@ static void process_pending() {
 
 static bool prepare_storage() {
     if (!SdStorage::local_access_allowed() || (storage_ready && !SdStorage::mounted())) return false;
-    if (storage_ready) return true;
+    if (storage_ready) {
+        EdfCatalog::Status catalog;
+        EdfCatalog::get_status(catalog);
+        if (catalog.ready) return true;
+        if (next_storage_ms && int32_t(millis() - next_storage_ms) < 0) return false;
+        if (!SdStorage::try_acquire()) return false;
+        next_storage_ms = millis() + 5000;
+        EdfCatalog::init();
+        EdfCatalog::get_status(catalog);
+        SdStorage::release();
+        return catalog.ready;
+    }
     if (next_storage_ms && int32_t(millis() - next_storage_ms) < 0) return false;
     const system_state_t state = Arbiter::get_state();
     if (state != SYS_IDLE && state != SYS_THERAPY) return false;
@@ -3274,7 +3285,7 @@ static void recorder_task(void *) {
             if (restarted) stop_session(control);
         }
         if (!SdStorage::local_access_allowed()) continue;
-        retry_recording();
+        if (have_storage) retry_recording();
 
         drain_raw_frames(pdMS_TO_TICKS(20));
         if (uxQueueMessagesWaiting(raw_queue) == 0) {

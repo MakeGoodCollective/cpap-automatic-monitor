@@ -76,8 +76,8 @@ bool usb_transfer(bool write, uint32_t sector, uint8_t *buffer, size_t size,
                   void (*done)(bool));
 void usb_ejected();
 
-// Explicit rename/delete steps, including partially completed jobs.
-// Recorder/catalog, private cache and mount/card changes are separate.
+// Explicit rename/delete steps, including partial jobs, and successful mounts.
+// Recorder/catalog commits and private cache writes have separate revisions.
 uint32_t files_revision();
 void notify_files_changed();
 
