@@ -61,6 +61,8 @@ struct SleepHqStatus {
     char current_day[9];
     char import_status[32];
     char last_error[96];
+    bool retry_pending;
+    uint32_t retry_at_epoch;
     CheckStatus check;
     Backlog backlog;
 };

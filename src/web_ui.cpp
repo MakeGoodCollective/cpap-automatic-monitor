@@ -1189,6 +1189,8 @@ static String buildExportsJson(bool full = true, uint8_t smb_fields = EXPORT_ALL
         if (shq_fields & EXPORT_RUN) {
             jsonAddUInt32(json, "import_id", sleephq.import_id);
             jsonAddString(json, "import_status", sleephq.import_status);
+            jsonAddBool(json, "retry_pending", sleephq.retry_pending);
+            jsonAddUInt32(json, "retry_at_epoch", sleephq.retry_at_epoch);
         }
         json += '}';
     }
@@ -1221,7 +1223,8 @@ static void publishExports() {
         ExportSync::get_status(smb);
         ExportSync::get_sleephq_status(shq);
         uint8_t fields[] = {exportChanges(smb, last->smb), exportChanges(shq, last->shq)};
-        if (shq.import_id != last->shq.import_id || strcmp(shq.import_status, last->shq.import_status))
+        if (shq.import_id != last->shq.import_id || strcmp(shq.import_status, last->shq.import_status) ||
+            shq.retry_pending != last->shq.retry_pending || shq.retry_at_epoch != last->shq.retry_at_epoch)
             fields[1] |= EXPORT_RUN;
         const auto &cfg = Config::get();
         if (last->endpoint != cfg.smb_endpoint) {

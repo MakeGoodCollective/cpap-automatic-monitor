@@ -54,6 +54,7 @@ enum class RequestKind : uint8_t {
     ManualSleepHq,
     StartupSmb,
     StartupSleepHq,
+    RetrySleepHq,
     CheckSmb,
     CheckSleepHq,
 };
@@ -107,6 +108,16 @@ static bool roots_cached = false;
 static uint32_t roots_pending = 0;
 static uint32_t roots_endpoint = 0;
 static uint32_t roots_catalog_generation = 0;
+
+// Only export_task mutates retry policy; published timing lives in its status.
+struct SleepHqRetry {
+    uint32_t config_revision;
+    uint32_t due_ms;
+    uint8_t attempt;
+    bool pending;
+    bool blocked;
+};
+static SleepHqRetry sleephq_retry = {};
 
 static void publish_change() {
     __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
@@ -195,7 +206,8 @@ static void settle_request(const Request &request) {
         portEXIT_CRITICAL(&status_mux);
     }
     if (request.kind == RequestKind::PostTherapy ||
-        request.kind == RequestKind::ManualSleepHq || request.kind == RequestKind::StartupSleepHq) {
+        request.kind == RequestKind::ManualSleepHq || request.kind == RequestKind::StartupSleepHq ||
+        request.kind == RequestKind::RetrySleepHq) {
         portENTER_CRITICAL(&sleephq_status_mux);
         if (sleephq_status.state == State::Pending) sleephq_status.state = State::Idle;
         portEXIT_CRITICAL(&sleephq_status_mux);
@@ -772,19 +784,74 @@ static bool snapshot_sleephq_config(SleepHqSync::Config &out,
     return true;
 }
 
+static uint32_t sleephq_retry_delay(const char *error, uint8_t attempt) {
+    bool retryable = false;
+    if (strncmp(error, "http_", 5) == 0) {
+        unsigned code = 0;
+        char extra = 0;
+        retryable = sscanf(error, "http_%u%c", &code, &extra) == 1 &&
+            (code == 408 || code == 429 || (code >= 500 && code <= 599));
+    } else {
+        static const char *const transient[] = {
+            "connect_failed", "write_failed", "response_header_failed",
+            "response_incomplete", "operation_timeout", "import_process_timeout",
+            "import_missing", "import_closed_before_upload", "tls_heap_guard",
+            "http_client_alloc_failed", "request_alloc_failed", "token_alloc_failed",
+            "request_header_alloc_failed", "response_alloc_failed", "upload_buffer_alloc",
+            "catalog_not_ready", "catalog_read", "storage_unavailable", "state_directory",
+            "local_open", "local_read_short", "inflight_write", "inflight_remove",
+            "done_marker_write",
+        };
+        for (const char *value : transient)
+            if (strcmp(error, value) == 0) { retryable = true; break; }
+    }
+    if (!retryable) return 0;
+    // Brief heap pressure gets three short retries, then normal backoff.
+    if (strcmp(error, "tls_heap_guard") == 0 && attempt < 3) return 10000;
+    constexpr uint32_t delays[] = {15 * 60 * 1000UL, 60 * 60 * 1000UL, 6 * 60 * 60 * 1000UL};
+    return delays[attempt < 3 ? attempt : 2];
+}
+
+static void publish_sleephq_retry(uint32_t delay_ms = 0) {
+    const uint32_t retry_at = delay_ms
+        ? static_cast<uint32_t>(time(nullptr)) + delay_ms / 1000 : 0;
+    portENTER_CRITICAL(&sleephq_status_mux);
+    sleephq_status.retry_pending = delay_ms != 0;
+    sleephq_status.retry_at_epoch = retry_at;
+    portEXIT_CRITICAL(&sleephq_status_mux);
+    publish_change();
+}
+
+static void reset_sleephq_retry(uint32_t revision) {
+    sleephq_retry = {};
+    sleephq_retry.config_revision = revision;
+    publish_sleephq_retry();
+}
+
 static void sleephq_failed(const char *error, const SleepHqSync::Progress &progress = {},
                            const char *request = "") {
+    const uint32_t delay_ms = sleephq_retry_delay(error, sleephq_retry.attempt);
+    if (sleephq_retry.attempt < UINT8_MAX) ++sleephq_retry.attempt;
+    sleephq_retry.pending = delay_ms != 0;
+    sleephq_retry.blocked = !delay_ms;
+    sleephq_retry.due_ms = millis() + delay_ms;
     set_sleephq_state(State::Error, error);
-    Log::logf(CAT_EXPORT, LOG_ERROR,
-              "[SLEEPHQ] Sync failed: %s phase=%s import=%lu file=%s request=%s\n",
+    publish_sleephq_retry(delay_ms);
+    Log::logf(CAT_EXPORT, delay_ms ? LOG_WARN : LOG_ERROR,
+              "[SLEEPHQ] Sync failed: %s phase=%s import=%lu retry=%lus request=%s file=%s\n",
               error, progress.phase ? progress.phase : "admission",
-              (unsigned long)progress.import_id,
-              progress.file[0] ? progress.file : "-", request[0] ? request : "-");
+              (unsigned long)progress.import_id, (unsigned long)(delay_ms / 1000),
+              request[0] ? request : "-", progress.file[0] ? progress.file : "-");
 }
 
 static bool run_sleephq(const Request &request) {
     const uint32_t config_revision = request.kind == RequestKind::PostTherapy
         ? Config::revision(Config::Section::SleepHq) : request.config_revision;
+    if (request.kind == RequestKind::ManualSleepHq ||
+        sleephq_retry.config_revision != config_revision)
+        reset_sleephq_retry(config_revision);
+    sleephq_retry.pending = false;
+    publish_sleephq_retry();
     char error[96] = {};
     SleepHqSync::Config config = {};
     if (!snapshot_sleephq_config(config, error, sizeof(error))) {
@@ -869,6 +936,7 @@ static bool run_sleephq(const Request &request) {
     sleephq_status.current_day[0] = 0;
     portEXIT_CRITICAL(&sleephq_status_mux);
     publish_change();
+    reset_sleephq_retry(config_revision);
     set_sleephq_state(State::Idle);
     return true;
 }
@@ -1112,12 +1180,20 @@ static void run_logged(const Request &request, const char *name,
     const bool smb = strcmp(name, "SMB") == 0;
     const auto section = smb ? Config::Section::Smb : Config::Section::SleepHq;
     const uint32_t config_revision = Config::revision(section);
+    if (!smb && request.kind != RequestKind::ManualSleepHq &&
+        request.kind != RequestKind::RetrySleepHq &&
+        sleephq_retry.config_revision == config_revision &&
+        (sleephq_retry.pending || sleephq_retry.blocked)) {
+        settle_request(request);
+        return;
+    }
     if (request_aborted(request)) {
         settle_request(request);
         return;
     }
     const uint32_t started = millis();
     Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync started reason=%s wait=%lums\n", name,
+              request.kind == RequestKind::RetrySleepHq ? "retry" :
               request.kind == RequestKind::PostTherapy ? "post_therapy" :
               request.kind == RequestKind::StartupSmb ||
               request.kind == RequestKind::StartupSleepHq ? "startup" : "manual",
@@ -1146,11 +1222,35 @@ static void run_logged(const Request &request, const char *name,
               (unsigned)EXPORT_TASK_STACK);
 }
 
+static bool take_sleephq_retry(Request &request) {
+    if (!sleephq_retry.pending ||
+        static_cast<int32_t>(millis() - sleephq_retry.due_ms) < 0 ||
+        !Config::get().sleephq_enabled || !AirSenseState::device_standby() ||
+        WiFi.status() != WL_CONNECTED || !SdStorage::mounted() ||
+        !SdStorage::local_access_allowed() || busy() ||
+        __atomic_load_n(&check_pending, __ATOMIC_ACQUIRE)) return false;
+    request = {};
+    request.kind = RequestKind::RetrySleepHq;
+    request.config_revision = sleephq_retry.config_revision;
+    request.generation = __atomic_load_n(&abort_generation, __ATOMIC_ACQUIRE);
+    request.queued_ms = millis();
+    set_sleephq_state(State::Pending);
+    return true;
+}
+
 static void export_task(void *) {
     while (true) {
+        const uint32_t shq_revision = Config::revision(Config::Section::SleepHq);
+        if (sleephq_retry.config_revision != shq_revision) {
+            const bool failed = sleephq_retry.pending || sleephq_retry.blocked;
+            reset_sleephq_retry(shq_revision);
+            if (failed && __atomic_load_n(&sleephq_status.state, __ATOMIC_ACQUIRE) == State::Error)
+                set_sleephq_state(State::Idle);
+        }
         refresh_backlog();
         Request request;
-        if (xQueueReceive(request_queue, &request, pdMS_TO_TICKS(1000)) != pdTRUE)
+        if (xQueueReceive(request_queue, &request, pdMS_TO_TICKS(1000)) != pdTRUE &&
+            !take_sleephq_retry(request))
             continue;
         if (request.generation !=
             __atomic_load_n(&abort_generation, __ATOMIC_ACQUIRE)) {
@@ -1193,7 +1293,8 @@ static void export_task(void *) {
 
         if (request.kind == RequestKind::ManualSmb || request.kind == RequestKind::StartupSmb) {
             run_logged(request, "SMB", run_smb, get_status);
-        } else if (request.kind == RequestKind::ManualSleepHq || request.kind == RequestKind::StartupSleepHq) {
+        } else if (request.kind == RequestKind::ManualSleepHq || request.kind == RequestKind::StartupSleepHq ||
+                   request.kind == RequestKind::RetrySleepHq) {
             run_logged(request, "SLEEPHQ", run_sleephq, get_sleephq_status, false);
         } else {
             const AirBridgeConfig &config = Config::get();
@@ -1272,9 +1373,15 @@ void therapy_started() {
         if (shq.check.state == CheckState::Pending || shq.check.state == CheckState::Working)
             set_check(false, generation, CheckState::Failed, shq.check.config_revision, "preempted");
     }
-    set_state(Config::get().smb_enabled ? State::Idle : State::Disabled);
-    set_sleephq_state(Config::get().sleephq_enabled
-                          ? State::Idle : State::Disabled);
+    portENTER_CRITICAL(&status_mux);
+    if (status.state == State::Pending || status.state == State::Working)
+        status.state = State::Idle;
+    portEXIT_CRITICAL(&status_mux);
+    portENTER_CRITICAL(&sleephq_status_mux);
+    if (sleephq_status.state == State::Pending || sleephq_status.state == State::Working)
+        sleephq_status.state = State::Idle;
+    portEXIT_CRITICAL(&sleephq_status_mux);
+    publish_change();
 }
 
 bool request_post_therapy(const EdfCatalog::Entry &entry) {
@@ -1291,7 +1398,12 @@ bool request_post_therapy(const EdfCatalog::Entry &entry) {
     request.queued_ms = millis();
     if (xQueueSend(request_queue, &request, 0) != pdTRUE) return false;
     if (smb) set_state(State::Pending);
-    if (sleephq) set_sleephq_state(State::Pending);
+    if (sleephq) {
+        portENTER_CRITICAL(&sleephq_status_mux);
+        if (sleephq_status.state != State::Error) sleephq_status.state = State::Pending;
+        portEXIT_CRITICAL(&sleephq_status_mux);
+        publish_change();
+    }
     return true;
 }
 
