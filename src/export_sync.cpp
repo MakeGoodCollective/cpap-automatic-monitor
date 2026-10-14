@@ -134,6 +134,19 @@ static bool generation_aborted(uint32_t generation) {
            AirSenseState::rop() == 1;
 }
 
+static bool request_aborted(const Request &request) {
+    if (generation_aborted(request.generation)) return true;
+    if (request.kind == RequestKind::PostTherapy) {
+        const auto &config = Config::get();
+        return !(config.smb_enabled && config.smb_auto_after_therapy) &&
+               !(config.sleephq_enabled && config.sleephq_auto_after_therapy);
+    }
+    const bool smb = request.kind == RequestKind::ManualSmb ||
+        request.kind == RequestKind::StartupSmb || request.kind == RequestKind::CheckSmb;
+    return Config::revision(smb ? Config::Section::Smb : Config::Section::SleepHq) !=
+        request.config_revision;
+}
+
 static bool export_ready(const EdfCatalog::Entry &entry) {
     constexpr uint8_t required = EdfCatalog::ENTRY_LIVE_COMPLETE |
         EdfCatalog::ENTRY_IDENTIFICATION_READY | EdfCatalog::ENTRY_STR_READY;
@@ -174,6 +187,22 @@ static void set_sleephq_state(State state, const char *error = nullptr) {
     publish_change();
 }
 
+static void settle_request(const Request &request) {
+    if (request.kind == RequestKind::PostTherapy ||
+        request.kind == RequestKind::ManualSmb || request.kind == RequestKind::StartupSmb) {
+        portENTER_CRITICAL(&status_mux);
+        if (status.state == State::Pending) status.state = State::Idle;
+        portEXIT_CRITICAL(&status_mux);
+    }
+    if (request.kind == RequestKind::PostTherapy ||
+        request.kind == RequestKind::ManualSleepHq || request.kind == RequestKind::StartupSleepHq) {
+        portENTER_CRITICAL(&sleephq_status_mux);
+        if (sleephq_status.state == State::Pending) sleephq_status.state = State::Idle;
+        portEXIT_CRITICAL(&sleephq_status_mux);
+    }
+    publish_change();
+}
+
 static void publish_sleephq_progress(
     void *, const SleepHqSync::Progress &progress) {
     portENTER_CRITICAL(&sleephq_status_mux);
@@ -193,8 +222,8 @@ static void publish_sleephq_progress(
 static bool run_aborted(void *context) {
     const RunContext *run = static_cast<const RunContext *>(context);
     return !run || generation_aborted(run->generation) ||
-           (run->network_only ? !AirSenseState::device_standby() ||
-               Config::revision(run->section) != run->config_revision : !storage.valid());
+           Config::revision(run->section) != run->config_revision ||
+           (run->network_only ? !AirSenseState::device_standby() : !storage.valid());
 }
 
 static bool wait_resolve(StorageSmbClient &client, RunContext &run,
@@ -609,6 +638,8 @@ static bool snapshot_smb_config(SmbConfig &out,
 }
 
 static bool run_smb(const Request &request) {
+    const uint32_t config_revision = request.kind == RequestKind::PostTherapy
+        ? Config::revision(Config::Section::Smb) : request.config_revision;
     char error[64] = {};
     SmbConfig config = {};
     if (!snapshot_smb_config(config, error, sizeof(error))) {
@@ -648,6 +679,8 @@ static bool run_smb(const Request &request) {
 
     RunContext run = {};
     run.generation = request.generation;
+    run.section = Config::Section::Smb;
+    run.config_revision = config_revision;
     run.operation.started_ms = millis();
     run.operation.last_progress_ms = run.operation.started_ms;
     run.operation.timeout_ms = OPERATION_IDLE_TIMEOUT_MS;
@@ -692,7 +725,7 @@ static bool run_smb(const Request &request) {
     if (client.connected()) disconnect(client, run);
     else client.abort_connection();
     heap_caps_free(buffer);
-    if (!success) {
+    if (!success || run_aborted(&run)) {
         if (run_aborted(&run)) set_state(State::Idle);
         else set_state(State::Error,
                        error[0] ? error : "smb_sync_failed");
@@ -739,16 +772,28 @@ static bool snapshot_sleephq_config(SleepHqSync::Config &out,
     return true;
 }
 
+static void sleephq_failed(const char *error, const SleepHqSync::Progress &progress = {},
+                           const char *request = "") {
+    set_sleephq_state(State::Error, error);
+    Log::logf(CAT_EXPORT, LOG_ERROR,
+              "[SLEEPHQ] Sync failed: %s phase=%s import=%lu file=%s request=%s\n",
+              error, progress.phase ? progress.phase : "admission",
+              (unsigned long)progress.import_id,
+              progress.file[0] ? progress.file : "-", request[0] ? request : "-");
+}
+
 static bool run_sleephq(const Request &request) {
+    const uint32_t config_revision = request.kind == RequestKind::PostTherapy
+        ? Config::revision(Config::Section::SleepHq) : request.config_revision;
     char error[96] = {};
     SleepHqSync::Config config = {};
     if (!snapshot_sleephq_config(config, error, sizeof(error))) {
-        set_sleephq_state(error[0] ? State::Error : State::Disabled,
-                          error[0] ? error : nullptr);
+        if (error[0]) sleephq_failed(error);
+        else set_sleephq_state(State::Disabled);
         return !error[0];
     }
     if (!aircannect::TlsMemory::status().installed) {
-        set_sleephq_state(State::Error, "tls_allocator_install");
+        sleephq_failed("tls_allocator_install");
         return false;
     }
 
@@ -770,12 +815,14 @@ static bool run_sleephq(const Request &request) {
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
     if (!catalog.ready) {
-        set_sleephq_state(State::Error, "catalog_not_ready");
+        sleephq_failed("catalog_not_ready");
         return false;
     }
 
     RunContext run = {};
     run.generation = request.generation;
+    run.section = Config::Section::SleepHq;
+    run.config_revision = config_revision;
     run.operation.started_ms = millis();
     run.operation.last_progress_ms = run.operation.started_ms;
     run.operation.timeout_ms = SLEEPHQ_IDLE_TIMEOUT_MS;
@@ -784,8 +831,13 @@ static bool run_sleephq(const Request &request) {
     run.operation.ctx = &run;
 
     SleepHqSync::Progress progress = {};
+    SleepHqSync::Run sync(config);
     bool success = true;
     for (uint32_t i = catalog.entries; success && i > 0; i--) {
+        if (run_aborted(&run)) {
+            success = false;
+            break;
+        }
         EdfCatalog::Entry entry;
         if (!storage.run([&](fs::FS &) { return EdfCatalog::read(i - 1, entry); })) {
             copy_text(error, sizeof(error), "catalog_read");
@@ -794,8 +846,8 @@ static bool run_sleephq(const Request &request) {
         }
         if (!export_ready(entry)) continue;
         SleepHqSync::BacklogChanges changes = {};
-        success = SleepHqSync::sync_session(
-            storage, config, entry, run.operation, progress,
+        success = sync.sync_session(
+            storage, entry, run.operation, progress,
             publish_sleephq_progress, nullptr, error, sizeof(error), &changes);
         if (changes.entry) invalidate_backlog_entry(i - 1, SHQ_VALID);
         if (changes.other_entries) {
@@ -805,10 +857,10 @@ static bool run_sleephq(const Request &request) {
         }
     }
 
-    if (!success) {
+    if (!success || run_aborted(&run)) {
         if (run_aborted(&run)) set_sleephq_state(State::Idle);
-        else set_sleephq_state(State::Error,
-                               error[0] ? error : "sleephq_sync_failed");
+        else sleephq_failed(error[0] ? error : "sleephq_sync_failed",
+                            progress, sync.last_request());
         return false;
     }
 
@@ -1055,7 +1107,15 @@ static void refresh_backlog() {
 
 template <typename T>
 static void run_logged(const Request &request, const char *name,
-                        bool (*run)(const Request &), void (*snapshot)(T &)) {
+                        bool (*run)(const Request &), void (*snapshot)(T &),
+                        bool generic_error = true) {
+    const bool smb = strcmp(name, "SMB") == 0;
+    const auto section = smb ? Config::Section::Smb : Config::Section::SleepHq;
+    const uint32_t config_revision = Config::revision(section);
+    if (request_aborted(request)) {
+        settle_request(request);
+        return;
+    }
     const uint32_t started = millis();
     Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync started reason=%s wait=%lums\n", name,
               request.kind == RequestKind::PostTherapy ? "post_therapy" :
@@ -1065,10 +1125,14 @@ static void run_logged(const Request &request, const char *name,
     bool success = run(request);
     T result;
     snapshot(result);
-    if (!success && (generation_aborted(request.generation) || !storage.valid())) {
-        Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync interrupted by storage change or therapy\n", name);
+    if (!success && (generation_aborted(request.generation) || !storage.valid() ||
+                     Config::revision(section) != config_revision)) {
+        Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync interrupted: %s\n", name,
+                  Config::revision(section) != config_revision ? "configuration changed" :
+                  generation_aborted(request.generation) ? "therapy started" : "storage changed");
     } else if (!success) {
-        Log::logf(CAT_EXPORT, LOG_ERROR, "[%s] Sync failed: %s\n", name, result.last_error);
+        if (generic_error)
+            Log::logf(CAT_EXPORT, LOG_ERROR, "[%s] Sync failed: %s\n", name, result.last_error);
     } else if (result.state == State::Disabled) {
         Log::logf(CAT_EXPORT, LOG_DEBUG, "[%s] Sync skipped: disabled\n", name);
     } else {
@@ -1098,17 +1162,20 @@ static void export_task(void *) {
         }
         while ((WiFi.status() != WL_CONNECTED ||
                 AirSenseState::rop() < 0) &&
-               !generation_aborted(request.generation)) {
+               !request_aborted(request)) {
             refresh_backlog();
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
-        if (generation_aborted(request.generation)) continue;
+        if (request_aborted(request)) {
+            settle_request(request);
+            continue;
+        }
 
         const uint32_t preparation = request.kind == RequestKind::PostTherapy
             ? EdfReport::prepare_before_export(request.entry.therapy_day) : 0;
         const uint32_t preparation_started = millis();
         bool admitted = false;
-        while (!generation_aborted(request.generation)) {
+        while (!request_aborted(request)) {
             const bool preparing = EdfReport::preparation_pending(preparation) &&
                 uint32_t(millis() - preparation_started) < 60000;
             if (!preparing && AirSenseState::device_standby() && storage.begin()) {
@@ -1117,23 +1184,27 @@ static void export_task(void *) {
             }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        if (!admitted) continue;
-        if (generation_aborted(request.generation)) { storage.end(); continue; }
+        if (!admitted || request_aborted(request)) {
+            storage.end();
+            settle_request(request);
+            continue;
+        }
         request_backlog_refresh();
 
         if (request.kind == RequestKind::ManualSmb || request.kind == RequestKind::StartupSmb) {
             run_logged(request, "SMB", run_smb, get_status);
         } else if (request.kind == RequestKind::ManualSleepHq || request.kind == RequestKind::StartupSleepHq) {
-            run_logged(request, "SLEEPHQ", run_sleephq, get_sleephq_status);
+            run_logged(request, "SLEEPHQ", run_sleephq, get_sleephq_status, false);
         } else {
             const AirBridgeConfig &config = Config::get();
             if (config.smb_enabled && config.smb_auto_after_therapy)
                 run_logged(request, "SMB", run_smb, get_status);
             if (!generation_aborted(request.generation) &&
                 config.sleephq_enabled && config.sleephq_auto_after_therapy)
-                run_logged(request, "SLEEPHQ", run_sleephq, get_sleephq_status);
+                run_logged(request, "SLEEPHQ", run_sleephq, get_sleephq_status, false);
         }
         storage.end();
+        settle_request(request);
     }
 }
 

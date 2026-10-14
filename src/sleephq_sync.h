@@ -5,17 +5,12 @@
 
 #include "background_operation_control.h"
 #include "edf_catalog.h"
-#include "sleephq_protocol.h"
+#include "sleephq_client.h"
 #include "sd_storage.h"
 
 namespace SleepHqSync {
 
-struct Config {
-    char client_id[aircannect::AC_SLEEPHQ_SECRET_MAX];
-    char client_secret[aircannect::AC_SLEEPHQ_SECRET_MAX];
-    char team_id[aircannect::AC_SLEEPHQ_ID_MAX];
-    char device_id[aircannect::AC_SLEEPHQ_ID_MAX];
-};
+using Config = aircannect::SleepHqConfig;
 
 struct Progress {
     uint32_t files_seen;
@@ -25,6 +20,8 @@ struct Progress {
     uint32_t import_id;
     char current_day[9];
     char import_status[aircannect::AC_SLEEPHQ_STATUS_MAX];
+    const char *phase;
+    char file[128];
 };
 
 using ProgressCallback = void (*)(void *context, const Progress &progress);
@@ -43,11 +40,22 @@ bool complete(SdStorage::Session &storage, const Config &config,
 bool pending_files(SdStorage::Session &storage, const Config &config,
                    const EdfCatalog::Entry &entry, uint32_t &files,
                    bool &incomplete, char *error, size_t error_size);
-bool sync_session(SdStorage::Session &storage, const Config &config,
-                  const EdfCatalog::Entry &entry,
-                  aircannect::BackgroundOperationControl &operation,
-                  Progress &progress, ProgressCallback callback,
-                  void *callback_context, char *error, size_t error_size,
-                  BacklogChanges *changes = nullptr);
+// One run owns authentication and team resolution across catalog entries.
+class Run {
+public:
+    explicit Run(const Config &config);
+    bool sync_session(SdStorage::Session &storage,
+                      const EdfCatalog::Entry &entry,
+                      aircannect::BackgroundOperationControl &operation,
+                      Progress &progress, ProgressCallback callback,
+                      void *callback_context, char *error, size_t error_size,
+                      BacklogChanges *changes = nullptr);
+    const char *last_request() const { return client_.last_request(); }
+
+private:
+    const Config config_;
+    aircannect::SleepHqClient client_;
+    uint32_t team_id_ = 0;
+};
 
 }  // namespace SleepHqSync

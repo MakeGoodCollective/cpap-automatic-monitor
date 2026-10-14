@@ -18,7 +18,6 @@ namespace {
 using aircannect::BackgroundOperationControl;
 using aircannect::BackgroundOperationStop;
 using aircannect::SleepHqClient;
-using aircannect::SleepHqConfig;
 using aircannect::SleepHqImportInfo;
 using aircannect::SleepHqImportStatusKind;
 using aircannect::SleepHqUploadRequest;
@@ -287,9 +286,9 @@ static bool write_journal(SdStorage::Session &access, const StatePaths &paths,
 
 static bool remove_journal(SdStorage::Session &access, const StatePaths &paths) {
     return access.run([&](fs::FS &storage) {
-        storage.remove(paths.journal);
-        storage.remove(paths.journal_part);
-        storage.remove(paths.journal_backup);
+        // Remove recovery copies first so a failed cleanup cannot resurrect one.
+        for (const char *path : {paths.journal_backup, paths.journal_part, paths.journal})
+            if (storage.exists(path) && !storage.remove(path)) return false;
         return true;
     });
 }
@@ -452,10 +451,34 @@ static bool finish_import(SdStorage::Session &storage, const StatePaths &paths,
         set_error(error, error_size, "done_marker_write");
         return false;
     }
-    remove_journal(storage, paths);
+    if (!remove_journal(storage, paths)) {
+        set_error(error, error_size, "inflight_remove");
+        return false;
+    }
     progress.current_day[0] = 0;
     publish(progress, callback, callback_context);
     return true;
+}
+
+static bool fetch_import(SdStorage::Session &storage, const StatePaths &paths,
+                         SleepHqClient &client, const Journal &journal,
+                         BackgroundOperationControl &operation,
+                         SleepHqImportInfo &info, char *error, size_t error_size) {
+    if (client.get_import(journal.import_id, info, &operation)) return true;
+    const bool missing = client.last_http_status() == 404 &&
+        strcmp(client.last_error(), "http_404") == 0 &&
+        strncmp(client.last_request(), "GET ", 4) == 0;
+    if (!missing) {
+        set_error(error, error_size, client.last_error());
+        return false;
+    }
+    if (!remove_journal(storage, paths)) {
+        set_error(error, error_size, "inflight_remove");
+        return false;
+    }
+    // Only the remote handle is invalidated; EDF files and done markers stay.
+    set_error(error, error_size, "import_missing");
+    return false;
 }
 
 static bool poll_import(SdStorage::Session &storage, const StatePaths &paths,
@@ -467,13 +490,13 @@ static bool poll_import(SdStorage::Session &storage, const StatePaths &paths,
     const uint32_t started = millis();
     bool process_requested = false;
     while (true) {
+        progress.phase = "import_status";
+        progress.file[0] = 0;
         if (!operation_allows(operation, error, error_size)) return false;
 
         SleepHqImportInfo info;
-        if (!client.get_import(journal.import_id, info, &operation)) {
-            set_error(error, error_size, client.last_error());
-            return false;
-        }
+        if (!fetch_import(storage, paths, client, journal, operation, info,
+                          error, error_size)) return false;
         operation.note_progress(millis());
         progress.import_id = journal.import_id;
         copy_cstr(progress.import_status, sizeof(progress.import_status),
@@ -486,14 +509,15 @@ static bool poll_import(SdStorage::Session &storage, const StatePaths &paths,
             return finish_import(storage, paths, journal, progress, callback,
                                  callback_context, error, error_size);
         if (kind == SleepHqImportStatusKind::Failure) {
-            remove_journal(storage, paths);
-            set_error(error, error_size,
-                      info.failed_reason[0] ? info.failed_reason
-                                            : "import_failed");
+            Log::logf(CAT_EXPORT, LOG_WARN, "[SLEEPHQ] Import %lu rejected: %.80s\n",
+                      (unsigned long)journal.import_id, info.failed_reason);
+            set_error(error, error_size, remove_journal(storage, paths)
+                ? "import_failed" : "inflight_remove");
             return false;
         }
 
         if (!process_requested && status_needs_process(info.status)) {
+            progress.phase = "process_import";
             if (!client.process_import(journal.import_id, &operation)) {
                 set_error(error, error_size, client.last_error());
                 return false;
@@ -524,6 +548,7 @@ static bool run_journal(SdStorage::Session &storage, const StatePaths &paths,
     publish(progress, callback, callback_context);
 
     if (journal.phase == PHASE_UPLOADING) {
+        progress.phase = "upload";
         for (size_t index = 0; index < FILE_COUNT; index++) {
             const uint16_t bit = static_cast<uint16_t>(1u << index);
             if (journal.uploaded_mask & bit) continue;
@@ -534,6 +559,7 @@ static bool run_journal(SdStorage::Session &storage, const StatePaths &paths,
                 set_error(error, error_size, "local_path_build");
                 return false;
             }
+            copy_cstr(progress.file, sizeof(progress.file), spec.local_path);
             progress.files_seen++;
             publish(progress, callback, callback_context);
 
@@ -617,15 +643,6 @@ static bool same_entry(const Journal &journal,
            journal.flags == entry.flags;
 }
 
-static bool configure_client(SleepHqClient &client, const Config &config) {
-    SleepHqConfig client_config;
-    copy_cstr(client_config.client_id, sizeof(client_config.client_id), config.client_id);
-    copy_cstr(client_config.client_secret, sizeof(client_config.client_secret), config.client_secret);
-    copy_cstr(client_config.team_id, sizeof(client_config.team_id), config.team_id);
-    copy_cstr(client_config.device_id, sizeof(client_config.device_id), config.device_id);
-    return client.configure(client_config);
-}
-
 }  // namespace
 
 bool configured(const Config &config) {
@@ -642,7 +659,7 @@ bool check_account(const Config &config, BackgroundOperationControl &operation,
         return false;
     }
     SleepHqClient client;
-    bool success = configure_client(client, config) &&
+    bool success = client.configure(config) &&
         client.resolve_team_id(team_id, &operation);
     bool more = true;
     for (uint32_t page = 1; success && more && !selection.found; ++page) {
@@ -705,13 +722,22 @@ bool pending_files(SdStorage::Session &storage, const Config &config,
     return true;
 }
 
-bool sync_session(SdStorage::Session &storage, const Config &config,
+Run::Run(const Config &config) : config_(config) {
+    client_.configure(config_);
+}
+
+bool Run::sync_session(SdStorage::Session &storage,
                   const EdfCatalog::Entry &entry,
                   BackgroundOperationControl &operation,
                   Progress &progress, ProgressCallback callback,
                   void *callback_context, char *error, size_t error_size,
                   BacklogChanges *changes) {
     if (changes) *changes = {};
+    const Config &config = config_;
+    SleepHqClient &client = client_;
+    progress.phase = "journal";
+    progress.file[0] = 0;
+    if (!operation_allows(operation, error, error_size)) return false;
     if (!configured(config)) {
         set_error(error, error_size, "not_configured");
         return false;
@@ -724,12 +750,6 @@ bool sync_session(SdStorage::Session &storage, const Config &config,
         return false;
     }
 
-    SleepHqClient client;
-    if (!configure_client(client, config)) {
-        set_error(error, error_size, "not_configured");
-        return false;
-    }
-
     Journal journal = {};
     const JournalLoad loaded = load_journal(storage, paths, journal);
     if (loaded == JournalLoad::Unavailable) {
@@ -737,24 +757,37 @@ bool sync_session(SdStorage::Session &storage, const Config &config,
         return false;
     }
     if (loaded == JournalLoad::Invalid) {
-        if (changes) changes->other_entries = true;
-        Log::logf(CAT_EXPORT, LOG_WARN,
-                  "[SLEEPHQ] discarded invalid inflight journal\n");
-        remove_journal(storage, paths);
+        set_error(error, error_size, "inflight_invalid");
+        return false;
     } else if (loaded == JournalLoad::Valid) {
         const bool requested_entry = same_entry(journal, entry);
         if (changes) {
             changes->entry = requested_entry;
             changes->other_entries = !requested_entry;
         }
+        progress.import_id = journal.import_id;
+        progress.phase = "resume_import";
+        if (journal.phase == PHASE_UPLOADING) {
+            SleepHqImportInfo info;
+            if (!fetch_import(storage, paths, client, journal, operation, info,
+                              error, error_size)) return false;
+            const auto kind = sleephq_classify_import_status(info.status);
+            const bool all_uploaded = journal.uploaded_mask == (1u << FILE_COUNT) - 1;
+            if (kind == SleepHqImportStatusKind::Failure ||
+                (!status_needs_process(info.status) && !all_uploaded)) {
+                const char *reason = kind == SleepHqImportStatusKind::Failure
+                    ? "import_failed" : "import_closed_before_upload";
+                set_error(error, error_size, remove_journal(storage, paths)
+                    ? reason : "inflight_remove");
+                return false;
+            }
+        }
         if (!run_journal(storage, paths, client, journal, operation,
                          progress, callback, callback_context,
                          error, error_size)) {
-            client.disconnect();
             return false;
         }
         if (requested_entry) {
-            client.disconnect();
             return true;
         }
     }
@@ -762,24 +795,23 @@ bool sync_session(SdStorage::Session &storage, const Config &config,
     if (marker_valid(storage, paths, entry)) {
         progress.files_skipped += FILE_COUNT;
         publish(progress, callback, callback_context);
-        client.disconnect();
         return true;
     }
 
-    uint32_t team_id = 0;
-    if (!client.resolve_team_id(team_id, &operation)) {
+    progress.phase = "resolve_team";
+    progress.import_id = 0;
+    if (!team_id_ && !client.resolve_team_id(team_id_, &operation)) {
         set_error(error, error_size, client.last_error());
-        client.disconnect();
         return false;
     }
     operation.note_progress(millis());
 
     SleepHqImportInfo import;
-    if (!client.create_import(team_id, import, &operation) || !import.id) {
+    progress.phase = "create_import";
+    if (!client.create_import(team_id_, import, &operation) || !import.id) {
         set_error(error, error_size,
                   client.last_error()[0] ? client.last_error()
                                          : "import_id_missing");
-        client.disconnect();
         return false;
     }
     operation.note_progress(millis());
@@ -793,7 +825,7 @@ bool sync_session(SdStorage::Session &storage, const Config &config,
     journal.phase = PHASE_UPLOADING;
     journal.flags = entry.flags;
     journal.import_id = import.id;
-    journal.team_id = team_id;
+    journal.team_id = team_id_;
     journal.finalized_epoch = entry.finalized_epoch;
     journal.str_revision = entry.str_revision;
     copy_cstr(journal.therapy_day, sizeof(journal.therapy_day),
@@ -803,7 +835,6 @@ bool sync_session(SdStorage::Session &storage, const Config &config,
     if (changes) changes->entry = true;
     if (!write_journal(storage, paths, journal)) {
         set_error(error, error_size, "inflight_write");
-        client.disconnect();
         return false;
     }
 
@@ -814,7 +845,6 @@ bool sync_session(SdStorage::Session &storage, const Config &config,
     const bool success = run_journal(
         storage, paths, client, journal, operation, progress,
         callback, callback_context, error, error_size);
-    client.disconnect();
     return success;
 }
 
