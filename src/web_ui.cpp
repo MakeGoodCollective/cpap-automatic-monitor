@@ -10,6 +10,7 @@
 #include "crash_diagnostics.h"
 #include "app_config.h"
 #include "auth_utils.h"
+#include "async_deferred_response.h"
 #include "build_info.h"
 #include "wifi_setup.h"
 #include "network_hints.h"
@@ -1695,8 +1696,22 @@ static void handleBleAction(AsyncWebServerRequest *request) {
 
 extern void dispatch_command(const char *line, String &response);
 
+using aircannect::AsyncDeferredResponse;
+
+static std::shared_ptr<AsyncDeferredResponse::State> deferResponse(AsyncWebServerRequest *request) {
+    auto state = std::shared_ptr<AsyncDeferredResponse::State>(new(std::nothrow) AsyncDeferredResponse::State);
+    auto *response = state ? new(std::nothrow) AsyncDeferredResponse(state) : nullptr;
+    if (!response) {
+        request->send(503);
+        return nullptr;
+    }
+    request->client()->setRxTimeout(0);
+    request->send(response);
+    return state;
+}
+
 struct WebCommand {
-    AsyncWebServerRequestPtr request;
+    std::shared_ptr<AsyncDeferredResponse::State> response;
     uart_transaction_t *transaction = nullptr;
     bool refresh_therapy = false;
 };
@@ -1713,7 +1728,12 @@ static void queueWebCommand(AsyncWebServerRequest *request, const String &cmd) {
     auto *transaction = slot ? Arbiter::begin_cmd(cmd.c_str(), CMD_SRC_TCP,
                                                   CMD_PRIO_NORMAL, uint16_t(128)) : nullptr;
     if (transaction) {
-        slot->request = request->pause();
+        slot->response = deferResponse(request);
+        if (!slot->response) {
+            xSemaphoreGive(command_mutex);
+            Arbiter::cancel_transaction(transaction);
+            return;
+        }
         slot->transaction = transaction;
         slot->refresh_therapy = cmd.startsWith("P S #ROP ");
     }
@@ -1726,7 +1746,7 @@ static void serviceWebCommands() {
     if (!command_mutex) return;
     for (auto &slot : web_commands) {
         if (xSemaphoreTake(command_mutex, 0) != pdTRUE) return;
-        if (!slot.transaction || (!slot.request.expired() &&
+        if (!slot.transaction || (!slot.response->cancelled() &&
             !Arbiter::transaction_done(slot.transaction) &&
             !Arbiter::transaction_expired(slot.transaction))) {
             xSemaphoreGive(command_mutex);
@@ -1736,19 +1756,19 @@ static void serviceWebCommands() {
         slot.transaction = nullptr;
         xSemaphoreGive(command_mutex);
 
-        auto request = pending.request.lock();
+        const bool connected = !pending.response->cancelled();
         char response[128] = {};
         uint16_t length = sizeof(response);
         bool ok = false;
         Arbiter::VarReadTrace trace;
-        if (request && Arbiter::transaction_done(pending.transaction)) {
+        if (connected && Arbiter::transaction_done(pending.transaction)) {
             ok = Arbiter::finish_cmd(pending.transaction, response, &length, nullptr, &trace);
         } else {
             Arbiter::cancel_transaction(pending.transaction);
             length = 0;
             trace.outcome = "deadline";
         }
-        if (!request) continue;
+        if (!connected) continue;
 
         if (ok && pending.refresh_therapy) AirSenseState::request_refresh();
         String json = "{";
@@ -1757,7 +1777,8 @@ static void serviceWebCommands() {
             jsonAddString(json, "error", strcmp(trace.outcome, "ok") ? trace.outcome : "command_failed");
         if (length) jsonAddString(json, "response", response);
         json += '}';
-        request->send(200, "application/json", json);
+        pending.response->publish(std::unique_ptr<AsyncWebServerResponse>(
+            new(std::nothrow) AsyncBasicResponse(200, "application/json", json)));
     }
 }
 
@@ -2245,23 +2266,25 @@ static void handleReportArtifact(AsyncWebServerRequest *request) {
     const auto range = operation.ranges[0];
     const uint8_t count = operation.range_count;
     const bool head = operation.head;
-    auto paused = request->pause();
+    auto deferred = deferResponse(request);
+    if (!deferred) return;
     std::weak_ptr<StorageBrowser::Transfer> active;
     const auto result = EdfReport::open_artifact(request->getParam("day")->value().c_str(),
         request->getParam("hash")->value().c_str(), kind == "document", operation,
-        [paused, range, count, head, tag, kind](int code, const char *error,
+        [deferred, range, count, head, tag, kind](int code, const char *error,
             std::shared_ptr<StorageBrowser::Transfer> transfer, uint64_t size) {
-            auto request = paused.lock();
-            if (!request) { if (transfer) transfer->cancel(); return; }
+            if (deferred->cancelled()) { if (transfer) transfer->cancel(); return; }
             if (error) {
                 String body = "{";
                 jsonAddString(body, "error", error, false); body += '}';
-                request->send(code, "application/json", body); return;
+                deferred->publish(std::unique_ptr<AsyncWebServerResponse>(
+                    new(std::nothrow) AsyncBasicResponse(code, "application/json", body)));
+                return;
             }
-            AsyncWebServerResponse *response = transfer
-                ? new(std::nothrow) StorageResponse(transfer, StorageBrowser::Kind::Immutable, size, code)
-                : request->beginResponse(code);
-            if (!response) { if (transfer) transfer->cancel(); request->send(503); return; }
+            AsyncWebServerResponse *response = nullptr;
+            if (transfer) response = new(std::nothrow) StorageResponse(transfer, StorageBrowser::Kind::Immutable, size, code);
+            else response = new(std::nothrow) AsyncBasicResponse(code);
+            if (!response) { if (transfer) transfer->cancel(); deferred->publish(nullptr); return; }
             response->setContentType(count > 1 && code == 206
                 ? "multipart/byteranges; boundary=ab-range" : kind == "document" ? "application/json" : "application/octet-stream");
             if (head && code != 304) response->setContentLength(size);
@@ -2274,13 +2297,14 @@ static void handleReportArtifact(AsyncWebServerRequest *request) {
                     static_cast<unsigned long>(range.last), static_cast<unsigned long long>(transfer->representation_size()));
                 response->addHeader("Content-Range", text);
             }
-            request->send(response);
+            deferred->publish(std::unique_ptr<AsyncWebServerResponse>(response));
         }, active);
     if (result == StorageBrowser::StartResult::Started) request->onDisconnect([active]() {
         if (auto transfer = active.lock()) transfer->cancel();
     });
-    else request->send(result == StorageBrowser::StartResult::BadRequest ? 400 :
-        result == StorageBrowser::StartResult::Busy ? 409 : 503, "application/json", "{\"error\":\"artifact_unavailable\"}");
+    else deferred->publish(std::unique_ptr<AsyncWebServerResponse>(new(std::nothrow) AsyncBasicResponse(
+        result == StorageBrowser::StartResult::BadRequest ? 400 :
+        result == StorageBrowser::StartResult::Busy ? 409 : 503, "application/json", "{\"error\":\"artifact_unavailable\"}")));
 }
 
 static void handleStorageUsb(AsyncWebServerRequest *request) {
@@ -2358,47 +2382,49 @@ static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind k
             disposition += encoded;
         }
     }
-    auto paused = request->pause();
+    auto deferred = deferResponse(request);
+    if (!deferred) return;
     std::weak_ptr<StorageBrowser::Transfer> active;
     const auto result = StorageBrowser::start(operation,
-        [paused, kind, disposition, mutation](int code, const char *error,
+        [deferred, kind, disposition, mutation](int code, const char *error,
                                   std::shared_ptr<StorageBrowser::Transfer> transfer, uint64_t size) {
-            auto request = paused.lock();
-            if (!request) { if (transfer) transfer->cancel(); return; }
+            if (deferred->cancelled()) { if (transfer) transfer->cancel(); return; }
             if (mutation) {
                 String body = "{\"ok\":";
                 body += error ? "false" : "true";
                 jsonAddUInt32(body, "changed", size);
                 if (error) jsonAddString(body, "error", error);
                 body += '}';
-                request->send(code, "application/json", body);
+                deferred->publish(std::unique_ptr<AsyncWebServerResponse>(
+                    new(std::nothrow) AsyncBasicResponse(code, "application/json", body)));
                 return;
             }
             if (error) {
                 String body = "{\"error\":";
                 jsonQuote(body, error);
                 body += '}';
-                request->send(code, "application/json", body);
+                deferred->publish(std::unique_ptr<AsyncWebServerResponse>(
+                    new(std::nothrow) AsyncBasicResponse(code, "application/json", body)));
                 return;
             }
             auto *response = new(std::nothrow) StorageResponse(transfer, kind, size);
             if (!response) {
                 Log::logf(CAT_WEB, LOG_WARN, "Storage response allocation failed\n");
                 transfer->cancel();
-                request->send(503);
+                deferred->publish(nullptr);
                 return;
             }
             if (disposition.length()) response->addHeader("Content-Disposition", disposition);
-            request->send(response);
+            deferred->publish(std::unique_ptr<AsyncWebServerResponse>(response));
         }, active);
     if (result == StorageBrowser::StartResult::Started) request->onDisconnect([active]() {
         if (auto transfer = active.lock()) transfer->cancel();
     });
-    else if (result == StorageBrowser::StartResult::BadRequest)
-        request->send(400, "application/json", "{\"error\":\"invalid_path\"}");
-    else if (result == StorageBrowser::StartResult::Busy)
-        request->send(409, "application/json", "{\"error\":\"storage_busy\"}");
-    else request->send(503, "application/json", "{\"error\":\"storage_unavailable\"}");
+    else deferred->publish(std::unique_ptr<AsyncWebServerResponse>(new(std::nothrow) AsyncBasicResponse(
+        result == StorageBrowser::StartResult::BadRequest ? 400 :
+        result == StorageBrowser::StartResult::Busy ? 409 : 503, "application/json",
+        result == StorageBrowser::StartResult::BadRequest ? "{\"error\":\"invalid_path\"}" :
+        result == StorageBrowser::StartResult::Busy ? "{\"error\":\"storage_busy\"}" : "{\"error\":\"storage_unavailable\"}")));
 }
 #endif
 

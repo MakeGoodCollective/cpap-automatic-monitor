@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build patched WebResponses.cpp without changing the installed library."""
+"""Build patched HTTP/TCP sources without changing installed libraries."""
 
 from pathlib import Path
 import shutil
@@ -10,10 +10,11 @@ from library_patches import apply_patches, patch_files
 
 def build_source(env, node):
     original = Path(node.srcnode().get_abspath())
-    output = Path(env.subst("$BUILD_DIR")) / "generated" / "WebResponses.cpp"
-    patches = patch_files(Path(env["PROJECT_DIR"]) / "patches" / "espasyncwebserver")
+    library = "asynctcp" if original.name == "AsyncTCP.cpp" else "espasyncwebserver"
+    output = Path(env.subst("$BUILD_DIR")) / "generated" / original.name
+    patches = patch_files(Path(env["PROJECT_DIR"]) / "patches" / library)
     if not patches:
-        raise RuntimeError("ESPAsyncWebServer patches are missing")
+        raise RuntimeError(f"{library} patches are missing")
     output.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(dir=output.parent) as temporary:
@@ -31,3 +32,4 @@ def build_source(env, node):
 if "Import" in globals():
     Import("env")
     env.AddBuildMiddleware(build_source, "*/ESPAsyncWebServer/src/WebResponses.cpp")
+    env.AddBuildMiddleware(build_source, "*/AsyncTCP/src/AsyncTCP.cpp")
