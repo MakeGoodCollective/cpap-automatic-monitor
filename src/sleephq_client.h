@@ -106,7 +106,6 @@ public:
                           const BackgroundOperationControl *operation = nullptr);
     bool process_import(
         uint32_t import_id,
-        SleepHqImportInfo *out = nullptr,
         const BackgroundOperationControl *operation = nullptr);
     bool get_import(
         uint32_t import_id,

@@ -494,30 +494,12 @@ static bool poll_import(SdStorage::Session &storage, const StatePaths &paths,
         }
 
         if (!process_requested && status_needs_process(info.status)) {
-            SleepHqImportInfo processed;
-            if (!client.process_import(journal.import_id, &processed,
-                                       &operation)) {
+            if (!client.process_import(journal.import_id, &operation)) {
                 set_error(error, error_size, client.last_error());
                 return false;
             }
             operation.note_progress(millis());
             process_requested = true;
-            copy_cstr(progress.import_status,
-                      sizeof(progress.import_status), processed.status);
-            publish(progress, callback, callback_context);
-            const SleepHqImportStatusKind processed_kind =
-                sleephq_classify_import_status(processed.status);
-            if (processed_kind == SleepHqImportStatusKind::Success)
-                return finish_import(storage, paths, journal, progress,
-                                     callback, callback_context,
-                                     error, error_size);
-            if (processed_kind == SleepHqImportStatusKind::Failure) {
-                remove_journal(storage, paths);
-                set_error(error, error_size,
-                          processed.failed_reason[0]
-                              ? processed.failed_reason : "import_failed");
-                return false;
-            }
         }
 
         if (static_cast<uint32_t>(millis() - started) >=

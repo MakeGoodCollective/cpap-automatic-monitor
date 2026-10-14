@@ -1186,18 +1186,14 @@ bool SleepHqClient::get_machine_date(uint32_t machine_id,
 }
 
 bool SleepHqClient::process_import(uint32_t import_id,
-                                   SleepHqImportInfo *out,
                                    const BackgroundOperationControl *operation) {
     char path[64];
     snprintf(path, sizeof(path), "/api/v1/imports/%lu/process_files",
              static_cast<unsigned long>(import_id));
     SleepHqHttpResponse response;
-    if (!request("POST", path, nullptr, nullptr, true, response,
-                 nullptr, nullptr, operation)) {
-        return false;
-    }
-    if (!out) return true;
-    return parse_import(response, *out);
+    // Acceptance is not an import snapshot; get_import owns the result check.
+    return request("POST", path, nullptr, nullptr, true, response,
+                   nullptr, nullptr, operation);
 }
 
 bool SleepHqClient::get_import(
