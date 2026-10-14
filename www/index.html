@@ -1705,7 +1705,10 @@ function reportTrackPlan(track, range, px, adjacent = false) {
 }
 
 async function reportArtifactTrackBlocks(manifest, artifact, tracks, range, px, signal, adjacent = false) {
-  const plans = tracks.map(track => reportTrackPlan(track,range,px,adjacent));
+  // Only a complete owner summary can prove a channel has no valid samples.
+  const empty = new Set(manifest.summary?.partial === false
+    ? (manifest.summary.channels || []).filter(channel => channel.count === 0).map(channel => channel.id) : []);
+  const plans = tracks.filter(track => !empty.has(track.id)).map(track => reportTrackPlan(track,range,px,adjacent));
   const buffers = await reportArtifactRanges(manifest.dataset,artifact,false,signal,plans.flatMap(plan => plan.ranges));
   let at = 0;
   for (const plan of plans) { plan.blocks = buffers.slice(at,at+plan.ranges.length); at += plan.ranges.length; }
