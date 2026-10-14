@@ -16,6 +16,7 @@ struct Progress {
     uint32_t files_seen;
     uint32_t files_uploaded;
     uint32_t files_skipped;
+    uint32_t files_attached;
     uint64_t bytes_uploaded;
     uint32_t import_id;
     char current_day[9];
@@ -44,8 +45,14 @@ bool pending_files(SdStorage::Session &storage, const Config &config,
 class Run {
 public:
     explicit Run(const Config &config);
-    bool sync_session(SdStorage::Session &storage,
-                      const EdfCatalog::Entry &entry,
+    ~Run();
+    Run(const Run &) = delete;
+    Run &operator=(const Run &) = delete;
+    bool resume(SdStorage::Session &storage,
+                aircannect::BackgroundOperationControl &operation,
+                Progress &progress, ProgressCallback callback, void *context,
+                char *error, size_t error_size, BacklogChanges *changes = nullptr);
+    bool sync_day(SdStorage::Session &storage, const char *day, bool repair,
                       aircannect::BackgroundOperationControl &operation,
                       Progress &progress, ProgressCallback callback,
                       void *callback_context, char *error, size_t error_size,
@@ -53,9 +60,11 @@ public:
     const char *last_request() const { return client_.last_request(); }
 
 private:
+    struct Inventory;
     const Config config_;
     aircannect::SleepHqClient client_;
     uint32_t team_id_ = 0;
+    Inventory *inventory_ = nullptr;
 };
 
 }  // namespace SleepHqSync

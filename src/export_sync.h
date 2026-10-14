@@ -6,6 +6,9 @@
 
 namespace ExportSync {
 
+enum class Engine : uint8_t { Smb, SleepHq, Count };
+enum class Action : uint8_t { Sync, Check, Repair };
+
 enum class State : uint8_t {
     Unsupported,
     Disabled,
@@ -55,6 +58,7 @@ struct SleepHqStatus {
     bool has_files;
     uint32_t files_uploaded;
     uint32_t files_skipped;
+    uint32_t files_attached;
     uint64_t bytes_uploaded;
     uint32_t import_id;
     uint32_t last_sync_epoch;
@@ -84,15 +88,20 @@ struct PublicationStamp {
 void init();
 void therapy_started();
 bool request_post_therapy(const EdfCatalog::Entry &entry);
-bool request_manual_smb(bool check = false, const char **error = nullptr);
-bool request_manual_sleephq(bool check = false, const char **error = nullptr);
+// A repair range is inclusive; one date selects a day, empty selects all local days.
+// Engines reject operations they cannot implement, without enqueuing any work.
+bool request_manual(Engine engine, Action action = Action::Sync,
+                    const char *from = nullptr, const char *to = nullptr,
+                    const char **error = nullptr);
+bool parse_engine(const char *name, Engine &engine);
+const char *engine_name(Engine engine);
 void request_backlog_refresh(bool files_changed = false);
 uint32_t revision();
 PublicationStamp publication_stamp();
 bool busy();
 void get_status(Status &out);
 void get_sleephq_status(SleepHqStatus &out);
-const char *action_blocked(bool smb, bool check);
+const char *action_blocked(Engine engine, Action action);
 const char *backlog_state(const Backlog &backlog, bool smb);
 const char *state_name(State state);
 const char *check_state_name(CheckState state);

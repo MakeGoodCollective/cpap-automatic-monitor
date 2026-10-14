@@ -1103,8 +1103,9 @@ static void appendExportStatus(String &json, const T &status, bool enabled,
     }
     if ((fields & EXPORT_META) && (smb || full)) jsonAddString(json, "endpoint", endpoint);
     if (fields & EXPORT_ACTIONS) {
-        jsonAddString(json, "sync_blocked", ExportSync::action_blocked(smb, false));
-        jsonAddString(json, "check_blocked", ExportSync::action_blocked(smb, true));
+        const auto engine = smb ? ExportSync::Engine::Smb : ExportSync::Engine::SleepHq;
+        jsonAddString(json, "sync_blocked", ExportSync::action_blocked(engine, ExportSync::Action::Sync));
+        jsonAddString(json, "check_blocked", ExportSync::action_blocked(engine, ExportSync::Action::Check));
     }
     if (fields & EXPORT_RUN) {
         jsonAddBool(json, "has_files", status.has_files);
@@ -1187,6 +1188,7 @@ static String buildExportsJson(bool full = true, uint8_t smb_fields = EXPORT_ALL
             jsonAddString(json, "device_id", cfg.sleephq_device_id.c_str());
         }
         if (shq_fields & EXPORT_RUN) {
+            jsonAddUInt32(json, "files_attached", sleephq.files_attached);
             jsonAddUInt32(json, "import_id", sleephq.import_id);
             jsonAddString(json, "import_status", sleephq.import_status);
             jsonAddBool(json, "retry_pending", sleephq.retry_pending);
@@ -1223,7 +1225,8 @@ static void publishExports() {
         ExportSync::get_status(smb);
         ExportSync::get_sleephq_status(shq);
         uint8_t fields[] = {exportChanges(smb, last->smb), exportChanges(shq, last->shq)};
-        if (shq.import_id != last->shq.import_id || strcmp(shq.import_status, last->shq.import_status) ||
+        if (shq.files_attached != last->shq.files_attached ||
+            shq.import_id != last->shq.import_id || strcmp(shq.import_status, last->shq.import_status) ||
             shq.retry_pending != last->shq.retry_pending || shq.retry_at_epoch != last->shq.retry_at_epoch)
             fields[1] |= EXPORT_RUN;
         const auto &cfg = Config::get();
@@ -1237,7 +1240,9 @@ static void publishExports() {
             fields[1] |= EXPORT_META;
         }
         for (uint8_t i = 0; i < 4; ++i) {
-            const char *reason = ExportSync::action_blocked(i < 2, i % 2);
+            const char *reason = ExportSync::action_blocked(
+                i < 2 ? ExportSync::Engine::Smb : ExportSync::Engine::SleepHq,
+                i % 2 ? ExportSync::Action::Check : ExportSync::Action::Sync);
             if (reason == last->blocked[i]) continue;
             last->blocked[i] = reason;
             fields[i / 2] |= EXPORT_ACTIONS;
@@ -1273,8 +1278,10 @@ static void handleExportRequest(AsyncWebServerRequest *request, bool smb) {
         return;
     }
     const char *error = nullptr;
-    const bool queued = smb ? ExportSync::request_manual_smb(action == "check", &error)
-                            : ExportSync::request_manual_sleephq(action == "check", &error);
+    const bool queued = ExportSync::request_manual(
+        smb ? ExportSync::Engine::Smb : ExportSync::Engine::SleepHq,
+        action == "check" ? ExportSync::Action::Check : ExportSync::Action::Sync,
+        nullptr, nullptr, &error);
     if (queued) {
         request->send(202, "application/json", "{\"ok\":true,\"state\":\"pending\"}");
     } else {

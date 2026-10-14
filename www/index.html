@@ -3690,6 +3690,7 @@ function renderExports(changed = null) {
     const files = [];
     if (state.has_files) {
       files.push(state.files_uploaded + ' uploaded');
+      if (state.files_attached) files.push(state.files_attached + ' attached');
       if (state.files_skipped) files.push(state.files_skipped + ' skipped');
     }
     if (['ready', 'confirming'].includes(state.backlog_state)) {

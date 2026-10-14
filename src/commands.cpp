@@ -366,6 +366,7 @@ void dispatch_command(const char *line, String &response) {
             response += " files=" + String(sleephq_status.files_uploaded);
             response += "/" + String(sleephq_status.files_seen);
             response += " skipped=" + String(sleephq_status.files_skipped);
+            response += " attached=" + String(sleephq_status.files_attached);
             response += " bytes=" + String(static_cast<unsigned long long>(
                 sleephq_status.bytes_uploaded));
             if (sleephq_status.import_id)
@@ -378,16 +379,28 @@ void dispatch_command(const char *line, String &response) {
             if (sleephq_status.last_error[0])
                 response += " error=" + String(sleephq_status.last_error);
             response += "\n";
-        } else if (sub == "SMB" || sub == "SLEEPHQ") {
-            const char *error = nullptr;
-            const bool smb = sub == "SMB";
-            const bool queued = smb ? ExportSync::request_manual_smb(false, &error)
-                                    : ExportSync::request_manual_sleephq(false, &error);
-            response = queued ? (smb ? "OK: SMB sync queued\n" : "OK: SleepHQ sync queued\n")
-                              : String("ERR: ") + error + "\n";
         } else {
-            response = "ERR: use EXPORT STATUS, EXPORT SMB, or "
-                       "EXPORT SLEEPHQ\n";
+            int position = 0;
+            const String name = parse_quoted_token(sub, &position);
+            const String verb = parse_quoted_token(sub, &position);
+            const String from = parse_quoted_token(sub, &position);
+            const String to = parse_quoted_token(sub, &position);
+            String extra = sub.substring(position);
+            extra.trim();
+            ExportSync::Engine engine;
+            if (!ExportSync::parse_engine(name.c_str(), engine)) {
+                response = "ERR: unknown export engine\n";
+            } else if ((!verb.isEmpty() && verb != "SYNC" && verb != "CHECK" && verb != "REPAIR") ||
+                       !extra.isEmpty() || (verb != "REPAIR" && (!from.isEmpty() || !to.isEmpty()))) {
+                response = "ERR: use EXPORT <engine> [SYNC|CHECK|REPAIR [YYYYMMDD [YYYYMMDD]]]\n";
+            } else {
+                const auto action = verb == "REPAIR" ? ExportSync::Action::Repair :
+                    verb == "CHECK" ? ExportSync::Action::Check : ExportSync::Action::Sync;
+                const char *error = nullptr;
+                const bool queued = ExportSync::request_manual(engine, action, from.c_str(), to.c_str(), &error);
+                response = queued ? String("OK: ") + ExportSync::engine_name(engine) + " " +
+                    (verb.isEmpty() ? "SYNC" : verb) + " queued\n" : String("ERR: ") + error + "\n";
+            }
         }
         return;
     }
@@ -745,7 +758,15 @@ void dispatch_command(const char *line, String &response) {
                    "  CONFIG [key [val]]  Get/set config\n"
                    "  CONFIG SAVE|RESET   Save/reset config\n"
                    "  CONFIG DUMP         Show all config\n"
-                   "  EXPORT STATUS|SMB|SLEEPHQ  Export status/manual sync\n"
+                   "  EXPORT STATUS  Export status\n"
+                   "  EXPORT <engine> [SYNC|CHECK|REPAIR [YYYYMMDD [YYYYMMDD]]]\n"
+                   "    Engines: ";
+        for (unsigned i = 0; i < static_cast<unsigned>(ExportSync::Engine::Count); ++i) {
+            if (i) response += ", ";
+            response += ExportSync::engine_name(static_cast<ExportSync::Engine>(i));
+        }
+        response += "; REPAIR requires engine support\n";
+        response +=
 #if AB_STORAGE_HAS_SDCARD
                    "  STORAGE RENAME path name  Rename a file or folder\n"
                    "  STORAGE RM path     Delete a file or folder recursively\n"
