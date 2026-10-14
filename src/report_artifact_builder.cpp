@@ -289,18 +289,42 @@ bool index_publish(const SdStorage::Session &session, const uint8_t key[32],
     return publish_document(session, "/airbridge/report/index", key, data, length, out, &retired);
 }
 
-bool index_discard(const SdStorage::Session &session, const uint8_t digest[32]) {
+static Lookup root_reference(const SdStorage::Session &session, const uint8_t digest[32]) {
     char path[PATH_BYTES];
     for (const char *prefix : {"/airbridge/report/index", "/airbridge/report/dataset", "/airbridge/report/rebuild"}) {
         for (unsigned slot = 0; slot < 2; ++slot) {
             Document retained;
             const auto state = document_head(session, prefix, slot, retained, path);
-            if (state == Lookup::Failed || state == Lookup::Invalid) return false;
-            if (state == Lookup::Ready && !memcmp(retained.digest, digest, 32)) return true;
+            if (state == Lookup::Failed || state == Lookup::Invalid) return state;
+            if (state == Lookup::Ready && !memcmp(retained.digest, digest, 32)) return Lookup::Ready;
         }
     }
+    return Lookup::Missing;
+}
+
+bool index_discard(const SdStorage::Session &session, const uint8_t digest[32]) {
+    const auto state = root_reference(session, digest);
+    if (state == Lookup::Ready) return true;
+    if (state != Lookup::Missing) return false;
+    char path[PATH_BYTES];
     if (!document_path("/airbridge/report/index", digest, path)) return false;
     return session.run([&](fs::FS &fs) { return !fs.exists(path) || fs.remove(path); });
+}
+
+Lookup index_candidate(const SdStorage::Session &session, const uint8_t digest[32],
+                       uint32_t bytes, aircannect::LargeTextBuffer &out) {
+    const auto state = root_reference(session, digest);
+    if (state == Lookup::Ready) return Lookup::Missing;
+    if (state != Lookup::Missing) return Lookup::Failed;
+    void *memory = aircannect::Memory::alloc_large(sizeof(DocumentScratch));
+    if (!memory) return Lookup::Failed;
+    std::unique_ptr<DocumentScratch, decltype(&aircannect::Memory::free)> scratch(
+        new (memory) DocumentScratch, aircannect::Memory::free);
+    Document candidate;
+    candidate.bytes = bytes;
+    memcpy(candidate.digest, digest, 32);
+    if (document_content(session, "/airbridge/report/index", candidate, out, *scratch)) return Lookup::Ready;
+    return !session.valid() || out.overflowed() ? Lookup::Failed : Lookup::Invalid;
 }
 
 struct Producer::Work {

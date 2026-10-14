@@ -53,6 +53,11 @@ bool index_publish(const SdStorage::Session &session, const uint8_t key[32],
 // Never removes content referenced by either index, dataset or rebuild head.
 // Caller proves the candidate is an index and excludes readers until return.
 bool index_discard(const SdStorage::Session &session, const uint8_t digest[32]);
+// Read an unreferenced root body once, verifying its content hash. Missing
+// means protected by a head; Invalid means malformed, Failed means retry.
+// The owner must still establish that this body is an index before removal.
+Lookup index_candidate(const SdStorage::Session &session, const uint8_t digest[32],
+                       uint32_t bytes, aircannect::LargeTextBuffer &out);
 
 // One source, one record traversal, all selected tracks. Scratch lives in PSRAM
 // and is independent of duration. Base transposition and x4 passes read the

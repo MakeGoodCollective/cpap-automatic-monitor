@@ -62,6 +62,7 @@ Result::Result(Result &&other) noexcept
 #include "debug_log.h"
 #include "memory_manager.h"
 #include "large_text_buffer.h"
+#include "json_util.h"
 #include "hex_util.h"
 #include "report_edf.h"
 #include "report_artifact_builder.h"
@@ -380,6 +381,12 @@ uint32_t published_index_data = 0, published_index_artifacts = UINT32_MAX;
 bool index_commit_pending = false;
 ReportArtifact::Document retired_index;
 uint32_t retired_index_files = 0;
+struct IndexCleanup {
+    uint32_t files = UINT32_MAX;
+    uint16_t shard = 0;
+    uint8_t present[32] = {};
+    bool discovered = false;
+} index_cleanup;
 
 struct CachedPublication {
     ReportArtifact::Document document;
@@ -1898,6 +1905,100 @@ bool retire_index(const SdStorage::Session &session) {
     return true;
 }
 
+ReportArtifact::Lookup index_shape(const aircannect::LargeTextBuffer &body) {
+    // Old root documents have no kind tag. Recognize only the exact compact
+    // schema emitted by days_json; unknown/future documents are not garbage.
+    aircannect::JsonAllocator allocator(false);
+    JsonDocument parsed(&allocator);
+    const auto error = deserializeJson(parsed, body.c_str(), body.length());
+    if (error == DeserializationError::NoMemory) return ReportArtifact::Lookup::Failed;
+    const auto root = parsed.as<JsonObjectConst>();
+    if (error || root.size() != 7 || root["source"] != "edf" ||
+        !root["revision"].is<uint32_t>() || !root["data_revision"].is<uint32_t>() ||
+        !aircannect::sha256_text_valid(root["dataset"].as<const char *>()) ||
+        !root["partial"].is<bool>() || !root["days"].is<JsonArrayConst>() ||
+        !root["periods"].is<JsonArrayConst>() || measureJson(parsed) != body.length())
+        return ReportArtifact::Lookup::Invalid;
+    const auto publication = [](JsonObjectConst value) {
+        const char *day = value["day"];
+        return day && strlen(day) == 8 && strspn(day, "0123456789") == 8 &&
+            aircannect::sha256_text_valid(value["digest"].as<const char *>()) &&
+            value["bytes"].is<uint32_t>() && value["bytes"].as<uint32_t>() > 0;
+    };
+    for (JsonObjectConst day : root["days"].as<JsonArrayConst>()) {
+        if (!day["day"].is<uint16_t>() || !day["session_count"].is<uint32_t>() ||
+            (day.size() != 2 && day.size() != 5)) return ReportArtifact::Lookup::Invalid;
+        if (day.size() == 5 && (day["publication"].as<JsonObjectConst>().size() != 3 ||
+            !publication(day["publication"]) || !day["stale"].is<bool>() ||
+            !aircannect::sha256_text_valid(day["identity"].as<const char *>())))
+            return ReportArtifact::Lookup::Invalid;
+    }
+    if (root["periods"].size() > sizeof(PERIODS) / sizeof(PERIODS[0])) return ReportArtifact::Lookup::Invalid;
+    for (JsonObjectConst period : root["periods"].as<JsonArrayConst>()) {
+        const uint16_t length = period["period"];
+        if (period.size() != 5 || !publication(period) || !period["stale"].is<bool>() ||
+            std::find(std::begin(PERIODS), std::end(PERIODS), length) == std::end(PERIODS))
+            return ReportArtifact::Lookup::Invalid;
+    }
+    return ReportArtifact::Lookup::Ready;
+}
+
+bool index_cleanup_pending() {
+    return index_cleanup.files != SdStorage::files_revision() ||
+        !index_cleanup.discovered || index_cleanup.shard < 256;
+}
+
+bool cleanup_indexes(const SdStorage::Session &session) {
+    if (aborted(nullptr, session) || ExportSync::busy()) return false;
+    if (index_cleanup.files != SdStorage::files_revision()) {
+        index_cleanup = {};
+        index_cleanup.files = SdStorage::files_revision();
+    }
+    SdStorage::Reader directory;
+    SdStorage::Reader::Entry entry;
+    bool end = false;
+    if (!index_cleanup.discovered) {
+        memset(index_cleanup.present, 0, sizeof(index_cleanup.present));
+        if (!directory.open(session, CACHE_DIR, true)) return false;
+        while (!end) {
+            if (aborted(nullptr, session) || !directory.next(entry, end)) return false;
+            if (end) break;
+            const char *name = strrchr(entry.name, '/');
+            name = name ? name + 1 : entry.name;
+            if (!entry.directory || strlen(name) != 2 || strspn(name, "0123456789abcdef") != 2) continue;
+            uint32_t shard;
+            if (aircannect::parse_hex(name, 2, shard)) index_cleanup.present[shard / 8] |= 1u << (shard % 8);
+        }
+        directory.close();
+        index_cleanup.discovered = true;
+    }
+    while (index_cleanup.shard < 256 && !(index_cleanup.present[index_cleanup.shard / 8] & (1u << (index_cleanup.shard % 8))))
+        ++index_cleanup.shard;
+    if (index_cleanup.shard == 256) return true;
+    char path[96];
+    snprintf(path, sizeof(path), "%s/%02x", CACHE_DIR, unsigned(index_cleanup.shard));
+    if (!directory.open(session, path, true)) return false;
+    end = false;
+    while (!end) {
+        if (aborted(nullptr, session) || ExportSync::busy() || !directory.next(entry, end)) return false;
+        if (end) break;
+        const char *name = strrchr(entry.name, '/');
+        name = name ? name + 1 : entry.name;
+        if (entry.directory || strlen(name) != 68 || strcmp(name + 64, ".abp") ||
+            strspn(name, "0123456789abcdef") != 64 || !entry.size || entry.size > MAX_BODY) continue;
+        uint8_t digest[32]; size_t decoded = 0;
+        if (!aircannect::hex_decode(name, 64, digest, sizeof(digest), decoded) || digest[0] != index_cleanup.shard) continue;
+        aircannect::LargeTextBuffer body(MAX_BODY, 0);
+        auto state = ReportArtifact::index_candidate(session, digest, entry.size, body);
+        if (state == ReportArtifact::Lookup::Ready) state = index_shape(body);
+        if (state == ReportArtifact::Lookup::Failed) return false;
+        if (state != ReportArtifact::Lookup::Ready) continue;
+        if (aborted(nullptr, session) || ExportSync::busy() || !discard_index(session, digest)) return false;
+    }
+    ++index_cleanup.shard;
+    return true;
+}
+
 bool publish_index(const SdStorage::Session &session) {
     if (!retire_index(session)) return false;
     const uint32_t artifacts = status.artifact_revision;
@@ -1906,6 +2007,7 @@ bool publish_index(const SdStorage::Session &session) {
         index_commit_pending = false;
         return true;
     }
+    index_commit_pending = true;
     Job snapshot;
     snapshot.data_revision = data;
     if (!days_json(session, snapshot)) return false;
@@ -1913,7 +2015,10 @@ bool publish_index(const SdStorage::Session &session) {
     uint8_t key[32];
     if (!ReportArtifact::fingerprint(reinterpret_cast<const uint8_t *>(snapshot.body.c_str()), snapshot.body.length(), key) ||
         !ReportArtifact::index_publish(session, key,
-            reinterpret_cast<const uint8_t *>(snapshot.body.c_str()), snapshot.body.length(), document, retired_index)) return false;
+            reinterpret_cast<const uint8_t *>(snapshot.body.c_str()), snapshot.body.length(), document, retired_index)) {
+        index_cleanup.files = UINT32_MAX; // A body may have committed without its head.
+        return false;
+    }
     published_index_data = data;
     published_index_artifacts = artifacts;
     retired_index_files = SdStorage::files_revision();
@@ -2417,7 +2522,7 @@ bool work_once() {
     if (job && job->background && ExportSync::busy()) {
         defer_job(job); publish(State::WaitingStorage, "export_pending"); return false;
     }
-    if (!job && !dirty() && !index_commit_pending && !retired_index.bytes && published_index_artifacts == status.artifact_revision &&
+    if (!job && !dirty() && !index_commit_pending && !retired_index.bytes && !index_cleanup_pending() && published_index_artifacts == status.artifact_revision &&
         (!backfill_enabled || (!backfill_before && backfill_period >= sizeof(PERIODS) / sizeof(PERIODS[0])) || ExportSync::busy() ||
         (background_retry && int32_t(millis() - background_retry) < 0))) { publish(State::Ready); return false; }
     SdStorage::Session session;
@@ -2484,9 +2589,11 @@ bool work_once() {
         // only when this run finishes or safely pauses, not after every day.
         if (!more && !checkpoint && !ExportSync::busy() && !publish_index(session))
             Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
+        const bool cleaning = !more && !ExportSync::busy() && !retired_index.bytes &&
+            published_index_artifacts == status.artifact_revision && index_cleanup_pending() && cleanup_indexes(session);
         session.end();
         publish(State::Ready);
-        return more;
+        return more || (cleaning && index_cleanup_pending());
     }
     xSemaphoreTake(mutex, portMAX_DELAY);
     job->state = JobState::Running;

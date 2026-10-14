@@ -54,11 +54,14 @@ void json_escape_append(Out &out, const char *value, size_t len,
 
 class JsonAllocator : public ArduinoJson::Allocator {
 public:
-    void *allocate(size_t size) override { return Memory::alloc_large(size); }
+    explicit JsonAllocator(bool internal_fallback = true) : internal_fallback_(internal_fallback) {}
+    void *allocate(size_t size) override { return Memory::alloc_large(size, internal_fallback_); }
     void deallocate(void *ptr) override { Memory::free(ptr); }
     void *reallocate(void *ptr, size_t size) override {
-        return Memory::realloc_large(ptr, size);
+        return Memory::realloc_large(ptr, size, internal_fallback_);
     }
+private:
+    bool internal_fallback_;
 };
 
 bool json_variant_to_string(JsonVariantConst value, std::string &out);
