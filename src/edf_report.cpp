@@ -198,6 +198,8 @@ struct CachedDay {
     DailyValues values;
     uint32_t updated = 0;
     uint16_t day = 0;
+    bool has_values = false, artifacts_checked = false;
+    uint8_t artifact_key[32] = {};
 };
 // Two annual selections; lazy growth, no per-day SD files or internal bulk fallback.
 constexpr size_t MAX_CACHED_DAYS = 2 * 366;
@@ -215,24 +217,17 @@ void invalidate_day(uint16_t day = 0) {
     for (size_t i = 0; i < daily_capacity; ++i)
         if (daily_cache[i].day == day) daily_cache[i].day = 0;
 }
-bool cached_day(uint16_t day, DailyValues &out, bool build) {
-    if (!day) return false;
-    for (size_t i = 0; i < daily_capacity; ++i) {
-        auto &entry = daily_cache[i];
-        if (entry.day != day || (build && !entry.values.ready)) continue;
-        out = entry.values;
-        entry.updated = ++daily_update;
-        return true;
-    }
-    return false;
-}
-void remember_day(uint16_t day, const DailyValues &values) {
-    if (!day) return;
+CachedDay *cached_day_entry(uint16_t day, bool create) {
+    if (!day) return nullptr;
     size_t slot = daily_capacity;
     for (size_t i = 0; i < daily_capacity; ++i) {
-        if (daily_cache[i].day == day) { slot = i; break; }
+        if (daily_cache[i].day == day) {
+            daily_cache[i].updated = ++daily_update;
+            return &daily_cache[i];
+        }
         if (!daily_cache[i].day && slot == daily_capacity) slot = i;
     }
+    if (!create) return nullptr;
     if (slot == daily_capacity && daily_capacity < MAX_CACHED_DAYS) {
         const size_t capacity = std::min(MAX_CACHED_DAYS, std::max(size_t(16), daily_capacity * 2));
         auto *grown = static_cast<CachedDay *>(aircannect::Memory::realloc_large(
@@ -243,13 +238,28 @@ void remember_day(uint16_t day, const DailyValues &values) {
             daily_capacity = capacity;
         }
     }
-    if (!daily_capacity) return; // Cache allocation failure does not fail a report.
+    if (!daily_capacity) return nullptr; // Cache allocation failure does not fail a report.
     if (slot == daily_capacity) {
         slot = 0;
         for (size_t i = 1; i < daily_capacity; ++i)
             if (int32_t(daily_cache[i].updated - daily_cache[slot].updated) < 0) slot = i;
     }
-    daily_cache[slot] = {values, ++daily_update, day};
+    daily_cache[slot] = {};
+    daily_cache[slot].day = day;
+    daily_cache[slot].updated = ++daily_update;
+    return &daily_cache[slot];
+}
+bool cached_day(uint16_t day, DailyValues &out, bool build) {
+    const auto *cached = cached_day_entry(day, false);
+    if (!cached || !cached->has_values || (build && !cached->values.ready)) return false;
+    out = cached->values;
+    return true;
+}
+void remember_day(uint16_t day, const DailyValues &values) {
+    if (auto *cached = cached_day_entry(day, true)) {
+        cached->values = values;
+        cached->has_values = true;
+    }
 }
 
 struct Payload : aircannect::LargeTextBuffer {
@@ -1432,13 +1442,13 @@ bool dataset(const SdStorage::Session &session) {
         esp_fill_random(id, sizeof(id));
         if (!ReportArtifact::document_publish(session, prefix, key, id, sizeof(id), document)) return false;
     } else if (found != ReportArtifact::Lookup::Ready) return false;
-    if (!ReportArtifact::document_read(session, prefix, document, bytes) || bytes.length() != 32) return false;
+    if (!ReportArtifact::document_read(session, prefix, document, bytes, nullptr) || bytes.length() != 32) return false;
     ReportArtifact::Document rebuild;
     const auto generation = ReportArtifact::document_lookup(session, "/airbridge/report/rebuild", nullptr, rebuild);
     rebuild_generation = 0;
     if (generation == ReportArtifact::Lookup::Ready) {
         Payload value;
-        if (!ReportArtifact::document_read(session, "/airbridge/report/rebuild", rebuild, value) || value.length() != 4) return false;
+        if (!ReportArtifact::document_read(session, "/airbridge/report/rebuild", rebuild, value, nullptr) || value.length() != 4) return false;
         rebuild_generation = SdStorage::get_le32(reinterpret_cast<const uint8_t *>(value.c_str()));
     } else if (generation != ReportArtifact::Lookup::Missing) return false;
     return aircannect::hex_encode(reinterpret_cast<const uint8_t *>(bytes.c_str()), 32,
@@ -1502,7 +1512,7 @@ bool prepare_period(const SdStorage::Session &session, Job &job) {
     if (!publication_key(job.request, key)) return note_issue(job, "publication_key");
     ReportArtifact::Document document;
     if (ReportArtifact::document_lookup(session, prefix, key, document) == ReportArtifact::Lookup::Ready)
-        return ReportArtifact::document_read(session, prefix, document, job.body);
+        return ReportArtifact::document_read(session, prefix, document, job.body, key);
     if (!summary_json(session, job) || job.issue || aborted(&job, session)) return false;
     EdfCatalog::Status current;
     EdfCatalog::get_status(current);
@@ -1572,9 +1582,12 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
     ReportArtifact::Document saved;
     const auto known = ReportArtifact::document_lookup(session, manifest, manifest_key, saved);
     if (known == ReportArtifact::Lookup::Ready) {
-        // A retained document cannot hide a damaged source reference after an
-        // explicit storage change. This reads references/headers, never EDF.
-        for (size_t i = 0; i < index_count; ++i) {
+        // Revalidate references only after a source/storage change or eviction.
+        // scan_index clears this owner cache when files_revision changes.
+        auto *cached = cached_day_entry(day, true);
+        const bool checked = cached && cached->artifacts_checked &&
+            !memcmp(cached->artifact_key, manifest_key, sizeof(manifest_key));
+        for (size_t i = 0; !checked && i < index_count; ++i) {
             const auto &entry = index[i];
             if (!selected(entry, day, day)) continue;
             for (uint8_t kind = 0; kind < 3; ++kind) {
@@ -1586,7 +1599,11 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
                     return note_issue(job, "artifact_lookup", entry.entry.file_prefix);
             }
         }
-        if (ReportArtifact::document_read(session, manifest, saved, job.body)) return true;
+        if (cached) {
+            memcpy(cached->artifact_key, manifest_key, sizeof(manifest_key));
+            cached->artifacts_checked = true;
+        }
+        if (ReportArtifact::document_read(session, manifest, saved, job.body, manifest_key)) return true;
         return note_issue(job, "publication_read", manifest);
     }
     if (known == ReportArtifact::Lookup::Failed || known == ReportArtifact::Lookup::Invalid)
@@ -1683,6 +1700,10 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
     if (!ReportArtifact::document_publish(session, manifest, manifest_key,
         reinterpret_cast<const uint8_t *>(job.body.c_str()), job.body.length(), saved))
         return note_issue(job, "publication_write", manifest);
+    if (auto *cached = cached_day_entry(day, true)) {
+        memcpy(cached->artifact_key, manifest_key, sizeof(manifest_key));
+        cached->artifacts_checked = true;
+    }
     __atomic_add_fetch(&cache_generation, 1, __ATOMIC_RELEASE);
     portENTER_CRITICAL(&status_mux);
     ++status.artifact_revision;
@@ -1723,8 +1744,10 @@ bool days_json(const SdStorage::Session &session, Job &job) {
         publication_prefix(day, prefix);
         Request request; request.day = day;
         ReportArtifact::Document document;
+        Payload verified;
         if (publication_key(request, key) &&
-            ReportArtifact::document_lookup(session, prefix, nullptr, document) == ReportArtifact::Lookup::Ready) {
+            ReportArtifact::document_lookup(session, prefix, nullptr, document) == ReportArtifact::Lookup::Ready &&
+            ReportArtifact::document_read(session, prefix, document, verified, nullptr)) {
             char digest[65], identity[65];
             aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
             aircannect::hex_encode(document.key, 32, identity, sizeof(identity), aircannect::HexCase::Lower);
@@ -1741,8 +1764,10 @@ bool days_json(const SdStorage::Session &session, Job &job) {
         char prefix[96]; uint8_t key[32];
         period_prefix(request, prefix);
         ReportArtifact::Document document;
+        Payload verified;
         if (!publication_key(request, key) || ReportArtifact::document_lookup(session, prefix, nullptr, document)
-            != ReportArtifact::Lookup::Ready) continue;
+            != ReportArtifact::Lookup::Ready ||
+            !ReportArtifact::document_read(session, prefix, document, verified, nullptr)) continue;
         char digest[65];
         aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
         job.body.print("%s{\"period\":%u,\"day\":\"%.8s\",\"digest\":\"%s\",\"bytes\":%u,\"stale\":%s}",
@@ -2276,7 +2301,7 @@ bool work_once() {
         ReportArtifact::Document document;
         Payload saved;
         if (ReportArtifact::document_lookup(session, "/airbridge/report/index", nullptr, document) == ReportArtifact::Lookup::Ready &&
-            ReportArtifact::document_read(session, "/airbridge/report/index", document, saved) &&
+            ReportArtifact::document_read(session, "/airbridge/report/index", document, saved, nullptr) &&
             saved.length() && saved.c_str()[0] == '{') {
             job->body.print("{\"stale\":true,");
             job->body.append(saved.c_str() + 1, saved.length() - 1);

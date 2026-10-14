@@ -34,12 +34,14 @@ struct Document {
     uint32_t bytes = 0, generation = 0;
 };
 
-// Small publications share the numeric producer's immutable, verified storage
-// path. Two heads retain the previous generation; content is never overwritten.
+// Lookup reads only CRC-protected heads. Read verifies the selected body once
+// and may fall back to the other head, updating document on success. A non-null
+// key forbids fallback to a publication of different sources.
 Lookup document_lookup(const SdStorage::Session &session, const char *prefix,
                        const uint8_t *key, Document &out);
 bool document_read(const SdStorage::Session &session, const char *prefix,
-                   const Document &document, aircannect::LargeTextBuffer &out);
+                   Document &document, aircannect::LargeTextBuffer &out,
+                   const uint8_t *key);
 bool document_publish(const SdStorage::Session &session, const char *prefix,
                       const uint8_t key[32], const uint8_t *data, size_t length,
                       Document &out);

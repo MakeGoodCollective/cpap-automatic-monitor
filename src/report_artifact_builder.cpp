@@ -107,42 +107,41 @@ Lookup lookup(const SdStorage::Session &session, const char *prefix,
 namespace {
 struct DocumentScratch {
     char path[PATH_BYTES], part[PATH_BYTES];
-    uint8_t block[1024];
+    uint8_t block[SdStorage::READ_CHUNK_BYTES];
 };
-static_assert(sizeof(DocumentScratch) <= 2048, "bounded document scratch fallback");
+static_assert(sizeof(DocumentScratch) <= 4608, "bounded document scratch fallback");
 
 bool document_path(const char *prefix, const uint8_t hash[32], char (&out)[PATH_BYTES]) {
     return content_path(prefix, hash, out, true);
 }
 
 bool document_content(const SdStorage::Session &session, const char *prefix,
-                      const Document &document, aircannect::LargeTextBuffer *out,
+                      const Document &document, aircannect::LargeTextBuffer &out,
                       DocumentScratch &scratch) {
     auto &path = scratch.path;
     auto &bytes = scratch.block;
     SdStorage::Reader reader;
+    out.clear();
     if (!document_path(prefix, document.digest, path) || !reader.open(session, path) ||
-        reader.size() != document.bytes || (out && !out->reserve(document.bytes))) return false;
-    if (out) out->clear();
+        reader.size() != document.bytes || !out.reserve(document.bytes)) return false;
     Digest digest;
     uint8_t hash[32];
     for (size_t at = 0; at < document.bytes;) {
         const size_t count = std::min(sizeof(bytes), size_t(document.bytes - at));
         if (reader.read(bytes, count) != count || !digest.add(bytes, count) ||
-            (out && !out->append(reinterpret_cast<const char *>(bytes), count))) {
-            if (out) out->clear();
+            !out.append(reinterpret_cast<const char *>(bytes), count)) {
+            out.clear();
             return false;
         }
         at += count;
     }
     const bool valid = digest.finish(hash) && !memcmp(hash, document.digest, 32);
-    if (!valid && out) out->clear();
+    if (!valid) out.clear();
     return valid;
 }
 
 Lookup document_head(const SdStorage::Session &session, const char *prefix, unsigned slot,
-                     Document &out, DocumentScratch &scratch) {
-    auto &path = scratch.path;
+                     Document &out, char (&path)[PATH_BYTES]) {
     snprintf(path, sizeof(path), "%s.head%u", prefix, slot);
     bool exists = false;
     if (!session.run([&](fs::FS &fs) { exists = fs.exists(path); return true; })) return Lookup::Failed;
@@ -154,17 +153,18 @@ Lookup document_head(const SdStorage::Session &session, const char *prefix, unsi
         crc32_ieee(bytes, 80) != SdStorage::get_le32(bytes + 80)) return Lookup::Invalid;
     out.generation = SdStorage::get_le32(bytes + 8);
     out.bytes = SdStorage::get_le32(bytes + 12);
+    if (!out.bytes || (out.generation & 1) != slot) return Lookup::Invalid;
     memcpy(out.key, bytes + 16, 32);
     memcpy(out.digest, bytes + 48, 32);
     reader.close();
-    return document_content(session, prefix, out, nullptr, scratch) ? Lookup::Ready : Lookup::Invalid;
+    return Lookup::Ready;
 }
 
 Lookup lookup_document(const SdStorage::Session &session, const char *prefix,
-                       const uint8_t *key, Document &out, DocumentScratch &scratch) {
+                       const uint8_t *key, Document &out, char (&path)[PATH_BYTES]) {
     Document heads[2];
-    const Lookup a = document_head(session, prefix, 0, heads[0], scratch);
-    const Lookup b = document_head(session, prefix, 1, heads[1], scratch);
+    const Lookup a = document_head(session, prefix, 0, heads[0], path);
+    const Lookup b = document_head(session, prefix, 1, heads[1], path);
     int chosen = -1;
     for (unsigned i = 0; i < 2; ++i) {
         if ((i ? b : a) != Lookup::Ready || (key && memcmp(key, heads[i].key, 32))) continue;
@@ -179,20 +179,28 @@ Lookup lookup_document(const SdStorage::Session &session, const char *prefix,
 
 Lookup document_lookup(const SdStorage::Session &session, const char *prefix,
                        const uint8_t *key, Document &out) {
-    void *memory = aircannect::Memory::alloc_large(sizeof(DocumentScratch));
-    if (!memory) return Lookup::Failed;
-    std::unique_ptr<DocumentScratch, decltype(&aircannect::Memory::free)> scratch(
-        new (memory) DocumentScratch, aircannect::Memory::free);
-    return lookup_document(session, prefix, key, out, *scratch);
+    char path[PATH_BYTES];
+    return lookup_document(session, prefix, key, out, path);
 }
 
 bool document_read(const SdStorage::Session &session, const char *prefix,
-                   const Document &document, aircannect::LargeTextBuffer &out) {
+                   Document &document, aircannect::LargeTextBuffer &out,
+                   const uint8_t *key) {
+    out.clear();
+    if (key && memcmp(key, document.key, 32)) return false;
     void *memory = aircannect::Memory::alloc_large(sizeof(DocumentScratch));
     if (!memory) return false;
     std::unique_ptr<DocumentScratch, decltype(&aircannect::Memory::free)> scratch(
         new (memory) DocumentScratch, aircannect::Memory::free);
-    return document_content(session, prefix, document, &out, *scratch);
+    if (document_content(session, prefix, document, out, *scratch)) return true;
+    if (!session.valid() || out.overflowed()) return false;
+    Document previous;
+    if (document_head(session, prefix, unsigned((document.generation & 1) ^ 1), previous, scratch->path) != Lookup::Ready ||
+        int32_t(previous.generation - document.generation) >= 0 ||
+        (key && memcmp(key, previous.key, 32)) || !memcmp(previous.digest, document.digest, 32) ||
+        !document_content(session, prefix, previous, out, *scratch)) return false;
+    document = previous;
+    return true;
 }
 
 bool document_publish(const SdStorage::Session &session, const char *prefix,
@@ -202,18 +210,15 @@ bool document_publish(const SdStorage::Session &session, const char *prefix,
     if (!memory) return false;
     std::unique_ptr<DocumentScratch, decltype(&aircannect::Memory::free)> scratch(
         new (memory) DocumentScratch, aircannect::Memory::free);
-    // Publication verifies previous heads before writing. Share one workspace
-    // through that nested chain instead of accumulating I/O buffers on stack.
+    // Only heads are needed to choose the next generation and inactive slot.
     Document previous;
-    const Lookup old = lookup_document(session, prefix, nullptr, previous, *scratch);
+    const Lookup old = lookup_document(session, prefix, nullptr, previous, scratch->path);
     if (old == Lookup::Failed || old == Lookup::Invalid) return false;
     out = {};
     out.bytes = length;
     out.generation = old == Lookup::Ready ? previous.generation + 1 : 1;
     memcpy(out.key, key, 32);
     if (!fingerprint(data, length, out.digest)) return false;
-    if (old == Lookup::Ready && !memcmp(previous.digest, out.digest, 32) &&
-        !memcmp(previous.key, key, 32)) { out = previous; return true; }
     auto &path = scratch->path;
     auto &part = scratch->part;
     if (!document_path(prefix, out.digest, path) || !named_path(prefix, "document.part", part)) return false;
@@ -246,6 +251,8 @@ bool document_publish(const SdStorage::Session &session, const char *prefix,
     }
     reader.close();
     if (!exists && !session.run([&](fs::FS &fs) { return fs.rename(part, path); })) return false;
+    if (old == Lookup::Ready && !memcmp(previous.digest, out.digest, 32) &&
+        !memcmp(previous.key, key, 32)) { out = previous; return true; }
     uint8_t head[84] = {};
     memcpy(head, "ABDOC001", 8);
     SdStorage::put_le32(head + 8, out.generation);
@@ -323,7 +330,7 @@ struct Producer::Work {
         aircannect::LargeTextBuffer saved(128, 128);
         if (!named_path(prefix, "checkpoint", path) ||
             document_lookup(session, path, metadata.source, document) != Lookup::Ready ||
-            !document_read(session, path, document, saved) || saved.length() != 48 ||
+            !document_read(session, path, document, saved, metadata.source) || saved.length() != 48 ||
             memcmp(saved.c_str(), "ABCHK001", 8)) return false;
         const auto *bytes = reinterpret_cast<const uint8_t *>(saved.c_str());
         const uint32_t complete = SdStorage::get_le32(bytes + 8);
