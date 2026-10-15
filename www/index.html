@@ -29,7 +29,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .nav-item{display:flex;align-items:center;gap:12px;padding:10px 20px;color:var(--text-dim);text-decoration:none;font-size:16px;cursor:pointer;border-left:3px solid transparent;transition:all 0.15s}
 .nav-item:hover{color:var(--text);background:#ffffff08}
 .nav-item.active{color:var(--accent);background:var(--accent-dim);border-left-color:var(--accent)}
-.nav-item .icon{font-size:16px;width:20px;text-align:center}
+.icon{display:inline-flex;width:20px;height:20px;align-items:center;justify-content:center;flex:none}
+.icon svg,.icon-button svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 
 /* Main */
 .main{display:flex;flex-direction:column;overflow:hidden}
@@ -186,6 +187,8 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .btn-danger:hover{background:#c73a52}
 .btn-group{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
 .btn-row{margin-top:12px;text-align:right}
+.icon-button{display:inline-flex;align-items:center;justify-content:center;width:32px;height:30px;padding:4px;flex:none}
+.icon-button svg{width:18px;height:18px}
 
 /* Status grid */
 .status-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 32px}
@@ -292,10 +295,14 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 /* Bottom nav */
 .bottom-nav{display:none;background:var(--surface);border-top:1px solid var(--border);justify-content:flex-start;padding:8px 0;padding-bottom:calc(8px + env(safe-area-inset-bottom));overflow-x:auto;-webkit-overflow-scrolling:touch;flex-shrink:0}
 .bottom-nav .bnav-item{display:flex;flex-direction:column;align-items:center;gap:2px;font-size:10px;color:var(--text-dim);cursor:pointer;padding:4px 10px;text-decoration:none;flex-shrink:0;white-space:nowrap}
-.bottom-nav .bnav-item .icon{font-size:18px}
+.bottom-nav .bnav-item .icon{width:22px;height:22px}
+.bottom-nav .bnav-item .icon svg{width:21px;height:21px}
 .bottom-nav .bnav-item.active{color:var(--accent)}
 
 /* Responsive */
+@media(pointer:coarse){
+  .icon-button{width:44px;height:44px}
+}
 @media(max-width:768px){
   [data-config-form] .row{flex-direction:column;align-items:stretch;gap:8px}
   [data-config-form] .row input,[data-config-form] .row select{width:100%}
@@ -324,6 +331,19 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 </head>
 <body>
 
+<svg aria-hidden="true" width="0" height="0" style="position:absolute">
+  <symbol id="icon-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="5" rx="1.5"/><rect x="13" y="10" width="8" height="11" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/></symbol>
+  <symbol id="icon-report" viewBox="0 0 24 24"><path d="M4 19V5"/><path d="M4 19h17"/><path d="M8 16v-4"/><path d="M12 16V8"/><path d="M16 16v-6"/><path d="M20 16V4"/></symbol>
+  <symbol id="icon-sync" viewBox="0 0 24 24"><path d="M20 7h-5V2"/><path d="M4 17h5v5"/><path d="M5.6 9A7 7 0 0 1 18 5l2 2"/><path d="M18.4 15A7 7 0 0 1 6 19l-2-2"/></symbol>
+  <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M21 4v6h-6"/><path d="M19 15a8 8 0 1 1-2-8.4L21 10"/></symbol>
+  <symbol id="icon-clinical" viewBox="0 0 24 24"><path d="M12 21s-8-4.4-8-11a4.5 4.5 0 0 1 8-2.8A4.5 4.5 0 0 1 20 10c0 6.6-8 11-8 11Z"/><path d="M7.5 12h3l1.5-3 2 6 1.5-3h1.5"/></symbol>
+  <symbol id="icon-oximetry" viewBox="0 0 24 24"><path d="M3 12h4l2-6 4 12 2-6h6"/></symbol>
+  <symbol id="icon-console" viewBox="0 0 24 24"><path d="m4 6 6 6-6 6"/><path d="M12 18h8"/></symbol>
+  <symbol id="icon-storage" viewBox="0 0 24 24"><path d="M5 3h11l4 4v14H4V4a1 1 0 0 1 1-1Z"/><path d="M8 3v6h8V3"/><path d="M8 17h8"/></symbol>
+  <symbol id="icon-config" viewBox="0 0 24 24"><path d="M4 6h16"/><circle cx="9" cy="6" r="2"/><path d="M4 12h16"/><circle cx="15" cy="12" r="2"/><path d="M4 18h16"/><circle cx="11" cy="18" r="2"/></symbol>
+  <symbol id="icon-ota" viewBox="0 0 24 24"><path d="M12 16V3"/><path d="m7 8 5-5 5 5"/><path d="M5 14v6a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-6"/></symbol>
+</svg>
+
 <div class="app">
   <aside class="sidebar">
     <div class="brand">
@@ -332,15 +352,15 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
       <small id="verBuild" style="color:#555"></small>
     </div>
     <nav>
-      <a class="nav-item active" data-tab="status"><span class="icon">&#9878;</span> Dashboard</a>
-      <a class="nav-item" data-tab="report"><span class="icon">&#9776;</span> Sleep Report</a>
-      <a class="nav-item" data-tab="sync" hidden><span class="icon">&#8644;</span> Sync</a>
-      <a class="nav-item" data-tab="clinical"><span class="icon">&#9881;</span> Clinical</a>
-      <a class="nav-item" data-tab="bluetooth"><span class="icon">&#9829;</span> Oximetry</a>
-      <a class="nav-item" data-tab="console"><span class="icon">&#9002;</span> Console</a>
-      <a class="nav-item" data-tab="storage" hidden><span class="icon">&#9635;</span> Storage</a>
-      <a class="nav-item" data-tab="device"><span class="icon">&#9881;</span> Config</a>
-      <a class="nav-item" data-tab="ota"><span class="icon">&#8679;</span> OTA Upload</a>
+      <a class="nav-item active" data-tab="status"><span class="icon"><svg aria-hidden="true"><use href="#icon-dashboard"/></svg></span> Dashboard</a>
+      <a class="nav-item" data-tab="report"><span class="icon"><svg aria-hidden="true"><use href="#icon-report"/></svg></span> Sleep Report</a>
+      <a class="nav-item" data-tab="sync" hidden><span class="icon"><svg aria-hidden="true"><use href="#icon-sync"/></svg></span> Sync</a>
+      <a class="nav-item" data-tab="clinical"><span class="icon"><svg aria-hidden="true"><use href="#icon-clinical"/></svg></span> Clinical</a>
+      <a class="nav-item" data-tab="bluetooth"><span class="icon"><svg aria-hidden="true"><use href="#icon-oximetry"/></svg></span> Oximetry</a>
+      <a class="nav-item" data-tab="console"><span class="icon"><svg aria-hidden="true"><use href="#icon-console"/></svg></span> Console</a>
+      <a class="nav-item" data-tab="storage" hidden><span class="icon"><svg aria-hidden="true"><use href="#icon-storage"/></svg></span> Storage</a>
+      <a class="nav-item" data-tab="device"><span class="icon"><svg aria-hidden="true"><use href="#icon-config"/></svg></span> Config</a>
+      <a class="nav-item" data-tab="ota"><span class="icon"><svg aria-hidden="true"><use href="#icon-ota"/></svg></span> OTA Upload</a>
     </nav>
   </aside>
 
@@ -356,7 +376,7 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
           <span id="topSsid">WiFi: --</span>
         </span>
         <span title="Free memory"><span id="topHeap">-- heap</span><span id="topPsram" hidden></span></span>
-        <button class="btn" onclick="loadStatus()" style="padding:4px 12px;font-size:11px">Refresh</button>
+        <button class="btn icon-button" id="refreshButton" type="button" onclick="loadStatus()" aria-label="Refresh" title="Refresh"><svg aria-hidden="true"><use href="#icon-refresh"/></svg></button>
       </div>
     </div>
 
@@ -685,7 +705,7 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
         <!-- AirBridge OTA -->
         <div class="card" style="border-left:3px solid var(--accent)">
           <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
-            <div style="font-size:24px">&#9881;</div>
+            <div class="icon" style="width:24px;height:24px"><svg aria-hidden="true"><use href="#icon-ota"/></svg></div>
             <div>
               <div style="font-weight:600;font-size:15px">AirBridge Firmware</div>
               <div style="font-size:12px;color:var(--text-dim)">ESP32 &middot; <span id="espFwVer">--</span></div>
@@ -781,15 +801,15 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 
 <!-- Mobile bottom nav -->
 <nav class="bottom-nav">
-  <a class="bnav-item active" data-tab="status"><span class="icon">&#9878;</span>Home</a>
-  <a class="bnav-item" data-tab="report"><span class="icon">&#9776;</span>Report</a>
-  <a class="bnav-item" data-tab="sync" hidden><span class="icon">&#8644;</span>Sync</a>
-  <a class="bnav-item" data-tab="clinical"><span class="icon">&#9881;</span>Clinical</a>
-  <a class="bnav-item" data-tab="bluetooth"><span class="icon">&#9829;</span>Oxi</a>
-  <a class="bnav-item" data-tab="console"><span class="icon">&#9002;</span>CLI</a>
-  <a class="bnav-item" data-tab="storage" hidden><span class="icon">&#9635;</span>Storage</a>
-  <a class="bnav-item" data-tab="device"><span class="icon">&#9881;</span>Config</a>
-  <a class="bnav-item" data-tab="ota"><span class="icon">&#8679;</span>OTA</a>
+  <a class="bnav-item active" data-tab="status"><span class="icon"><svg aria-hidden="true"><use href="#icon-dashboard"/></svg></span>Home</a>
+  <a class="bnav-item" data-tab="report"><span class="icon"><svg aria-hidden="true"><use href="#icon-report"/></svg></span>Report</a>
+  <a class="bnav-item" data-tab="sync" hidden><span class="icon"><svg aria-hidden="true"><use href="#icon-sync"/></svg></span>Sync</a>
+  <a class="bnav-item" data-tab="clinical"><span class="icon"><svg aria-hidden="true"><use href="#icon-clinical"/></svg></span>Clinical</a>
+  <a class="bnav-item" data-tab="bluetooth"><span class="icon"><svg aria-hidden="true"><use href="#icon-oximetry"/></svg></span>Oxi</a>
+  <a class="bnav-item" data-tab="console"><span class="icon"><svg aria-hidden="true"><use href="#icon-console"/></svg></span>CLI</a>
+  <a class="bnav-item" data-tab="storage" hidden><span class="icon"><svg aria-hidden="true"><use href="#icon-storage"/></svg></span>Storage</a>
+  <a class="bnav-item" data-tab="device"><span class="icon"><svg aria-hidden="true"><use href="#icon-config"/></svg></span>Config</a>
+  <a class="bnav-item" data-tab="ota"><span class="icon"><svg aria-hidden="true"><use href="#icon-ota"/></svg></span>OTA</a>
 </nav>
 
 <!-- Toast container -->
