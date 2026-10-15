@@ -117,7 +117,7 @@ bool document_path(const char *prefix, const uint8_t hash[32], char (&out)[PATH_
 
 bool document_content(const SdStorage::Session &session, const char *prefix,
                       const Document &document, aircannect::LargeTextBuffer &out,
-                      DocumentScratch &scratch) {
+                      DocumentScratch &scratch, bool (*cancelled)(void *) = nullptr, void *context = nullptr) {
     auto &path = scratch.path;
     auto &bytes = scratch.block;
     SdStorage::Reader reader;
@@ -127,6 +127,7 @@ bool document_content(const SdStorage::Session &session, const char *prefix,
     Digest digest;
     uint8_t hash[32];
     for (size_t at = 0; at < document.bytes;) {
+        if (cancelled && cancelled(context)) { out.clear(); return false; }
         const size_t count = std::min(sizeof(bytes), size_t(document.bytes - at));
         if (reader.read(bytes, count) != count || !digest.add(bytes, count) ||
             !out.append(reinterpret_cast<const char *>(bytes), count)) {
@@ -197,20 +198,20 @@ Lookup document_slot(const SdStorage::Session &session, const char *prefix,
 
 bool document_read(const SdStorage::Session &session, const char *prefix,
                    Document &document, aircannect::LargeTextBuffer &out,
-                   const uint8_t *key, bool fallback) {
+                   const uint8_t *key, bool fallback, bool (*cancelled)(void *), void *context) {
     out.clear();
     if (key && memcmp(key, document.key, 32)) return false;
     void *memory = aircannect::Memory::alloc_large(sizeof(DocumentScratch));
     if (!memory) return false;
     std::unique_ptr<DocumentScratch, decltype(&aircannect::Memory::free)> scratch(
         new (memory) DocumentScratch, aircannect::Memory::free);
-    if (document_content(session, prefix, document, out, *scratch)) return true;
-    if (!fallback || !session.valid() || out.overflowed()) return false;
+    if (document_content(session, prefix, document, out, *scratch, cancelled, context)) return true;
+    if (!fallback || !session.valid() || out.overflowed() || (cancelled && cancelled(context))) return false;
     Document previous;
     if (document_head(session, prefix, unsigned((document.generation & 1) ^ 1), previous, scratch->path) != Lookup::Ready ||
         int32_t(previous.generation - document.generation) >= 0 ||
         (key && memcmp(key, previous.key, 32)) || !memcmp(previous.digest, document.digest, 32) ||
-        !document_content(session, prefix, previous, out, *scratch)) return false;
+        !document_content(session, prefix, previous, out, *scratch, cancelled, context)) return false;
     document = previous;
     return true;
 }
@@ -319,7 +320,7 @@ bool index_discard(const SdStorage::Session &session, const uint8_t digest[32]) 
 }
 
 Lookup index_candidate(const SdStorage::Session &session, const uint8_t digest[32],
-                       uint32_t bytes, aircannect::LargeTextBuffer &out) {
+                       uint32_t bytes, aircannect::LargeTextBuffer &out, bool (*cancelled)(void *), void *context) {
     const auto state = root_reference(session, digest);
     if (state == Lookup::Ready) return Lookup::Missing;
     if (state != Lookup::Missing) return Lookup::Failed;
@@ -330,8 +331,8 @@ Lookup index_candidate(const SdStorage::Session &session, const uint8_t digest[3
     Document candidate;
     candidate.bytes = bytes;
     memcpy(candidate.digest, digest, 32);
-    if (document_content(session, "/airbridge/report/index", candidate, out, *scratch)) return Lookup::Ready;
-    return !session.valid() || out.overflowed() ? Lookup::Failed : Lookup::Invalid;
+    if (document_content(session, "/airbridge/report/index", candidate, out, *scratch, cancelled, context)) return Lookup::Ready;
+    return !session.valid() || out.overflowed() || (cancelled && cancelled(context)) ? Lookup::Failed : Lookup::Invalid;
 }
 
 struct Producer::Work {

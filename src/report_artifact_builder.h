@@ -44,7 +44,8 @@ Lookup document_slot(const SdStorage::Session &session, const char *prefix,
                      unsigned slot, Document &out);
 bool document_read(const SdStorage::Session &session, const char *prefix,
                    Document &document, aircannect::LargeTextBuffer &out,
-                   const uint8_t *key, bool fallback = true);
+                   const uint8_t *key, bool fallback = true,
+                   bool (*cancelled)(void *) = nullptr, void *context = nullptr);
 bool document_publish(const SdStorage::Session &session, const char *prefix,
                       const uint8_t key[32], const uint8_t *data, size_t length,
                       Document &out);
@@ -54,13 +55,15 @@ bool document_publish(const SdStorage::Session &session, const char *prefix,
 bool index_publish(const SdStorage::Session &session, const uint8_t key[32],
                    const uint8_t *data, size_t length, Document &out, Document &retired);
 // Never removes content referenced by either index, dataset or rebuild head.
-// Caller proves the candidate is an index and excludes readers until return.
+// Caller proves the candidate is an index; its exclusive SD session serializes
+// deletion with reads admitted concurrently by the transport.
 bool index_discard(const SdStorage::Session &session, const uint8_t digest[32]);
 // Read an unreferenced root body once, verifying its content hash. Missing
 // means protected by a head; Invalid means malformed, Failed means retry.
 // The owner must still establish that this body is an index before removal.
 Lookup index_candidate(const SdStorage::Session &session, const uint8_t digest[32],
-                       uint32_t bytes, aircannect::LargeTextBuffer &out);
+                       uint32_t bytes, aircannect::LargeTextBuffer &out,
+                       bool (*cancelled)(void *) = nullptr, void *context = nullptr);
 
 // One source, one record traversal, all selected tracks. Scratch lives in PSRAM
 // and is independent of duration. Base transposition and x4 passes read the

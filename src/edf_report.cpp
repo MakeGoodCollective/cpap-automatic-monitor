@@ -87,6 +87,7 @@ constexpr size_t INTERNAL_BODY = 16 * 1024;
 constexpr size_t INTERNAL_WORK = 8 * 1024;
 constexpr uint32_t RETAIN_MS = 6 * 60 * 60 * 1000;
 constexpr uint32_t DELIVERY_MS = 30000;
+constexpr uint32_t FOREGROUND_QUIET_MS = 1000;
 constexpr size_t SLOT_COUNT = 2;
 constexpr size_t RETAINED_SLOTS = 32;
 constexpr double LEAK_THRESHOLD = 24;
@@ -378,7 +379,8 @@ Status status;
 uint32_t next_id = 1, data_revision = 1;
 uint32_t foreground_epoch = 0;
 uint32_t artifact_reads = 0;
-bool index_deleting = false;
+uint32_t foreground_at = 0;
+bool foreground_seen = false;
 uint32_t backfill_revision = 0;
 uint16_t backfill_before = UINT16_MAX;
 uint8_t backfill_period = 0;
@@ -1905,27 +1907,31 @@ bool days_json(const SdStorage::Session &session, Job &job) {
     return job.body.good();
 }
 
-struct ArtifactRemoval {
-    // Pair admission with open_artifact: a reader cannot enter between the
-    // last active-read check and removal. No I/O runs under the critical lock.
-    bool admitted;
-    ArtifactRemoval() {
-        portENTER_CRITICAL(&status_mux);
-        admitted = !__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) && !index_deleting;
-        if (admitted) index_deleting = true;
-        portEXIT_CRITICAL(&status_mux);
-    }
-    ~ArtifactRemoval() {
-        if (!admitted) return;
-        portENTER_CRITICAL(&status_mux);
-        index_deleting = false;
-        portEXIT_CRITICAL(&status_mux);
-    }
-};
+uint32_t foreground_wait() {
+    portENTER_CRITICAL(&status_mux);
+    const uint32_t elapsed = millis() - foreground_at;
+    const uint32_t wait = foreground_seen && elapsed < FOREGROUND_QUIET_MS ? FOREGROUND_QUIET_MS - elapsed : 0;
+    portEXIT_CRITICAL(&status_mux);
+    return wait;
+}
+
+void foreground_activity() {
+    portENTER_CRITICAL(&status_mux);
+    foreground_at = millis();
+    foreground_seen = true;
+    portEXIT_CRITICAL(&status_mux);
+}
+
+bool cleanup_cancelled(void *context) {
+    return foreground_wait() || ExportSync::busy() ||
+        aborted(nullptr, *static_cast<const SdStorage::Session *>(context));
+}
 
 bool discard_index(const SdStorage::Session &session, const uint8_t digest[32]) {
-    ArtifactRemoval removal;
-    return removal.admitted && ReportArtifact::index_discard(session, digest);
+    // SD ownership serializes unlink with the actual read, not its admission.
+    // A newly admitted reader waits for this session, then opens the file;
+    // retained heads are never candidates. Do not reject it during an unlink.
+    return !__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) && ReportArtifact::index_discard(session, digest);
 }
 
 bool retire_index(const SdStorage::Session &session) {
@@ -1983,7 +1989,8 @@ bool index_cleanup_pending() {
 }
 
 bool cleanup_indexes(const SdStorage::Session &session) {
-    if (aborted(nullptr, session) || ExportSync::busy()) return false;
+    auto *context = const_cast<SdStorage::Session *>(&session);
+    if (cleanup_cancelled(context)) return false;
     if (index_cleanup.files != SdStorage::files_revision()) {
         index_cleanup = {};
         index_cleanup.files = SdStorage::files_revision();
@@ -1995,7 +2002,7 @@ bool cleanup_indexes(const SdStorage::Session &session) {
         memset(index_cleanup.present, 0, sizeof(index_cleanup.present));
         if (!directory.open(session, CACHE_DIR, true)) return false;
         while (!end) {
-            if (aborted(nullptr, session) || !directory.next(entry, end)) return false;
+            if (cleanup_cancelled(context) || !directory.next(entry, end)) return false;
             if (end) break;
             const char *name = strrchr(entry.name, '/');
             name = name ? name + 1 : entry.name;
@@ -2014,7 +2021,7 @@ bool cleanup_indexes(const SdStorage::Session &session) {
     if (!directory.open(session, path, true)) return false;
     end = false;
     while (!end) {
-        if (aborted(nullptr, session) || ExportSync::busy() || !directory.next(entry, end)) return false;
+        if (cleanup_cancelled(context) || !directory.next(entry, end)) return false;
         if (end) break;
         const char *name = strrchr(entry.name, '/');
         name = name ? name + 1 : entry.name;
@@ -2023,7 +2030,7 @@ bool cleanup_indexes(const SdStorage::Session &session) {
         uint8_t digest[32]; size_t decoded = 0;
         if (!aircannect::hex_decode(name, 64, digest, sizeof(digest), decoded) || digest[0] != index_cleanup.shard) continue;
         aircannect::LargeTextBuffer body(MAX_BODY, 0);
-        auto state = ReportArtifact::index_candidate(session, digest, entry.size, body);
+        auto state = ReportArtifact::index_candidate(session, digest, entry.size, body, cleanup_cancelled, context);
         if (state == ReportArtifact::Lookup::Ready) {
             // The only four-byte root document in v1 is the rebuild counter.
             // Both live counter heads remain protected by index_candidate.
@@ -2033,7 +2040,7 @@ bool cleanup_indexes(const SdStorage::Session &session) {
         }
         if (state == ReportArtifact::Lookup::Failed) return false;
         if (state != ReportArtifact::Lookup::Ready) continue;
-        if (aborted(nullptr, session) || ExportSync::busy() || !discard_index(session, digest)) return false;
+        if (cleanup_cancelled(context) || !discard_index(session, digest)) return false;
     }
     ++index_cleanup.shard;
     return true;
@@ -2485,7 +2492,7 @@ struct DayCleanup {
         return new (files + count++) File;
     }
     bool active() const {
-        return !aborted(nullptr, session) && !ExportSync::busy() &&
+        return !cleanup_cancelled(const_cast<SdStorage::Session *>(&session)) &&
             epoch == __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
     }
     bool inventory(const char *relative = "") {
@@ -2643,10 +2650,12 @@ struct DayCleanup {
         if (!header) return Lookup::Failed;
         size_t sources = 0;
         for (size_t i = 0; i < index_count; ++i) if (selected(index[i], day, day)) {
+            if (!active()) return Lookup::Failed;
             ++sources;
             if (!(index[i].key.present & 7) || !cached_summary_header(session, index[i], *header) || header->partial)
                 return active() ? Lookup::Invalid : Lookup::Failed;
             for (uint8_t kind = 0; kind < 3; ++kind) if (index[i].key.present & (1u << kind)) {
+                if (!active()) return Lookup::Failed;
                 char name[96]; uint8_t identity[32]; ReportArtifact::Publication publication;
                 if (!artifact_identity(index[i], kind, name, identity) ||
                     ReportArtifact::lookup(session, name, identity, publication) != Lookup::Ready)
@@ -2667,6 +2676,7 @@ struct DayCleanup {
         // Heads and references are parsed once before any deletion. Retained
         // manifests may still reference bodies whose named heads are obsolete.
         for (size_t i = 0; i < count; ++i) {
+            if (!active()) return Lookup::Failed;
             auto &file = files[i];
             file.discard = obsolete(file);
             file.discard |= !strcmp(file.name, "day.document.part") ||
@@ -2675,7 +2685,8 @@ struct DayCleanup {
             const size_t n = strlen(file.name);
             if (file.discard && n > 6 && (!strcmp(file.name + n - 6, ".stats") || !strcmp(file.name + n - 7, ".series"))) {
                 uint8_t header[20];
-                if (file.bytes < sizeof(header) || !read(file, header, sizeof(header))) return Lookup::Invalid;
+                if (file.bytes < sizeof(header)) return Lookup::Invalid;
+                if (!read(file, header, sizeof(header))) return active() ? Lookup::Invalid : Lookup::Failed;
                 // Native v7 cache layouts are the only legacy formats this
                 // owner understands. Future/foreign cache files are untouched.
                 const bool stats = !strcmp(file.name + n - 6, ".stats");
@@ -2724,6 +2735,7 @@ struct DayCleanup {
         }
         bool current_checked = false;
         for (size_t i = 0; i < count; ++i) {
+            if (!active()) return Lookup::Failed;
             auto &file = files[i];
             if (file.leaf) { file.discard = true; continue; }
             if (strlen(file.name) == 68 && !strcmp(file.name + 64, ".abt") &&
@@ -2761,7 +2773,8 @@ struct DayCleanup {
             if (!aircannect::hex_decode(file.name + 3, 64, document.digest, 32, decoded)) return Lookup::Invalid;
             document.bytes = file.bytes;
             aircannect::LargeTextBuffer body(MAX_BODY, 0);
-            if (!ReportArtifact::document_read(session, prefix, document, body, nullptr, false)) return Lookup::Failed;
+            if (!ReportArtifact::document_read(session, prefix, document, body, nullptr, false,
+                cleanup_cancelled, const_cast<SdStorage::Session *>(&session))) return Lookup::Failed;
             aircannect::JsonAllocator allocator(false);
             JsonDocument json(&allocator);
             const auto error = deserializeJson(json, body.c_str(), body.length());
@@ -2808,8 +2821,6 @@ struct DayCleanup {
             if (!file.discard || file.keep || body != bodies) continue;
             if (!active()) return Lookup::Failed;
             char path[224]; snprintf(path, sizeof(path), "%s/%s", file.legacy ? CACHE_DIR : directory, file.name);
-            ArtifactRemoval removal;
-            if (!removal.admitted) return Lookup::Failed;
             const bool ok = session.run([&](fs::FS &fs) { return !fs.exists(path) || fs.remove(path); });
             if (!ok) return Lookup::Failed;
             ++removed; removed_bytes += file.bytes;
@@ -2840,7 +2851,8 @@ bool artifact_cleanup_pending() {
 }
 
 bool cleanup_artifacts(const SdStorage::Session &session) {
-    if (aborted(nullptr, session) || ExportSync::busy()) return false;
+    auto *context = const_cast<SdStorage::Session *>(&session);
+    if (cleanup_cancelled(context)) return false;
     // Result bodies can contain selectors into older graphs. Never invalidate
     // a pinned or not-yet-delivered response while collecting its dependencies.
     bool busy = false;
@@ -2872,7 +2884,8 @@ bool cleanup_artifacts(const SdStorage::Session &session) {
             if (found == ReportArtifact::Lookup::Missing) continue;
             aircannect::LargeTextBuffer body(MAX_BODY, 0);
             if (found != ReportArtifact::Lookup::Ready ||
-                !ReportArtifact::document_read(session, "/airbridge/report/index", document, body, nullptr, false) ||
+                !ReportArtifact::document_read(session, "/airbridge/report/index", document, body, nullptr, false,
+                    cleanup_cancelled, context) ||
                 index_shape(body) != ReportArtifact::Lookup::Ready) return false;
             aircannect::JsonAllocator allocator(false); JsonDocument json(&allocator);
             if (deserializeJson(json, body.c_str(), body.length())) return false;
@@ -2890,7 +2903,7 @@ bool cleanup_artifacts(const SdStorage::Session &session) {
         if (!directory.open(session, CACHE_DIR, true)) return false;
         SdStorage::Reader::Entry entry; bool end = false;
         while (!end) {
-            if (aborted(nullptr, session) || !directory.next(entry, end)) return false;
+            if (cleanup_cancelled(context) || !directory.next(entry, end)) return false;
             if (end) break;
             const char *name = strrchr(entry.name, '/'); name = name ? name + 1 : entry.name;
             uint16_t day;
@@ -2930,6 +2943,9 @@ bool cleanup_artifacts(const SdStorage::Session &session) {
         const auto *cached = cached_day_entry(day, false);
         const bool checked = cached && cached->cleanup_checked && !memcmp(cached->cleanup_key, key, sizeof(key));
         DayCleanup cleanup(session, day);
+        const uint32_t started = millis();
+        if (!checked) Log::logf(CAT_REPORT, LOG_DEBUG, "Report cleanup scanning day=%.8s\n",
+            cleanup.directory + strlen(CACHE_DIR) + 1);
         const auto result = checked ? ReportArtifact::Lookup::Ready : cleanup.collect();
         if (cleanup.removed) {
             cache_usage_known = false;
@@ -2937,7 +2953,12 @@ bool cleanup_artifacts(const SdStorage::Session &session) {
                 cleanup.directory + strlen(CACHE_DIR) + 1, static_cast<unsigned long>(cleanup.removed),
                 static_cast<unsigned long long>(cleanup.removed_bytes));
         }
-        if (result == ReportArtifact::Lookup::Failed) return false;
+        if (result == ReportArtifact::Lookup::Failed) {
+            Log::logf(CAT_REPORT, LOG_DEBUG, "Report cleanup deferred day=%.8s elapsed=%lums foreground=%u\n",
+                cleanup.directory + strlen(CACHE_DIR) + 1, static_cast<unsigned long>(millis() - started),
+                unsigned(foreground_wait() || __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE)));
+            return false;
+        }
         if (auto *entry = cached_day_entry(day, true)) {
             memcpy(entry->cleanup_key, key, sizeof(key));
             entry->cleanup_checked = true;
@@ -2948,6 +2969,7 @@ bool cleanup_artifacts(const SdStorage::Session &session) {
         artifact_cleanup.next += sizeof(day);
     }
     if (artifact_cleanup.next == artifact_cleanup.days.length()) {
+        if (cleanup_cancelled(context)) return false;
         aircannect::LargeTextBuffer days(MAX_SESSION_COUNT * sizeof(uint16_t), 0), anchors(2 * MAX_BODY, 0);
         aircannect::LargeTextBuffer legacy(MAX_SESSION_COUNT * sizeof(CleanupLegacy), 0);
         days.swap(artifact_cleanup.days); anchors.swap(artifact_cleanup.anchors); legacy.swap(artifact_cleanup.legacy);
@@ -3067,6 +3089,9 @@ bool work_once() {
     if (!SdStorage::mounted()) { defer_job(job); publish(State::Blocked, "no_sd"); return false; }
     if (__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE)) {
         defer_job(job); publish(State::WaitingStorage, "artifact_read"); return false;
+    }
+    if ((!job || job->background) && foreground_wait()) {
+        defer_job(job); publish(State::Ready); return false;
     }
     if (job && job->background && ExportSync::busy()) {
         defer_job(job); publish(State::WaitingStorage, "export_pending"); return false;
@@ -3247,12 +3272,15 @@ void worker(void *) {
         if (work_once()) continue;
         Status publication;
         get_status(publication);
-        xSemaphoreTake(wake, background_retry || publication.state == State::WaitingStorage || publication.state == State::Blocked
-            ? pdMS_TO_TICKS(1000) : portMAX_DELAY);
+        const uint32_t quiet = foreground_wait();
+        xSemaphoreTake(wake, quiet ? pdMS_TO_TICKS(quiet) :
+            background_retry || publication.state == State::WaitingStorage || publication.state == State::Blocked
+                ? pdMS_TO_TICKS(1000) : portMAX_DELAY);
     }
 }
 
 void artifact_read_released() {
+    foreground_activity();
     __atomic_sub_fetch(&artifact_reads, 1, __ATOMIC_ACQ_REL);
     if (wake) xSemaphoreGive(wake);
 }
@@ -3353,6 +3381,8 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     if (!publication.mounted) return reject("no_sd");
     if (!publication.available) return reject("not_idle");
     if (request.revision && request.revision != publication.data_revision) return reject("stale_revision");
+    foreground_activity();
+    __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
     if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return reject("busy");
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
@@ -3405,7 +3435,6 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     slot->id = next_id++;
     if (!next_id) next_id = 1;
     slot->state = JobState::Queued;
-    __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
     id = slot->id;
     xSemaphoreGive(mutex);
     portENTER_CRITICAL(&status_mux);
@@ -3455,13 +3484,8 @@ StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
     if (root && !document) return StorageBrowser::StartResult::BadRequest;
     // Keep priority until the reader releases SD, not just until backfill
     // observes an epoch change and immediately starts its next attempt.
-    portENTER_CRITICAL(&status_mux);
-    if (index_deleting) {
-        portEXIT_CRITICAL(&status_mux);
-        return StorageBrowser::StartResult::Busy;
-    }
+    foreground_activity();
     __atomic_add_fetch(&artifact_reads, 1, __ATOMIC_ACQ_REL);
-    portEXIT_CRITICAL(&status_mux);
     __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
     operation.kind = StorageBrowser::Kind::Immutable;
     operation.selection[0] = 0;
