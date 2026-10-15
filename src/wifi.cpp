@@ -23,6 +23,8 @@ typedef enum {
 
 static wifi_state_t wf_state = WF_OFF;
 static std::atomic<uint32_t> status_revision{0};
+static std::atomic<uint32_t> sta_address{0}, ap_address{0};
+static std::atomic<bool> ap_address_pending{false};
 static uint32_t state_entered_ms = 0;
 static bool ntp_done = false;
 
@@ -165,17 +167,27 @@ static void wifi_event_cb(WiFiEvent_t event, WiFiEventInfo_t info) {
         }
         break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+        sta_address.store(info.got_ip.ip_info.ip.addr);
         got_ip = true;
         hint_refresh_pending = true;
         status_revision.fetch_add(1);
         break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+        sta_address.store(0);
         sta_disconnected = true;
         last_disconnect_reason = info.wifi_sta_disconnected.reason;
         status_revision.fetch_add(1);
         break;
     case ARDUINO_EVENT_WIFI_STA_LOST_IP:
     case ARDUINO_EVENT_WIFI_STA_STOP:
+        sta_address.store(0);
+        status_revision.fetch_add(1);
+        break;
+    case ARDUINO_EVENT_WIFI_AP_STOP:
+        ap_address.store(0);
+        [[fallthrough]];
+    case ARDUINO_EVENT_WIFI_AP_START:
+        ap_address_pending.store(true);
         status_revision.fetch_add(1);
         break;
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
@@ -187,6 +199,13 @@ static void wifi_event_cb(WiFiEvent_t event, WiFiEventInfo_t info) {
     default:
         break;
     }
+}
+
+static void refresh_ap_address() {
+    if (!ap_address_pending.exchange(false)) return;
+    const uint32_t address = (WiFi.getMode() & WIFI_AP) ?
+        static_cast<uint32_t>(WiFi.softAPIP()) : 0;
+    if (ap_address.exchange(address) != address) status_revision.fetch_add(1);
 }
 
 
@@ -689,6 +708,7 @@ void WiFiSetup::check() {
         else if (pending & 4) apply_profile_changes();
     }
 
+    refresh_ap_address();
     check_mdns();
 
     auto &cfg = Config::get();
@@ -970,6 +990,11 @@ void WiFiSetup::suspend_roaming() { roaming_suspended = true; }
 void WiFiSetup::resume_roaming()  { roaming_suspended = false; }
 
 uint32_t WiFiSetup::revision() { return status_revision.load(); }
+
+void WiFiSetup::addresses(uint32_t &sta, uint32_t &ap) {
+    sta = sta_address.load();
+    ap = ap_address.load();
+}
 
 const char *WiFiSetup::state_name() {
     switch (wf_state) {

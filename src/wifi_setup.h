@@ -16,6 +16,8 @@ namespace WiFiSetup {
 
     const char *state_name();
     uint32_t revision();
+    // Published IPv4 addresses in network byte order; zero means unavailable.
+    void addresses(uint32_t &sta, uint32_t &ap);
     int8_t current_rssi();
     const char *connected_ssid();
     uint8_t connected_net_idx();

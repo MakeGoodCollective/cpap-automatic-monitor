@@ -6,6 +6,7 @@
 #include "oxi_ble.h"
 #include "sleep_report.h"
 #include "sd_storage.h"
+#include "wifi_setup.h"
 #include <string.h>
 
 namespace DeviceStatus {
@@ -20,6 +21,8 @@ struct Snapshot {
     bool feeding;
     char oxi_source[32];
     char oxi_name[32];
+    uint32_t ip = 0;
+    uint32_t ap_ip = 0;
     SleepReport::Source report_source = SleepReport::Source::Device;
     uint32_t report_revision = 0;
     uint32_t report_data_revision = 0;
@@ -43,6 +46,7 @@ inline Snapshot snapshot() {
     out.feeding = OxiArbiter::is_feeding();
     OxiArbiter::get_source(out.oxi_source, sizeof(out.oxi_source),
                            out.oxi_name, sizeof(out.oxi_name));
+    WiFiSetup::addresses(out.ip, out.ap_ip);
     SleepReport::Publication report;
     SleepReport::get_publication(report);
     out.report_source = report.source;

@@ -708,7 +708,7 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
             <div class="icon" style="width:24px;height:24px"><svg aria-hidden="true"><use href="#icon-ota"/></svg></div>
             <div>
               <div style="font-weight:600;font-size:15px">AirBridge Firmware</div>
-              <div style="font-size:12px;color:var(--text-dim)">ESP32 &middot; <span id="espFwVer">--</span></div>
+              <div style="font-size:12px;color:var(--text-dim)">ESP32 &middot; <span id="espFwTarget">--</span> &middot; <span id="espFwVer">--</span></div>
             </div>
           </div>
           <div class="row">
@@ -1300,9 +1300,19 @@ function renderStatus(d) {
   if (d.ssid !== undefined) {
     el = document.getElementById('topSsid');
     el.textContent = 'WiFi: ' + (d.ssid || '--');
-    el.title = d.ssid || 'Not connected';
   }
   if (d.rssi !== undefined) updateWifiBars(document.getElementById('topWifi'), d.rssi);
+  if (d.ssid !== undefined || d.rssi !== undefined || d.ip !== undefined || d.ap_ip !== undefined) {
+    const details = [];
+    if (lastStatus.ssid) details.push('Network: ' + lastStatus.ssid);
+    if (lastStatus.rssi < 0) details.push('Signal: ' + fmtRssi(lastStatus.rssi));
+    if (lastStatus.ip) details.push('LAN IP: ' + lastStatus.ip);
+    if (lastStatus.ap_ip) details.push('Access point IP: ' + lastStatus.ap_ip);
+    const tooltip = details.join('\n') || 'No WiFi connection';
+    document.getElementById('topSsid').title = tooltip;
+    document.getElementById('topSsid').setAttribute('aria-label', tooltip.replace(/\n/g, ', '));
+    document.getElementById('topWifi').title = tooltip;
+  }
   if (d.uptime !== undefined) {
     var s = d.uptime, days = (s/86400)|0, hrs = ((s%86400)/3600)|0, mins = ((s%3600)/60)|0;
     var ut = '';
@@ -1314,6 +1324,10 @@ function renderStatus(d) {
     document.getElementById('ver').textContent = d.version;
     var vb = document.getElementById('verBuild');
     if (vb && d.built) vb.textContent = d.built;
+  }
+  if (d.target !== undefined) {
+    document.getElementById('verBuild').title = d.target ? 'Build target: ' + d.target : '';
+    document.getElementById('espFwTarget').textContent = d.target || '--';
   }
 
   if (!document.getElementById('p-status').classList.contains('active')) return;

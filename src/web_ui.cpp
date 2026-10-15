@@ -371,8 +371,15 @@ static void appendStatusIdentity(Output &json, bool comma = true) {
     AirSenseState::identity(identity);
     jsonAddString(json, "version", airbridge_version(), comma);
     jsonAddString(json, "built", airbridge_build_date());
+    jsonAddString(json, "target", AB_OTA_RELEASE_TARGET);
     jsonAddString(json, "pna", identity.pna);
     jsonAddString(json, "srn", identity.srn);
+}
+
+template<class Output>
+static void appendWifiAddresses(Output &json, uint32_t sta, uint32_t ap) {
+    jsonAddString(json, "ip", sta ? IPAddress(sta).toString().c_str() : "");
+    jsonAddString(json, "ap_ip", ap ? IPAddress(ap).toString().c_str() : "");
 }
 
 template<class Output>
@@ -396,6 +403,7 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
                    static_cast<int>(ESP.getFreePsram()) : -1);
         jsonAddString(json, "ssid", WiFiSetup::connected_ssid());
         jsonAddInt(json, "rssi", WiFiSetup::current_rssi());
+        appendWifiAddresses(json, status.ip, status.ap_ip);
         jsonAddInt(json, "uptime", millis() / 1000);
     }
     if (fields & STATUS_STORAGE) {
@@ -2058,7 +2066,9 @@ static void handleWifiGet(AsyncWebServerRequest *request) {
     jsonAddString(json, "ssid", WiFiSetup::connected_ssid());
     jsonAddInt(json, "rssi", WiFiSetup::current_rssi());
     jsonAddInt(json, "net_idx", WiFiSetup::connected_net_idx());
-    jsonAddString(json, "ip", WiFiSetup::is_connected() ? WiFi.localIP().toString().c_str() : "");
+    uint32_t sta, ap;
+    WiFiSetup::addresses(sta, ap);
+    appendWifiAddresses(json, sta, ap);
     jsonAddString(json, "roam", cfg.wifi_roam ? "1" : "0");
 
     json += ",\"networks\":[";
@@ -2527,6 +2537,7 @@ static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
     uint8_t fields = 0;
     if (a.rop != b.rop || a.sys != b.sys || a.mhr != b.mhr || a.mop != b.mop)
         fields |= STATUS_THERAPY;
+    if (a.ip != b.ip || a.ap_ip != b.ap_ip) fields |= STATUS_HEALTH;
     if (a.oxi != b.oxi || a.feeding != b.feeding ||
         strcmp(a.oxi_source, b.oxi_source) || strcmp(a.oxi_name, b.oxi_name) ||
         a.reading.valid != b.reading.valid ||
