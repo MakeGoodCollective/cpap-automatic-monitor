@@ -269,6 +269,10 @@ struct Payload : aircannect::LargeTextBuffer {
     Payload() : LargeTextBuffer(MAX_BODY, INTERNAL_BODY) {}
     bool format_error = false;
     bool good() const { return !format_error && !overflowed(); }
+    size_t write(uint8_t byte) { return write(&byte, 1); }
+    size_t write(const uint8_t *bytes, size_t length) {
+        return append(reinterpret_cast<const char *>(bytes), length) ? length : 0;
+    }
     bool print(const char *format, ...) {
         char text[256];
         va_list args;
@@ -285,11 +289,11 @@ struct Job {
     Request request;
     JobState state = JobState::Free;
     uint32_t id = 0, completed_ms = 0, data_revision = 0, cache_generation = 0;
-    uint32_t artifact_revision = 0;
+    uint32_t artifact_revision = 0, files_revision = 0;
     uint16_t readers = 0;
     uint16_t consumers = 1, deliveries = 0;
     bool delivered = false, cancelled = false, shared = false;
-    bool background = false;
+    bool background = false, recovered_index = false;
     mutable bool artifact_preempted = false;
     uint32_t foreground_epoch = 0;
     int code = 0;
@@ -3072,6 +3076,10 @@ bool work_once() {
         (background_retry && int32_t(millis() - background_retry) < 0))) { publish(State::Ready); return false; }
     SdStorage::Session session;
     if (!session.begin()) { defer_job(job); publish(State::WaitingStorage, "storage_busy"); return false; }
+    if (job) {
+        job->files_revision = SdStorage::files_revision();
+        job->recovered_index = false;
+    }
     JobTiming timing(job);
     publish(State::Building);
     const uint32_t index_started = timing.stamp();
@@ -3081,10 +3089,19 @@ bool work_once() {
         Payload saved;
         if (ReportArtifact::document_lookup(session, "/airbridge/report/index", nullptr, document) == ReportArtifact::Lookup::Ready &&
             ReportArtifact::document_read(session, "/airbridge/report/index", document, saved, nullptr) &&
-            saved.length() && saved.c_str()[0] == '{') {
-            job->body.print("{\"stale\":true,");
-            job->body.append(saved.c_str() + 1, saved.length() - 1);
-            recovered_index = job->body.good();
+            saved.length()) {
+            aircannect::JsonAllocator allocator(false);
+            JsonDocument parsed(&allocator);
+            if (!deserializeJson(parsed, saved.c_str(), saved.length()) && parsed["source"] == "edf" &&
+                parsed["days"].is<JsonArrayConst>() && parsed["periods"].is<JsonArrayConst>() &&
+                aircannect::sha256_text_valid(parsed["dataset"].as<const char *>())) {
+                parsed["stale"] = true;
+                parsed["revision"] = revision() + 1;
+                parsed["data_revision"] = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
+                const size_t written = serializeJson(parsed, job->body);
+                recovered_index = job->body.good() && written == measureJson(parsed);
+            }
+            if (!recovered_index) job->body.clear();
         }
     }
     const bool indexed = recovered_index || refresh_index(session);
@@ -3149,6 +3166,7 @@ bool work_once() {
     job->error = job->issue = nullptr;
     job->issue_path[0] = 0;
     job->artifact_preempted = false;
+    job->recovered_index = recovered_index;
     job->foreground_epoch = __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
     xSemaphoreGive(mutex);
     bool success = false;
@@ -3170,8 +3188,9 @@ bool work_once() {
     const bool interrupted = !AirSenseState::local_background_allowed() || !session.valid();
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
-    const bool changed = !recovered_index && (catalog.generation != catalog_generation || SdStorage::files_revision() != file_revision ||
-        job->data_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE));
+    const bool changed = SdStorage::files_revision() != job->files_revision ||
+        job->data_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE) ||
+        (!recovered_index && (catalog.generation != catalog_generation || SdStorage::files_revision() != file_revision));
     const bool yielded = job->artifact_preempted || __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) ||
         (job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE));
     if (success && !job->background && job->request.action == Action::Prepare &&
@@ -3343,7 +3362,7 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     Job *slot = nullptr, *delivered = nullptr;
     size_t active = 0;
     for (auto &job : jobs) {
-        if (current_index && !job.cancelled && !job.issue && job.state == JobState::Complete && job.code == 200 &&
+        if (current_index && !job.recovered_index && !job.cancelled && !job.issue && job.state == JobState::Complete && job.code == 200 &&
             job.data_revision == publication.data_revision && job.request == request &&
             (request.action != Action::Days || job.artifact_revision == publication.artifact_revision) &&
             ((request.action != Action::Summary && request.action != Action::History && request.action != Action::Days) ||
@@ -3465,10 +3484,12 @@ int poll(uint32_t id, Result &out) {
         get_status(publication);
         if (job.code == 200 && (!SdStorage::local_access_allowed() || !SdStorage::mounted() || !publication.mounted ||
             job.data_revision != publication.data_revision ||
-            SdStorage::files_revision() != publication.files_revision)) { code = 409; break; }
+            SdStorage::files_revision() != job.files_revision)) { code = 409; break; }
         EdfCatalog::Status catalog;
         EdfCatalog::get_status(catalog);
-        if (job.code == 200 && catalog.generation != publication.catalog_generation) { code = 202; break; }
+        // A saved index is explicitly stale, but usable before the RAM index
+        // exists. Validate its own read generation, not uninitialized metadata.
+        if (job.code == 200 && !job.recovered_index && catalog.generation != publication.catalog_generation) { code = 202; break; }
         if (!job.body.length() || job.readers == UINT16_MAX) { code = 503; break; }
         code = job.code;
         ++job.readers;
