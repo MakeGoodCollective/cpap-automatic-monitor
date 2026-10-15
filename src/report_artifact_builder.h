@@ -39,9 +39,12 @@ struct Document {
 // key forbids fallback to a publication of different sources.
 Lookup document_lookup(const SdStorage::Session &session, const char *prefix,
                        const uint8_t *key, Document &out);
+// Retention traverses both committed generations, never just the newest one.
+Lookup document_slot(const SdStorage::Session &session, const char *prefix,
+                     unsigned slot, Document &out);
 bool document_read(const SdStorage::Session &session, const char *prefix,
                    Document &document, aircannect::LargeTextBuffer &out,
-                   const uint8_t *key);
+                   const uint8_t *key, bool fallback = true);
 bool document_publish(const SdStorage::Session &session, const char *prefix,
                       const uint8_t key[32], const uint8_t *data, size_t length,
                       Document &out);

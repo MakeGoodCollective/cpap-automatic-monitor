@@ -201,6 +201,8 @@ struct CachedDay {
     uint16_t day = 0;
     bool has_values = false, artifacts_checked = false;
     uint8_t artifact_key[32] = {};
+    uint8_t cleanup_key[32] = {};
+    bool cleanup_checked = false;
 };
 // Two annual selections; lazy growth, no per-day SD files or internal bulk fallback.
 constexpr size_t MAX_CACHED_DAYS = 2 * 366;
@@ -388,6 +390,25 @@ struct IndexCleanup {
     bool discovered = false;
 } index_cleanup;
 
+struct CleanupAnchor {
+    uint16_t day = 0;
+    uint8_t digest[32] = {};
+    uint32_t bytes = 0;
+};
+struct CleanupLegacy {
+    uint16_t day = 0;
+    uint32_t bytes = 0;
+    char name[33] = {};
+};
+struct ArtifactCleanup {
+    uint32_t files = UINT32_MAX, data = 0, artifacts = UINT32_MAX;
+    size_t next = 0;
+    bool discovered = false, complete = false;
+    aircannect::LargeTextBuffer days{MAX_SESSION_COUNT * sizeof(uint16_t), 0};
+    aircannect::LargeTextBuffer anchors{2 * MAX_BODY, 0};
+    aircannect::LargeTextBuffer legacy{MAX_SESSION_COUNT * sizeof(CleanupLegacy), 0};
+} artifact_cleanup;
+
 struct CachedPublication {
     ReportArtifact::Document document;
     uint16_t day = 0, period = 0;
@@ -477,6 +498,7 @@ void remember_publication(uint16_t day, uint16_t period, const ReportArtifact::D
         entry->document = document;
         entry->state = ReportArtifact::Lookup::Ready;
     }
+    if (auto *entry = cached_day_entry(day, false)) entry->cleanup_checked = false;
 }
 
 ReportArtifact::Lookup lookup_publication(const SdStorage::Session &session,
@@ -1879,19 +1901,27 @@ bool days_json(const SdStorage::Session &session, Job &job) {
     return job.body.good();
 }
 
-bool discard_index(const SdStorage::Session &session, const uint8_t digest[32]) {
+struct ArtifactRemoval {
     // Pair admission with open_artifact: a reader cannot enter between the
     // last active-read check and removal. No I/O runs under the critical lock.
-    portENTER_CRITICAL(&status_mux);
-    const bool admitted = !__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) && !index_deleting;
-    if (admitted) index_deleting = true;
-    portEXIT_CRITICAL(&status_mux);
-    if (!admitted) return false;
-    const bool removed = ReportArtifact::index_discard(session, digest);
-    portENTER_CRITICAL(&status_mux);
-    index_deleting = false;
-    portEXIT_CRITICAL(&status_mux);
-    return removed;
+    bool admitted;
+    ArtifactRemoval() {
+        portENTER_CRITICAL(&status_mux);
+        admitted = !__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) && !index_deleting;
+        if (admitted) index_deleting = true;
+        portEXIT_CRITICAL(&status_mux);
+    }
+    ~ArtifactRemoval() {
+        if (!admitted) return;
+        portENTER_CRITICAL(&status_mux);
+        index_deleting = false;
+        portEXIT_CRITICAL(&status_mux);
+    }
+};
+
+bool discard_index(const SdStorage::Session &session, const uint8_t digest[32]) {
+    ArtifactRemoval removal;
+    return removal.admitted && ReportArtifact::index_discard(session, digest);
 }
 
 bool retire_index(const SdStorage::Session &session) {
@@ -1990,7 +2020,13 @@ bool cleanup_indexes(const SdStorage::Session &session) {
         if (!aircannect::hex_decode(name, 64, digest, sizeof(digest), decoded) || digest[0] != index_cleanup.shard) continue;
         aircannect::LargeTextBuffer body(MAX_BODY, 0);
         auto state = ReportArtifact::index_candidate(session, digest, entry.size, body);
-        if (state == ReportArtifact::Lookup::Ready) state = index_shape(body);
+        if (state == ReportArtifact::Lookup::Ready) {
+            // The only four-byte root document in v1 is the rebuild counter.
+            // Both live counter heads remain protected by index_candidate.
+            const uint32_t generation = body.length() == 4 ?
+                SdStorage::get_le32(reinterpret_cast<const uint8_t *>(body.c_str())) : 0;
+            if (!generation || generation >= rebuild_generation) state = index_shape(body);
+        }
         if (state == ReportArtifact::Lookup::Failed) return false;
         if (state != ReportArtifact::Lookup::Ready) continue;
         if (aborted(nullptr, session) || ExportSync::busy() || !discard_index(session, digest)) return false;
@@ -2409,6 +2445,514 @@ void error_body(Job &job, int code, const char *error) {
     job.body.print("{\"source\":\"edf\",\"error\":\"%s\"}", error);
 }
 
+// A collection proof lives for one SD lease. Only small publication documents
+// are traversed; numeric payloads are never rehashed to decide reachability.
+struct DayCleanup {
+    struct File {
+        char name[128] = {};
+        uint32_t bytes = 0;
+        bool keep = false, discard = false, leaf = false, legacy = false;
+        uint16_t period = 0;
+        bool replacement = false;
+    };
+    const SdStorage::Session &session;
+    uint16_t day;
+    uint32_t epoch = __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
+    char directory[96] = {};
+    File *files = nullptr;
+    size_t count = 0, capacity = 0;
+    uint32_t removed = 0;
+    uint64_t removed_bytes = 0;
+    uint8_t empty_shards[32] = {};
+
+    DayCleanup(const SdStorage::Session &session, uint16_t day) : session(session), day(day) {
+        publication_prefix(day, directory);
+        *strrchr(directory, '/') = 0;
+    }
+    ~DayCleanup() { aircannect::Memory::free(files); }
+    File *append() {
+        if (count == capacity) {
+            const size_t next = capacity ? capacity * 2 : 32;
+            if (next > SIZE_MAX / sizeof(File)) return nullptr;
+            auto *grown = static_cast<File *>(aircannect::Memory::realloc_large(files, next * sizeof(File), false));
+            if (!grown) return nullptr;
+            files = grown; capacity = next;
+        }
+        return new (files + count++) File;
+    }
+    bool active() const {
+        return !aborted(nullptr, session) && !ExportSync::busy() &&
+            epoch == __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
+    }
+    bool inventory(const char *relative = "") {
+        char path[192];
+        snprintf(path, sizeof(path), "%s%s%s", directory, *relative ? "/" : "", relative);
+        SdStorage::Reader reader;
+        if (!reader.open(session, path, true)) return false;
+        SdStorage::Reader::Entry entry;
+        bool end = false;
+        bool empty = true;
+        uint8_t shards[32] = {};
+        while (!end) {
+            if (!active() || !reader.next(entry, end)) return false;
+            if (end) break;
+            empty = false;
+            const char *name = strrchr(entry.name, '/');
+            name = name ? name + 1 : entry.name;
+            if (entry.directory) {
+                uint32_t shard;
+                if (!*relative && strlen(name) == 2 && strspn(name, "0123456789abcdef") == 2 &&
+                    aircannect::parse_hex(name, 2, shard)) shards[shard / 8] |= 1u << (shard % 8);
+                continue;
+            }
+            if (entry.size > UINT32_MAX || strlen(name) + strlen(relative) + 2 > sizeof(File::name)) continue;
+            auto *added = append();
+            if (!added) return false;
+            auto &file = *added;
+            snprintf(file.name, sizeof(file.name), "%s%s%s", relative, *relative ? "/" : "", name);
+            file.bytes = entry.size;
+        }
+        reader.close();
+        uint32_t empty_shard;
+        if (empty && *relative && aircannect::parse_hex(relative, 2, empty_shard))
+            empty_shards[empty_shard / 8] |= 1u << (empty_shard % 8);
+        for (unsigned i = 0; i < 256; ++i) if (shards[i / 8] & (1u << (i % 8))) {
+            char shard[3]; snprintf(shard, sizeof(shard), "%02x", i);
+            if (!inventory(shard)) return false;
+        }
+        return true;
+    }
+    File *find(const char *name) {
+        size_t lo = 0, hi = count;
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+            if (strcmp(files[mid].name, name) < 0) lo = mid + 1; else hi = mid;
+        }
+        return lo < count && !strcmp(files[lo].name, name) ? files + lo : nullptr;
+    }
+    bool content(const uint8_t digest[32], uint32_t bytes, bool document, bool keep) {
+        char text[65], name[80];
+        aircannect::hex_encode(digest, 32, text, sizeof(text), aircannect::HexCase::Lower);
+        snprintf(name, sizeof(name), "%.*s%s%s.%s", document ? 2 : 0, text,
+            document ? "/" : "", text, document ? "abp" : "abt");
+        auto *file = find(name);
+        if (!file || file->bytes != bytes) return !keep;
+        file->keep |= keep;
+        file->discard |= !keep;
+        return true;
+    }
+    bool reference(JsonObjectConst value, bool document, bool keep) {
+        const char *date = value["day"], *text = value["digest"];
+        uint16_t parsed;
+        uint8_t digest[32]; size_t decoded;
+        return date && catalog_day(date, parsed) && parsed == day &&
+            aircannect::sha256_text_valid(text) && value["bytes"].is<uint32_t>() &&
+            aircannect::hex_decode(text, 64, digest, sizeof(digest), decoded) &&
+            content(digest, value["bytes"], document, keep);
+    }
+    bool read(const File &file, uint8_t *out, size_t length) {
+        char path[224]; snprintf(path, sizeof(path), "%s/%s", file.legacy ? CACHE_DIR : directory, file.name);
+        SdStorage::Reader reader;
+        return active() && length <= file.bytes && reader.open(session, path) &&
+            reader.size() == file.bytes && reader.read(out, length) == length;
+    }
+    const IndexedSession *source(const char *name, uint16_t source_day = 0) const {
+        if (strlen(name) < 15 || (name[15] && name[15] != '.' && name[15] != '_')) return nullptr;
+        if (!source_day) source_day = day;
+        for (size_t i = 0; i < index_count; ++i)
+            if (selected(index[i], source_day, source_day) && !strncmp(index[i].entry.file_prefix, name, 15)) return index + i;
+        return nullptr;
+    }
+    // Recognize only filenames produced by the known cache/producer versions.
+    // An unknown session or future suffix is preserved, not guessed away.
+    bool obsolete(const File &file) const {
+        const auto *entry = source(file.name);
+        if (!entry) return false;
+        const char *tail = file.name + 15;
+        int kind = -1;
+        if (*tail == '_') {
+            for (int k = 0; k < 3; ++k) if (!strncmp(tail + 1, SUFFIXES[k], 3) && tail[4] == '.') kind = k;
+            if (kind < 0 || !(entry->key.present & (1u << kind))) return false;
+            tail += 4;
+        }
+        uint32_t generation = 0;
+        if (!strncmp(tail, ".g", 2)) {
+            const char *digits = tail + 2, *end = digits;
+            while (*end >= '0' && *end <= '9') ++end;
+            if (end == digits || *end != '.' || end - digits > 10) return false;
+            uint64_t value = 0;
+            for (const char *p = digits; p != end; ++p) value = value * 10 + unsigned(*p - '0');
+            if (value > UINT32_MAX) return false;
+            generation = value; tail = end;
+        }
+        if (kind < 0) {
+            if (!strcmp(tail, ".series") || !strcmp(tail, ".series.part") || !strcmp(tail, ".stats.part")) return true;
+            if (!strcmp(tail, ".stats") || !strcmp(tail, ".events.head0") || !strcmp(tail, ".events.head1") ||
+                !strcmp(tail, ".histograms.head0") || !strcmp(tail, ".histograms.head1")) return file.legacy || generation != rebuild_generation;
+            return !strcmp(tail, ".events.document.part") || !strcmp(tail, ".histograms.document.part");
+        }
+        if (!strcmp(tail, ".checkpoint.head0") || !strcmp(tail, ".checkpoint.head1") ||
+            !strcmp(tail, ".checkpoint.document.part") || !strcmp(tail, ".samples.part") ||
+            !strcmp(tail, ".tiles.part") || !strcmp(tail, ".resume.part")) return true;
+        if (strlen(tail) != 69 || tail[0] != '.' || strcmp(tail + 65, ".ref") ||
+            strspn(tail + 1, "0123456789abcdef") != 64) return false;
+        char prefix[96], text[65]; uint8_t key[32];
+        if (!artifact_identity(*entry, kind, prefix, key)) return false;
+        aircannect::hex_encode(key, 32, text, sizeof(text), aircannect::HexCase::Lower);
+        return generation != rebuild_generation || strncmp(text, tail + 1, 64);
+    }
+    bool covered(JsonObjectConst summary, bool period = false) const {
+        if (!summary["sessions"].is<JsonArrayConst>() || !summary["partial"].is<bool>() || summary["partial"].as<bool>()) return false;
+        for (JsonObjectConst item : summary["sessions"].as<JsonArrayConst>()) {
+            const char *prefix = item["prefix"];
+            const uint16_t source_day = period ? item["day"].as<uint16_t>() : day;
+            if (!prefix || strlen(prefix) != 15 || !source_day) return false;
+            const auto *entry = source(prefix, source_day);
+            if (!entry || !(entry->key.present & 7)) return false;
+        }
+        return true;
+    }
+    bool covered_manifest(JsonObjectConst manifest) const {
+        const auto summary = manifest["summary"].as<JsonObjectConst>();
+        if (!covered(summary)) return false;
+        for (JsonObjectConst artifact : manifest["artifacts"].as<JsonArrayConst>()) {
+            const IndexedSession *entry = nullptr;
+            for (JsonObjectConst item : summary["sessions"].as<JsonArrayConst>())
+                if (item["id"] == artifact["session"]) entry = source(item["prefix"]);
+            int kind = -1;
+            for (int k = 0; k < 3; ++k) if (artifact["kind"] == SUFFIXES[k]) kind = k;
+            if (!entry || kind < 0 || !(entry->key.present & (1u << kind))) return false;
+        }
+        return true;
+    }
+    ReportArtifact::Lookup collect() {
+        using ReportArtifact::Lookup;
+        char prefix[96]; uint8_t key[32];
+        publication_prefix(day, prefix);
+        Request request; request.day = day;
+        ReportArtifact::Document current;
+        if (!publication_key(request, key) ||
+            ReportArtifact::document_lookup(session, prefix, key, current) != Lookup::Ready) return Lookup::Invalid;
+        // A complete replacement must already exist. Cleanup never builds one,
+        // scans EDF, or removes the only surviving legacy cache on speculation.
+        std::unique_ptr<CacheHeader> header(new (std::nothrow) CacheHeader);
+        if (!header) return Lookup::Failed;
+        size_t sources = 0;
+        for (size_t i = 0; i < index_count; ++i) if (selected(index[i], day, day)) {
+            ++sources;
+            if (!(index[i].key.present & 7) || !cached_summary_header(session, index[i], *header) || header->partial)
+                return active() ? Lookup::Invalid : Lookup::Failed;
+            for (uint8_t kind = 0; kind < 3; ++kind) if (index[i].key.present & (1u << kind)) {
+                char name[96]; uint8_t identity[32]; ReportArtifact::Publication publication;
+                if (!artifact_identity(index[i], kind, name, identity) ||
+                    ReportArtifact::lookup(session, name, identity, publication) != Lookup::Ready)
+                    return active() ? Lookup::Invalid : Lookup::Failed;
+            }
+        }
+        if (!sources) return Lookup::Invalid;
+        header.reset();
+        if (!inventory()) return Lookup::Failed;
+        for (size_t at = 0; at < artifact_cleanup.legacy.length(); at += sizeof(CleanupLegacy)) {
+            CleanupLegacy legacy; memcpy(&legacy, artifact_cleanup.legacy.c_str() + at, sizeof(legacy));
+            if (legacy.day != day) continue;
+            auto *file = append();
+            if (!file) return Lookup::Failed;
+            strcpy(file->name, legacy.name); file->bytes = legacy.bytes; file->legacy = true;
+        }
+        std::sort(files, files + count, [](const File &a, const File &b) { return strcmp(a.name, b.name) < 0; });
+        // Heads and references are parsed once before any deletion. Retained
+        // manifests may still reference bodies whose named heads are obsolete.
+        for (size_t i = 0; i < count; ++i) {
+            auto &file = files[i];
+            file.discard = obsolete(file);
+            file.discard |= !strcmp(file.name, "day.document.part") ||
+                !strcmp(file.name, "day.refused.head0") || !strcmp(file.name, "day.refused.head1") ||
+                !strcmp(file.name, "day.refused.document.part");
+            const size_t n = strlen(file.name);
+            if (file.discard && n > 6 && (!strcmp(file.name + n - 6, ".stats") || !strcmp(file.name + n - 7, ".series"))) {
+                uint8_t header[20];
+                if (file.bytes < sizeof(header) || !read(file, header, sizeof(header))) return Lookup::Invalid;
+                // Native v7 cache layouts are the only legacy formats this
+                // owner understands. Future/foreign cache files are untouched.
+                const bool stats = !strcmp(file.name + n - 6, ".stats");
+                file.discard = stats ? SdStorage::get_le32(header) == STATS_CACHE_VERSION && !memcmp(header + 12, "ABRPT01", 8) :
+                    SdStorage::get_le32(header + 8) == 7 && !memcmp(header, "ABSER01", 8);
+            }
+            if (n > 6 && (!strcmp(file.name + n - 6, ".head0") || !strcmp(file.name + n - 6, ".head1"))) {
+                char name[224]; snprintf(name, sizeof(name), "%s/%.*s", directory, int(n - 6), file.name);
+                ReportArtifact::Document document;
+                const auto state = ReportArtifact::document_slot(session, name, file.name[n - 1] - '0', document);
+                if (state != Lookup::Ready) return state == Lookup::Failed ? state : Lookup::Invalid;
+                if (!content(document.digest, document.bytes, true, !file.discard)) return Lookup::Invalid;
+                if (!strncmp(file.name, "period-", 7)) {
+                    unsigned period = 0; int end = 0;
+                    if (sscanf(file.name, "period-%u%n", &period, &end) == 1 && size_t(end) == n - 6) {
+                        Request request; request.view = View::Period; request.day = day; request.period = period;
+                        uint8_t current_key[32];
+                        if (period <= UINT16_MAX && valid(request) && publication_key(request, current_key) &&
+                            !memcmp(document.key, current_key, 32)) {
+                            char digest[65], body[80];
+                            aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+                            snprintf(body, sizeof(body), "%.2s/%s.abp", digest, digest);
+                            if (auto *replacement = find(body)) { replacement->period = period; replacement->replacement = true; }
+                        }
+                    }
+                }
+                if (strstr(file.name, ".refused.head")) {
+                    char digest[65], body[80];
+                    aircannect::hex_encode(document.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+                    snprintf(body, sizeof(body), "%.2s/%s.abp", digest, digest);
+                    if (auto *leaf = find(body)) leaf->leaf = true;
+                }
+            } else if (n > 69 && !strcmp(file.name + n - 4, ".ref") && file.name[n - 69] == '.') {
+                uint8_t identity[32]; size_t decoded;
+                if (!aircannect::hex_decode(file.name + n - 68, 64, identity, sizeof(identity), decoded)) return Lookup::Invalid;
+                char name[224]; snprintf(name, sizeof(name), "%s/%.*s", directory, int(n - 69), file.name);
+                ReportArtifact::Publication publication;
+                const auto state = ReportArtifact::lookup(session, name, identity, publication);
+                if (state != Lookup::Ready) return state == Lookup::Failed ? state : Lookup::Invalid;
+                if (!content(publication.digest, publication.bytes, false, !file.discard)) return Lookup::Invalid;
+            }
+        }
+        for (size_t at = 0; at < artifact_cleanup.anchors.length(); at += sizeof(CleanupAnchor)) {
+            CleanupAnchor anchor; memcpy(&anchor, artifact_cleanup.anchors.c_str() + at, sizeof(anchor));
+            if (anchor.day == day && !content(anchor.digest, anchor.bytes, true, true)) return Lookup::Invalid;
+        }
+        bool current_checked = false;
+        for (size_t i = 0; i < count; ++i) {
+            auto &file = files[i];
+            if (file.leaf) { file.discard = true; continue; }
+            if (strlen(file.name) == 68 && !strcmp(file.name + 64, ".abt") &&
+                strspn(file.name, "0123456789abcdef") == 64 && file.bytes >= ReportArtifact::HEADER_BYTES) {
+                uint8_t header[ReportArtifact::HEADER_BYTES];
+                if (!read(file, header, sizeof(header))) return Lookup::Failed;
+                if (!memcmp(header, "ABTILE01", 8) && SdStorage::get_le16(header + 8) == ReportArtifact::VERSION &&
+                    SdStorage::get_le32(header + 12) == file.bytes) file.discard = true;
+                continue;
+            }
+            if (strlen(file.name) != 71 || file.name[2] != '/' || strcmp(file.name + 67, ".abp") ||
+                strspn(file.name + 3, "0123456789abcdef") != 64 || strncmp(file.name, file.name + 3, 2)) continue;
+            uint8_t first[16];
+            memset(first, 0, sizeof(first));
+            if (file.bytes < 11) return Lookup::Invalid;
+            if (!read(file, first, std::min<size_t>(file.bytes, sizeof(first)))) return Lookup::Failed;
+            if (!memcmp(first, "ABHIST01", 8) && SdStorage::get_le16(first + 8) == 1 &&
+                SdStorage::get_le32(first + 12) == file.bytes) { file.discard = true; continue; }
+            if (!memcmp(first, "ABCHK001", 8) && file.bytes == 48) {
+                // Unheaded checkpoint bodies have no live resume point.
+                file.discard = true; continue;
+            }
+            if (memcmp(first, "{\"source\":\"edf\",", 16) && memcmp(first, "{\"events\":[", 11)) {
+                uint8_t reason[32] = {};
+                if (file.bytes >= sizeof(reason) || !read(file, reason, file.bytes)) return Lookup::Invalid;
+                bool refused = false;
+                for (const char *known : {"partial_source", "source_header", "artifact_lookup", "numeric_files_missing"})
+                    refused |= file.bytes == strlen(known) && !memcmp(reason, known, file.bytes);
+                if (!refused) return Lookup::Invalid;
+                file.discard = true; continue;
+            }
+            if (file.bytes > MAX_BODY) return Lookup::Invalid;
+            ReportArtifact::Document document;
+            size_t decoded;
+            if (!aircannect::hex_decode(file.name + 3, 64, document.digest, 32, decoded)) return Lookup::Invalid;
+            document.bytes = file.bytes;
+            aircannect::LargeTextBuffer body(MAX_BODY, 0);
+            if (!ReportArtifact::document_read(session, prefix, document, body, nullptr, false)) return Lookup::Failed;
+            aircannect::JsonAllocator allocator(false);
+            JsonDocument json(&allocator);
+            const auto error = deserializeJson(json, body.c_str(), body.length());
+            if (error) return error == DeserializationError::NoMemory ? Lookup::Failed : Lookup::Invalid;
+            const auto root = json.as<JsonObjectConst>();
+            if (root.size() == 1 && root["events"].is<JsonArrayConst>()) { file.discard = true; continue; }
+            if (root["source"] != "edf" || !root["day"].is<uint16_t>() || root["day"].as<uint16_t>() != day) return Lookup::Invalid;
+            if (!root["artifacts"].is<JsonArrayConst>()) {
+                if (root.size() == 20 && root["view"] == "period" && root["first_day"].is<uint16_t>() &&
+                    root["last_day"].as<uint16_t>() == day && root["first_day"].as<uint16_t>() <= day) {
+                    const unsigned period = day - root["first_day"].as<uint16_t>() + 1;
+                    const bool complete = covered(root, true);
+                    file.replacement &= complete && file.period == period;
+                    file.period = period;
+                    file.discard = complete;
+                } else return Lookup::Invalid;
+                continue;
+            }
+            if (root.size() != 9 || !root["event_groups"].is<JsonArrayConst>() ||
+                !root["summary"].is<JsonObjectConst>() || root["dataset"] != dataset_id) return Lookup::Invalid;
+            const bool replacement = !memcmp(document.digest, current.digest, 32);
+            if (replacement && (!covered_manifest(root) || root["summary"]["sessions"].size() != sources)) return Lookup::Invalid;
+            current_checked |= replacement;
+            file.keep |= replacement || !covered_manifest(root);
+            file.discard = true;
+            for (JsonObjectConst item : root["artifacts"].as<JsonArrayConst>())
+                if (!reference(item, false, file.keep)) return Lookup::Invalid;
+            for (JsonObjectConst item : root["event_groups"].as<JsonArrayConst>())
+                if (!reference(item, true, file.keep) || !reference(item["histogram"], true, file.keep)) return Lookup::Invalid;
+        }
+        if (!current_checked) return Lookup::Invalid;
+        for (size_t i = 0; i < count; ++i) if (files[i].period && files[i].discard) {
+            bool replacement = false;
+            for (size_t n = 0; n < count; ++n)
+                replacement |= files[n].period == files[i].period && files[n].replacement;
+            files[i].discard = replacement;
+        }
+        // Remove obsolete roots first. A reset at any following unlink leaves
+        // both retained publication graphs intact; the next pass rediscovers.
+        for (bool bodies : {false, true}) for (size_t i = 0; i < count; ++i) {
+            const auto &file = files[i];
+            const char *ext = strrchr(file.name, '.');
+            const bool body = ext && (!strcmp(ext, ".abp") || !strcmp(ext, ".abt"));
+            if (!file.discard || file.keep || body != bodies) continue;
+            if (!active()) return Lookup::Failed;
+            char path[224]; snprintf(path, sizeof(path), "%s/%s", file.legacy ? CACHE_DIR : directory, file.name);
+            ArtifactRemoval removal;
+            if (!removal.admitted) return Lookup::Failed;
+            const bool ok = session.run([&](fs::FS &fs) { return !fs.exists(path) || fs.remove(path); });
+            if (!ok) return Lookup::Failed;
+            ++removed; removed_bytes += file.bytes;
+            uint32_t shard;
+            if (file.name[2] == '/' && aircannect::parse_hex(file.name, 2, shard)) empty_shards[shard / 8] |= 1u << (shard % 8);
+        }
+        for (unsigned shard = 0; shard < 256; ++shard) if (empty_shards[shard / 8] & (1u << (shard % 8))) {
+            if (!active()) return Lookup::Failed;
+            bool retained = false;
+            for (size_t i = 0; i < count; ++i) {
+                uint32_t prefix;
+                if (files[i].name[2] == '/' && aircannect::parse_hex(files[i].name, 2, prefix) && prefix == shard)
+                    retained |= files[i].keep || !files[i].discard;
+            }
+            if (retained) continue;
+            char path[100]; snprintf(path, sizeof(path), "%s/%02x", directory, shard);
+            // rmdir succeeds only if empty; unknown files/subdirectories survive.
+            if (!session.run([&](fs::FS &fs) { fs.rmdir(path); return true; })) return Lookup::Failed;
+        }
+        return Lookup::Ready;
+    }
+};
+
+bool artifact_cleanup_pending() {
+    return !artifact_cleanup.complete || artifact_cleanup.files != SdStorage::files_revision() ||
+        artifact_cleanup.data != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE) ||
+        artifact_cleanup.artifacts != status.artifact_revision;
+}
+
+bool cleanup_artifacts(const SdStorage::Session &session) {
+    if (aborted(nullptr, session) || ExportSync::busy()) return false;
+    // Result bodies can contain selectors into older graphs. Never invalidate
+    // a pinned or not-yet-delivered response while collecting its dependencies.
+    bool busy = false;
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    for (auto &job : jobs) {
+        if (job.state == JobState::Free) continue;
+        if (!evictable(job)) busy = true;
+    }
+    if (!busy) for (auto &job : jobs) if (job.state != JobState::Free) reset_job(job);
+    xSemaphoreGive(mutex);
+    if (busy) return false;
+    const uint32_t data = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
+    if (artifact_cleanup.files != SdStorage::files_revision() || artifact_cleanup.data != data ||
+        artifact_cleanup.artifacts != status.artifact_revision) {
+        if (artifact_cleanup.files != SdStorage::files_revision())
+            for (size_t i = 0; i < daily_capacity; ++i) daily_cache[i].cleanup_checked = false;
+        artifact_cleanup.~ArtifactCleanup();
+        new (&artifact_cleanup) ArtifactCleanup;
+        artifact_cleanup.files = SdStorage::files_revision();
+        artifact_cleanup.data = data;
+        artifact_cleanup.artifacts = status.artifact_revision;
+    }
+    if (!artifact_cleanup.discovered) {
+        artifact_cleanup.days.clear(); artifact_cleanup.anchors.clear(); artifact_cleanup.legacy.clear();
+        // Read the two small root documents once per sweep, not once per day.
+        for (unsigned slot = 0; slot < 2; ++slot) {
+            ReportArtifact::Document document;
+            const auto found = ReportArtifact::document_slot(session, "/airbridge/report/index", slot, document);
+            if (found == ReportArtifact::Lookup::Missing) continue;
+            aircannect::LargeTextBuffer body(MAX_BODY, 0);
+            if (found != ReportArtifact::Lookup::Ready ||
+                !ReportArtifact::document_read(session, "/airbridge/report/index", document, body, nullptr, false) ||
+                index_shape(body) != ReportArtifact::Lookup::Ready) return false;
+            aircannect::JsonAllocator allocator(false); JsonDocument json(&allocator);
+            if (deserializeJson(json, body.c_str(), body.length())) return false;
+            for (const char *name : {"days", "periods"}) for (JsonObjectConst item : json[name].as<JsonArrayConst>()) {
+                const auto ref = !strcmp(name, "days") ? item["publication"].as<JsonObjectConst>() : item;
+                if (ref.isNull()) continue;
+                CleanupAnchor anchor; size_t decoded;
+                if (!catalog_day(ref["day"], anchor.day) ||
+                    !aircannect::hex_decode(ref["digest"], 64, anchor.digest, 32, decoded)) return false;
+                anchor.bytes = ref["bytes"];
+                if (!artifact_cleanup.anchors.append(reinterpret_cast<const char *>(&anchor), sizeof(anchor))) return false;
+            }
+        }
+        SdStorage::Reader directory;
+        if (!directory.open(session, CACHE_DIR, true)) return false;
+        SdStorage::Reader::Entry entry; bool end = false;
+        while (!end) {
+            if (aborted(nullptr, session) || !directory.next(entry, end)) return false;
+            if (end) break;
+            const char *name = strrchr(entry.name, '/'); name = name ? name + 1 : entry.name;
+            uint16_t day;
+            if (entry.directory && catalog_day(name, day) &&
+                !artifact_cleanup.days.append(reinterpret_cast<const char *>(&day), sizeof(day))) return false;
+            const char *base;
+            if (!entry.directory && entry.size <= UINT32_MAX && cache_name(name, base)) {
+                for (size_t i = 0; i < index_count; ++i) if (!strncmp(base, index[i].entry.file_prefix, 15)) {
+                    CleanupLegacy legacy;
+                    legacy.day = index[i].day; legacy.bytes = entry.size;
+                    strcpy(legacy.name, base);
+                    if (!artifact_cleanup.legacy.append(reinterpret_cast<const char *>(&legacy), sizeof(legacy))) return false;
+                    break;
+                }
+            }
+        }
+        artifact_cleanup.discovered = true;
+    }
+    if (artifact_cleanup.next < artifact_cleanup.days.length()) {
+        uint16_t day; memcpy(&day, artifact_cleanup.days.c_str() + artifact_cleanup.next, sizeof(day));
+        // A new night's publication must not rescan every old day. Source
+        // identity, root dependencies and owner publication invalidate this
+        // proof; external edits/remount clear it for every cached day above.
+        Request request; request.day = day;
+        uint8_t key[32];
+        aircannect::LargeTextBuffer identity(MAX_BODY, INTERNAL_WORK);
+        if (!publication_key(request, key) || !identity.append(reinterpret_cast<const char *>(key), sizeof(key))) return false;
+        for (size_t at = 0; at < artifact_cleanup.anchors.length(); at += sizeof(CleanupAnchor)) {
+            CleanupAnchor anchor; memcpy(&anchor, artifact_cleanup.anchors.c_str() + at, sizeof(anchor));
+            if (anchor.day != day) continue;
+            bool duplicate = false;
+            for (size_t n = sizeof(key); n < identity.length(); n += sizeof(anchor.digest))
+                duplicate |= !memcmp(identity.c_str() + n, anchor.digest, sizeof(anchor.digest));
+            if (!duplicate && !identity.append(reinterpret_cast<const char *>(anchor.digest), sizeof(anchor.digest))) return false;
+        }
+        if (!ReportArtifact::fingerprint(reinterpret_cast<const uint8_t *>(identity.c_str()), identity.length(), key)) return false;
+        const auto *cached = cached_day_entry(day, false);
+        const bool checked = cached && cached->cleanup_checked && !memcmp(cached->cleanup_key, key, sizeof(key));
+        DayCleanup cleanup(session, day);
+        const auto result = checked ? ReportArtifact::Lookup::Ready : cleanup.collect();
+        if (cleanup.removed) {
+            cache_usage_known = false;
+            Log::logf(CAT_REPORT, LOG_INFO, "Report cleanup day=%.8s removed=%lu bytes=%llu\n",
+                cleanup.directory + strlen(CACHE_DIR) + 1, static_cast<unsigned long>(cleanup.removed),
+                static_cast<unsigned long long>(cleanup.removed_bytes));
+        }
+        if (result == ReportArtifact::Lookup::Failed) return false;
+        if (auto *entry = cached_day_entry(day, true)) {
+            memcpy(entry->cleanup_key, key, sizeof(key));
+            entry->cleanup_checked = true;
+        }
+        if (result == ReportArtifact::Lookup::Invalid)
+            Log::logf(CAT_REPORT, LOG_DEBUG, "Report cleanup preserved day=%.8s; replacement or references not verified\n",
+                cleanup.directory + strlen(CACHE_DIR) + 1);
+        artifact_cleanup.next += sizeof(day);
+    }
+    if (artifact_cleanup.next == artifact_cleanup.days.length()) {
+        aircannect::LargeTextBuffer days(MAX_SESSION_COUNT * sizeof(uint16_t), 0), anchors(2 * MAX_BODY, 0);
+        aircannect::LargeTextBuffer legacy(MAX_SESSION_COUNT * sizeof(CleanupLegacy), 0);
+        days.swap(artifact_cleanup.days); anchors.swap(artifact_cleanup.anchors); legacy.swap(artifact_cleanup.legacy);
+        artifact_cleanup.complete = true;
+        if (session.valid()) session.run([](fs::FS &) { SdStorage::refresh_usage(); return true; });
+    }
+    return true;
+}
+
 bool dirty() {
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
@@ -2425,6 +2969,7 @@ bool reindex(const SdStorage::Session &session, Job &job) {
     if (!ReportArtifact::document_publish(session, "/airbridge/report/rebuild", key, value, sizeof(value), document))
         return note_issue(job, "rebuild_publish");
     ++rebuild_generation;
+    index_cleanup.files = UINT32_MAX;
     invalidate_day(); invalidate_str();
     backfill_revision = 0; backfill_before = UINT16_MAX; backfill_period = 0;
     indexed_invalidation = __atomic_add_fetch(&invalidation_generation, 1, __ATOMIC_RELEASE);
@@ -2522,7 +3067,7 @@ bool work_once() {
     if (job && job->background && ExportSync::busy()) {
         defer_job(job); publish(State::WaitingStorage, "export_pending"); return false;
     }
-    if (!job && !dirty() && !index_commit_pending && !retired_index.bytes && !index_cleanup_pending() && published_index_artifacts == status.artifact_revision &&
+    if (!job && !dirty() && !index_commit_pending && !retired_index.bytes && !index_cleanup_pending() && !artifact_cleanup_pending() && published_index_artifacts == status.artifact_revision &&
         (!backfill_enabled || (!backfill_before && backfill_period >= sizeof(PERIODS) / sizeof(PERIODS[0])) || ExportSync::busy() ||
         (background_retry && int32_t(millis() - background_retry) < 0))) { publish(State::Ready); return false; }
     SdStorage::Session session;
@@ -2591,9 +3136,11 @@ bool work_once() {
             Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
         const bool cleaning = !more && !ExportSync::busy() && !retired_index.bytes &&
             published_index_artifacts == status.artifact_revision && index_cleanup_pending() && cleanup_indexes(session);
+        const bool collecting = !more && !ExportSync::busy() && !retired_index.bytes && !index_cleanup_pending() &&
+            published_index_artifacts == status.artifact_revision && artifact_cleanup_pending() && cleanup_artifacts(session);
         session.end();
         publish(State::Ready);
-        return more || (cleaning && index_cleanup_pending());
+        return more || (cleaning && index_cleanup_pending()) || (collecting && artifact_cleanup_pending());
     }
     xSemaphoreTake(mutex, portMAX_DELAY);
     job->state = JobState::Running;

@@ -188,9 +188,16 @@ Lookup document_lookup(const SdStorage::Session &session, const char *prefix,
     return lookup_document(session, prefix, key, out, path);
 }
 
+Lookup document_slot(const SdStorage::Session &session, const char *prefix,
+                     unsigned slot, Document &out) {
+    if (slot > 1) return Lookup::Invalid;
+    char path[PATH_BYTES];
+    return document_head(session, prefix, slot, out, path);
+}
+
 bool document_read(const SdStorage::Session &session, const char *prefix,
                    Document &document, aircannect::LargeTextBuffer &out,
-                   const uint8_t *key) {
+                   const uint8_t *key, bool fallback) {
     out.clear();
     if (key && memcmp(key, document.key, 32)) return false;
     void *memory = aircannect::Memory::alloc_large(sizeof(DocumentScratch));
@@ -198,7 +205,7 @@ bool document_read(const SdStorage::Session &session, const char *prefix,
     std::unique_ptr<DocumentScratch, decltype(&aircannect::Memory::free)> scratch(
         new (memory) DocumentScratch, aircannect::Memory::free);
     if (document_content(session, prefix, document, out, *scratch)) return true;
-    if (!session.valid() || out.overflowed()) return false;
+    if (!fallback || !session.valid() || out.overflowed()) return false;
     Document previous;
     if (document_head(session, prefix, unsigned((document.generation & 1) ^ 1), previous, scratch->path) != Lookup::Ready ||
         int32_t(previous.generation - document.generation) >= 0 ||
