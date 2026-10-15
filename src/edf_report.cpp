@@ -3540,6 +3540,9 @@ void Result::reset() {
     id_ = 0;
     data_ = nullptr;
     length_ = 0;
+    // Collection may be asleep solely because this response pinned selectors.
+    foreground_activity();
+    if (wake) xSemaphoreGive(wake);
 }
 
 }  // namespace EdfReport
