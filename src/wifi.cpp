@@ -93,14 +93,16 @@ static void stop_mdns() {
 
 static void check_mdns() {
     const wifi_mode_t mode = WiFi.getMode();
-    const bool available = mode != WIFI_OFF &&
-        (WiFi.status() == WL_CONNECTED ||
-         ((mode & WIFI_AP) && WiFi.softAPIP() != IPAddress()));
-    if (!available) {
+    if (mode == WIFI_OFF) {
         stop_mdns();
         return;
     }
+    // The responder follows STA and AP events without being recreated.
     if (mdns_started) return;
+    const bool available = WiFi.status() == WL_CONNECTED ||
+        ((mode & WIFI_AP) && WiFi.softAPIP() != IPAddress());
+    if (!available) return;
+
     const uint32_t now = millis();
     if (mdns_attempted && now - mdns_last_attempt_ms < MDNS_RETRY_INTERVAL_MS) return;
     mdns_attempted = true;
@@ -583,8 +585,10 @@ static void apply_network_config() {
     status_revision.fetch_add(1);
     roam_connecting = false;
     const auto &cfg = Config::get();
-    stop_mdns();
-    mdns_hostname = cfg.hostname;
+    if (cfg.wifi_mode == WIFI_MODE_OFF || mdns_hostname != cfg.hostname) {
+        stop_mdns();
+        mdns_hostname = cfg.hostname;
+    }
     if (scan_pending.load(std::memory_order_acquire)) esp_wifi_scan_stop();
     clear_scan();
     got_ip = false;
