@@ -4090,10 +4090,8 @@ function renderBleDevices(id, devices, known) {
 }
 
 function toggleOxi() {
-  var st = document.getElementById('bleStatusGrid');
-  var isDisabled = st && st.querySelector('[data-field="state"]') &&
-                   st.querySelector('[data-field="state"]').textContent === 'DISABLED';
-  bleAction(isDisabled ? 'enable' : 'disable');
+  if (!lastStatus.oxi) return;
+  bleAction(lastStatus.oxi === 'DISABLED' ? 'enable' : 'disable');
 }
 
 function loadBle() {
