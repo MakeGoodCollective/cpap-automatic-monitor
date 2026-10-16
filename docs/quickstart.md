@@ -63,8 +63,10 @@ settings are applied automatically after the USB upload.
 
 ## Verify it works
 
-Once connected to your WiFi, open `http://airbridge/`. If the hostname does
-not resolve, use the device IP from your router's DHCP leases.
+Once connected to your WiFi, open `http://airbridge.local/` (mDNS). If you
+changed `hostname`, use `http://<hostname>.local/` instead. `http://airbridge/`
+also works if your router resolves DHCP hostnames. If the name does not
+resolve, use the device IP from your router's DHCP leases.
 
 The **Dashboard** should show the AirSense name and serial number. With the
 AirSense powered on, connected, and not running therapy, its state is
