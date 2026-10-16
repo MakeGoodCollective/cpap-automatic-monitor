@@ -29,7 +29,7 @@ top-level WiFi-related config keys are:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `hostname` | airbridge | DHCP hostname and AP SSID prefix |
+| `hostname` | airbridge | DHCP and mDNS hostname, and AP SSID prefix |
 | `wifi_mode` | 1 | Operating mode, see table below |
 | `wifi_roam` | true | Roam automatically between saved networks |
 | `wifi_country` | 01 | ISO 3166 country code; "01" = worldwide |
@@ -46,6 +46,19 @@ top-level WiFi-related config keys are:
 
 The softAP (when used) is named `<hostname>_<MAC>` with password `airbridge`,
 and serves the web UI at `192.168.4.1`.
+
+mDNS makes the device reachable at `<hostname>.local` on the local network,
+including in AP mode. For the default hostname, open `http://airbridge.local/`.
+Set `hostname` to a DNS host label (letters, digits and hyphens, without a
+`.local` suffix); use a different name for each device. Web UI changes take
+effect when the WiFi configuration is applied, without a reboot (application
+is deferred while roaming is suspended, e.g. during therapy). For CLI changes,
+run `$CONFIG SAVE` and `$REBOOT`. mDNS resumes after reconnection and stops
+when WiFi is disabled. Startup failures are logged and retried every 30 seconds.
+
+The client must support mDNS and the network must allow multicast traffic.
+If name resolution is unavailable, use the device IP address instead.
+For a non-default `http_port`, append `:<port>` to the URL.
 
 With no saved networks, Auto and STA+AP modes provide an access point for
 setup. STA-only does not start an access point.

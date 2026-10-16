@@ -3,6 +3,7 @@
 #include "debug_log.h"
 #include "network_hints.h"
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <esp_wifi.h>
 #include <esp_sntp.h>
 #include <esp_netif.h>
@@ -77,6 +78,43 @@ static volatile uint8_t ap_client_count = 0;
 static uint32_t ap_quiet_since_ms = 0;
 static bool pending_ap_teardown = false;
 #define AP_TEARDOWN_QUIET_MS    120000
+
+static String mdns_hostname;
+static bool mdns_started = false;
+static bool mdns_attempted = false;
+static uint32_t mdns_last_attempt_ms = 0;
+#define MDNS_RETRY_INTERVAL_MS 30000
+
+static void stop_mdns() {
+    if (mdns_started) MDNS.end();
+    mdns_started = false;
+    mdns_attempted = false;
+}
+
+static void check_mdns() {
+    const wifi_mode_t mode = WiFi.getMode();
+    const bool available = mode != WIFI_OFF &&
+        (WiFi.status() == WL_CONNECTED ||
+         ((mode & WIFI_AP) && WiFi.softAPIP() != IPAddress()));
+    if (!available) {
+        stop_mdns();
+        return;
+    }
+    if (mdns_started) return;
+    const uint32_t now = millis();
+    if (mdns_attempted && now - mdns_last_attempt_ms < MDNS_RETRY_INTERVAL_MS) return;
+    mdns_attempted = true;
+    mdns_last_attempt_ms = now;
+    if (mdns_hostname.isEmpty() || !MDNS.begin(mdns_hostname)) {
+        // begin() can allocate the responder before failing to set its name.
+        MDNS.end();
+        Log::logf(CAT_WIFI, LOG_WARN, "mDNS start failed for '%s'; retry in %d s\n",
+                  mdns_hostname.c_str(), MDNS_RETRY_INTERVAL_MS / 1000);
+        return;
+    }
+    mdns_started = true;
+    Log::logf(CAT_WIFI, LOG_INFO, "mDNS: %s.local\n", mdns_hostname.c_str());
+}
 
 
 static void ntp_sync_cb(struct timeval *tv) {
@@ -480,6 +518,7 @@ static void apply_country_code() {
 
 bool WiFiSetup::init() {
     auto &cfg = Config::get();
+    mdns_hostname = cfg.hostname;
 
     // STA_START reapplies Arduino's saved policy after every radio restart.
     if (!WiFi.setSleep(false)) {
@@ -544,6 +583,8 @@ static void apply_network_config() {
     status_revision.fetch_add(1);
     roam_connecting = false;
     const auto &cfg = Config::get();
+    stop_mdns();
+    mdns_hostname = cfg.hostname;
     if (scan_pending.load(std::memory_order_acquire)) esp_wifi_scan_stop();
     clear_scan();
     got_ip = false;
@@ -643,6 +684,8 @@ void WiFiSetup::check() {
         if (pending & 1) apply_network_config();
         else if (pending & 4) apply_profile_changes();
     }
+
+    check_mdns();
 
     auto &cfg = Config::get();
     uint32_t elapsed = millis() - state_entered_ms;
