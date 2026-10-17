@@ -1,0 +1,14 @@
+:root {
+  color-scheme: light;
+  --bg:#f1f4f5;--surface:#f9fafb;--card:#fff;--border:#d6dfe3;--border-light:#c4cfd5;
+  --text:#203039;--text-dim:#586974;--accent:#007f6d;--accent-dim:#007f6d14;
+  --red:#c52d46;--green:#14753e;--blue:#4f52b7;--cyan:#00718a;--orange:#9d4e08;
+  --violet:#6c4daf;--magenta:#a329aa;--slate:#4a5868;--yellow:#806200;--pink:#ac376f;
+  --sky:#176888;--orchid:#7e40a7;--mint:#087653;--rose:#a0327d;
+  --hover:#20303908;--hover-strong:#2030390c;--hover-soft:#20303905;--separator:#d6dfe380;
+  --accent-ink:#fff;--accent-hover:#006e5e;--danger-ink:#fff;--danger-bg:#c52d46;--danger-hover:#aa233a;
+  --success-bg:#e4f4ea;--success-border:#a8d3b7;--info-bg:#e3f2f7;--info-border:#a4cfdc;
+  --error-bg:#fce8ec;--error-border:#e5b2bd;--idle-bg:#edf1f3;
+  --chart-card:#f9fbfc;--plot-bg:#fff;--plot-text:#586974;--plot-grid:#dfe6eb;--plot-zero:#94a5af;
+  --cursor:#596a75;--selection:#00718a22;--shadow:#20303926;--signal-off:#a8b5bd;--text-faint:#62727d
+}

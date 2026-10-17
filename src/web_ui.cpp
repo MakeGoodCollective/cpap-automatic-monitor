@@ -430,6 +430,7 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
         jsonAddUInt32(json, "config_revision", Config::revision());
         jsonAddInt(json, "onboarding_complete", Config::onboarding_complete());
         jsonAddString(json, "ui_language", status.ui_language);
+        jsonAddString(json, "ui_theme", status.ui_theme);
     }
     if (fields & STATUS_REPORT) {
         jsonAddString(json, "report_source", SleepReport::source_name(status.report_source));
@@ -510,13 +511,16 @@ static size_t buildStatusJson(char *out, size_t cap) {
 static const uint32_t STATUS_CACHE_TTL_MS = 500;
 // Includes bounded owner strings at the WebUI escape worst case (two bytes)
 // and both uint32 report revisions.
-static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 2304 : 1344;
+static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 2400 : 1440;
 static String status_cache;
 static uint32_t status_cache_built_at = 0;
+static uint32_t status_cache_config_revision = 0;
 
 static bool refreshStatusCacheIfNeeded() {
     uint32_t now = millis();
-    if (status_cache.length() > 0 && now - status_cache_built_at < STATUS_CACHE_TTL_MS)
+    const uint32_t revision = Config::revision();
+    if (status_cache.length() > 0 && status_cache_config_revision == revision &&
+        now - status_cache_built_at < STATUS_CACHE_TTL_MS)
         return true;
 
     char body[STATUS_JSON_MAX];
@@ -525,6 +529,7 @@ static bool refreshStatusCacheIfNeeded() {
 
     status_cache = body;
     status_cache_built_at = millis();
+    status_cache_config_revision = revision;
     return true;
 }
 
@@ -2475,6 +2480,15 @@ void WebUI::init(uint16_t port) {
 
     http->on("/", HTTP_GET, handleRoot);
     http->on("/wizard", HTTP_GET, handleRoot);
+    for (const auto &asset : UI_THEME_ASSETS) {
+        http->on(AsyncURIMatcher::exact(asset.url), HTTP_GET, [asset](AsyncWebServerRequest *request) {
+            if (!checkAuth(request)) return;
+            auto *response = request->beginResponse(200, "text/css; charset=utf-8", asset.data, asset.size);
+            response->addHeader("Content-Encoding", "gzip");
+            response->addHeader("Cache-Control", "private, max-age=31536000, immutable");
+            request->send(response);
+        });
+    }
     http->on("/api/onboarding", HTTP_POST, handleOnboardingComplete, NULL, handleJsonBody);
     http->on("/api/status", HTTP_GET, handleStatus);
     http->on(AsyncURIMatcher::exact("/api/crash"), HTTP_GET, handleCrashStatus);
@@ -2539,7 +2553,8 @@ static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
     if (a.rop != b.rop || a.sys != b.sys || a.mhr != b.mhr || a.mop != b.mop)
         fields |= STATUS_THERAPY;
     if (a.ip != b.ip || a.ap_ip != b.ap_ip) fields |= STATUS_HEALTH;
-    if (strcmp(a.ui_language, b.ui_language)) fields |= STATUS_CONFIG;
+    if (strcmp(a.ui_language, b.ui_language) || strcmp(a.ui_theme, b.ui_theme))
+        fields |= STATUS_CONFIG;
     if (a.oxi != b.oxi || a.feeding != b.feeding ||
         strcmp(a.oxi_source, b.oxi_source) || strcmp(a.oxi_name, b.oxi_name) ||
         a.reading.valid != b.reading.valid ||

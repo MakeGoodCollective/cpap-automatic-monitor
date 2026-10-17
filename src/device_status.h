@@ -25,6 +25,7 @@ struct Snapshot {
     uint32_t ip = 0;
     uint32_t ap_ip = 0;
     char ui_language[16] = "auto";
+    char ui_theme[32] = "auto";
     SleepReport::Source report_source = SleepReport::Source::Device;
     uint32_t report_revision = 0;
     uint32_t report_data_revision = 0;
@@ -50,6 +51,7 @@ inline Snapshot snapshot() {
                            out.oxi_name, sizeof(out.oxi_name));
     WiFiSetup::addresses(out.ip, out.ap_ip);
     strncpy(out.ui_language, Config::ui_language(), sizeof(out.ui_language) - 1);
+    strncpy(out.ui_theme, Config::ui_theme(), sizeof(out.ui_theme) - 1);
     SleepReport::Publication report;
     SleepReport::get_publication(report);
     out.report_source = report.source;

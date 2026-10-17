@@ -1,0 +1,14 @@
+:root {
+  color-scheme: dark;
+  --bg:#0d0d1a;--surface:#141428;--card:#1a1a32;--border:#252545;--border-light:#2a2a4a;
+  --text:#e0e0e0;--text-dim:#888;--accent:#00d4aa;--accent-dim:#00d4aa33;
+  --red:#e94560;--green:#4ade80;--blue:#818cf8;--cyan:#22d3ee;--orange:#fb923c;
+  --violet:#a78bfa;--magenta:#d946ef;--slate:#cbd5e1;--yellow:#facc15;--pink:#f472b6;
+  --sky:#7dd3fc;--orchid:#c084fc;--mint:#34d399;--rose:#f0abfc;
+  --hover:#ffffff08;--hover-strong:#ffffff0a;--hover-soft:#ffffff04;--separator:#25254533;
+  --accent-ink:#000;--accent-hover:#00c49a;--danger-ink:#fff;--danger-bg:#c73a52;--danger-hover:#b53048;
+  --success-bg:#064e3b;--success-border:#065f46;--info-bg:#0c4a6e;--info-border:#0369a1;
+  --error-bg:#350909;--error-border:#7f1d1d;--idle-bg:#1e1e3a;
+  --chart-card:#0a0a16;--plot-bg:#08081a;--plot-text:#9aa0b5;--plot-grid:#25283d;--plot-zero:#50546b;
+  --cursor:#aaa;--selection:#22d3ee33;--shadow:#0006;--signal-off:#475569;--text-faint:#8c8ca1
+}

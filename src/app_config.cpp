@@ -1,5 +1,6 @@
 #include "app_config.h"
 #include "ui_languages_generated.h"
+#include "ui_themes_generated.h"
 #include "auth_utils.h"
 #include "network_hints.h"
 #include "debug_log.h"
@@ -57,6 +58,7 @@ struct KVEntry {
 // Choice labels are used at build time, not retained in firmware RAM.
 #define KV_ENUM(k, n, f, d, s, ...) KV_U8(k, n, f, d, s)
 #define KV_LANGUAGE(k, n, f, d, s) KV_STR(k, n, f, d, s)
+#define KV_THEME(k, n, f, d, s) KV_STR(k, n, f, d, s)
 #define KV_BOOL(k, n, f, d, s, ...) {k, n, KVEntry::BOOL, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
 
 static const KVEntry kv_table[] = {
@@ -81,6 +83,7 @@ static const KVEntry kv_table[] = {
     KV_SECRET("http_pass", "http_pass", http_pass, "airbridge", Access),
     KV_STR("auth_whitelist", "auth_wl", auth_whitelist, "", Access),
     KV_LANGUAGE("ui_language", "ui_language", ui_language, "auto", Access),
+    KV_THEME("ui_theme", "ui_theme", ui_theme, "auto", Access),
     KV_STR("update_url", "update_url", update_url, AB_DEFAULT_UPDATE_URL, Updates),
     KV_STR("ntp_server", "ntp_server", ntp_server, "", Time),
     KV_STR("tz", "tz", tz, "UTC0", Time),
@@ -384,7 +387,19 @@ const char *Config::ui_language() {
     return "auto";
 }
 
+const char *Config::ui_theme() {
+    for (const char *id : UI_THEME_IDS)
+        if (cfg.ui_theme == id) return id;
+    return "auto";
+}
+
 bool Config::set_value(const char *key, const char *value) {
+    if (strcasecmp(key, "ui_theme") == 0 && strcmp(value, "auto") != 0) {
+        bool supported = false;
+        for (const char *id : UI_THEME_IDS)
+            if (strcmp(value, id) == 0) supported = true;
+        if (!supported) return false;
+    }
     if (strcasecmp(key, "ui_language") == 0 && strcmp(value, "auto") != 0) {
         bool supported = false;
         for (const char *tag : UI_LANGUAGE_TAGS)
