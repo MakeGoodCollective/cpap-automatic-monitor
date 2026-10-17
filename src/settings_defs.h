@@ -43,7 +43,7 @@ static const var_def_t VAR_CATALOG[] PROGMEM = {
     {"ITX", "Ti Max",           SET_SCALED, 50, 2, NULL},
     {"ITT", "Ti",               SET_SCALED, 50, 2, NULL},
     {"RST", "Rise Time (ms)",   SET_INT,    1, 0, NULL},
-    {"IBR", "Target Pt Rate",   SET_INT,    1, 0, NULL},
+    {"IBR", "Target Pt Rate",   SET_SCALED,  5, 0, NULL},
 
     {"EBE", "Easy-Breathe",     SET_ENUM,   1, 0, "Off,On"},
     {"VTS", "Trigger Sens.",    SET_ENUM,   1, 0, "Very Low,Low,Med,High,Very High"},
@@ -97,7 +97,7 @@ static const var_def_t VAR_CATALOG[] PROGMEM = {
     {"NMF", "Non-Vent Mask",    SET_ENUM,   1, 0, "Off,On"},
     {"SPX", "Low SpO2 Alarm",   SET_INT,    1, 0, NULL},
     {"APX", "Apnea Alarm (s)",  SET_INT,    1, 0, NULL},
-    {"LMA", "Low MV Alarm",     SET_INT,    1, 0, NULL},
+    {"LMA", "Low MV Alarm",     SET_SCALED,  8, 0, NULL},
     {NULL, NULL, SET_INT, 0, 0, NULL}  // sentinel
 };
 
