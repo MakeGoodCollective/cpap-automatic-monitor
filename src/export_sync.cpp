@@ -121,6 +121,7 @@ static portMUX_TYPE sleephq_status_mux = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t request_queue = nullptr;
 static TaskHandle_t export_task_handle = nullptr;
 static SdStorage::Session storage;
+static bool storage_demand = false;
 static volatile uint32_t abort_generation = 1;
 static uint32_t status_revision = 0;
 static bool check_pending = false;
@@ -1415,8 +1416,10 @@ static void export_task(void *) {
             if (request.kind == RequestKind::PostTherapy)
                 selected.config_revision = Config::revision(engine.section);
             while (!request_aborted(selected)) {
-                if (WiFi.status() != WL_CONNECTED ||
-                    !AirSenseState::device_standby() || !storage.begin()) {
+                const bool ready = WiFi.status() == WL_CONNECTED &&
+                    AirSenseState::device_standby();
+                __atomic_store_n(&storage_demand, ready, __ATOMIC_RELEASE);
+                if (!ready || !storage.begin()) {
                     vTaskDelay(pdMS_TO_TICKS(100));
                     continue;
                 }
@@ -1427,6 +1430,7 @@ static void export_task(void *) {
                 if (!yielded) break;
                 engine.set_state(State::Pending, nullptr);
             }
+            __atomic_store_n(&storage_demand, false, __ATOMIC_RELEASE);
         }
         settle_request(request);
     }
@@ -1602,6 +1606,10 @@ bool busy() {
     return false;
 }
 
+bool storage_requested() {
+    return __atomic_load_n(&storage_demand, __ATOMIC_ACQUIRE);
+}
+
 static State configured_state(State state, bool enabled) {
     if (state == State::Pending || state == State::Working) return state;
     if (!enabled) return State::Disabled;
@@ -1668,6 +1676,7 @@ void init() {}
 uint32_t revision() { return 0; }
 PublicationStamp publication_stamp() { return {}; }
 bool busy() { return false; }
+bool storage_requested() { return false; }
 void therapy_started() {}
 bool request_post_therapy(const EdfCatalog::Entry &) { return false; }
 bool request_manual(Engine, Action, const char *, const char *, const char **error) {

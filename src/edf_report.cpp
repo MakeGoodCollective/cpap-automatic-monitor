@@ -168,16 +168,16 @@ struct CacheHeader {
     double csr_seconds = 0, leak_high_seconds = 0;
     bool csr_known = false;
 };
-struct SessionData {
-    CacheHeader header;
-    uint64_t *bins = nullptr;
-    Event *events = nullptr;
-    // Summaries and history nest during preparation; keep their headers off
-    // the worker stack along with the separately allocated samples/events.
+struct ReportWork {
     static void *operator new(size_t size, const std::nothrow_t &) noexcept {
         return aircannect::Memory::alloc_large(size, size <= INTERNAL_WORK);
     }
     static void operator delete(void *memory) noexcept { aircannect::Memory::free(memory); }
+};
+struct SessionData : ReportWork {
+    CacheHeader header;
+    uint64_t *bins = nullptr;
+    Event *events = nullptr;
     ~SessionData() {
         aircannect::Memory::free(bins);
         aircannect::Memory::free(events);
@@ -286,7 +286,19 @@ struct Payload : aircannect::LargeTextBuffer {
 };
 
 enum class JobState : uint8_t { Free, Queued, Running, Complete };
+struct SessionBuild;
+struct SummaryWork;
+struct HistoryWork;
+struct PrepareWork;
+struct Job;
+struct RetainedIssue {
+    const char *reason = nullptr;
+    char path[96] = {};
+    void capture(const Job &job);
+    void restore(const Job &job) const;
+};
 struct Job {
+    ~Job();
     Request request;
     JobState state = JobState::Free;
     uint32_t id = 0, completed_ms = 0, data_revision = 0, cache_generation = 0;
@@ -301,10 +313,15 @@ struct Job {
     const char *error = nullptr;
     mutable const char *issue = nullptr;
     mutable char issue_path[96] = {};
+    mutable RetainedIssue accepted_issue;
     mutable uint64_t source_bytes = 0;
     mutable uint32_t source_reads = 0, source_us = 0, tiles_us = 0;
     bool diagnostics = false;
     Payload body;
+    mutable std::unique_ptr<SessionBuild> build;
+    std::unique_ptr<SummaryWork> summary;
+    std::unique_ptr<HistoryWork> history;
+    std::unique_ptr<PrepareWork> preparation;
 };
 
 bool note_issue(const Job &job, const char *reason, const char *path = "") {
@@ -314,6 +331,35 @@ bool note_issue(const Job &job, const char *reason, const char *path = "") {
     }
     return false;
 }
+
+void RetainedIssue::capture(const Job &job) {
+    if (!reason && job.issue) {
+        reason = job.issue;
+        snprintf(path, sizeof(path), "%s", job.issue_path);
+    }
+}
+void RetainedIssue::restore(const Job &job) const {
+    if (reason) note_issue(job, reason, path);
+}
+
+// A transferable source keeps only its own accepted degradation, never an
+// earlier session's diagnostic or an error from an interrupted attempt.
+struct SourceIssueScope {
+    const Job &job;
+    RetainedIssue previous;
+    SourceIssueScope(const Job &job, const RetainedIssue &source) : job(job) {
+        previous.capture(job);
+        job.issue = nullptr;
+        job.issue_path[0] = 0;
+        source.restore(job);
+    }
+    ~SourceIssueScope() {
+        if (previous.reason) {
+            job.issue = nullptr;
+            previous.restore(job);
+        }
+    }
+};
 
 void log_result(const Job &job) {
     const bool expected = job.code == 409 || job.code == 410;
@@ -569,13 +615,13 @@ bool reclaim_result() {
     xSemaphoreGive(mutex);
     return oldest != nullptr;
 }
-bool aborted(const Job *job, const SdStorage::Session &session) {
+bool aborted(const Job *job, const SdStorage::Session &session, bool cooperative = true) {
     // Owner-only work batches: SD operations remain individually bounded, and
     // CPU codec/histogram loops also yield without a delay per sample or tile.
     static uint32_t batch_us = 0;
     const uint32_t now = micros();
     if (uint32_t(now - batch_us) >= 4000) { vTaskDelay(1); batch_us = micros(); }
-    if (session.yield_requested()) {
+    if (cooperative && session.yield_requested()) {
         if (job) job->storage_yielded = true;
         return true;
     }
@@ -781,11 +827,13 @@ struct Input {
     uint8_t *record = nullptr;
     size_t record_capacity = 0;
     uint64_t record_offset = UINT64_MAX;
+    size_t record_loaded = 0;
+    bool header_ready = false, reading_header = false;
     char path[96] = {};
-    const SdStorage::Session &session;
-    const Job &job;
+    SdStorage::Session session;
+    const Job *job;
     ReportArtifact::Producer *artifact = nullptr;
-    Input(const SdStorage::Session &session, const Job &job) : session(session), job(job) {
+    Input(const SdStorage::Session &session, const Job &job) : session(session), job(&job) {
         void *memory = aircannect::Memory::alloc_large(sizeof(ReportEdf::Header),
                                                       sizeof(ReportEdf::Header) <= INTERNAL_WORK);
         if (memory) header = new (memory) ReportEdf::Header;
@@ -795,31 +843,42 @@ struct Input {
         aircannect::Memory::free(record);
     }
     size_t read_source(uint8_t *out, size_t bytes) {
-        const uint32_t started = job.diagnostics ? micros() : 0;
+        const uint32_t started = job->diagnostics ? micros() : 0;
         const size_t count = file.read(out, bytes);
-        if (job.diagnostics) {
-            job.source_us += uint32_t(micros() - started);
-            job.source_bytes += count;
-            ++job.source_reads;
+        if (job->diagnostics) {
+            job->source_us += uint32_t(micros() - started);
+            job->source_bytes += count;
+            ++job->source_reads;
         }
         return count;
     }
     bool open(const SdStorage::Session &session, const IndexedSession &entry, uint8_t kind) {
         char source[96];
         source_path(entry, kind, "edf", source);
+        this->session = session;
+        if (header_ready && !strcmp(path, source))
+            return file || file.open(session, path);
         if (!open_file(source)) return false;
-        if (!ReportEdf::read_header(reader, *header)) return note_issue(job, "source_header", path);
-        return prepare_record();
+        // A bounded descriptor read is the smallest resumable metadata step.
+        // Recording/USB revocation still interrupts each underlying read.
+        reading_header = true;
+        const bool parsed = ReportEdf::read_header(reader, *header);
+        reading_header = false;
+        if (!parsed) return note_issue(*job, "source_header", path);
+        header_ready = prepare_record();
+        return header_ready;
     }
     bool open_file(const char *source) {
-        if (!header) return note_issue(job, "header_alloc");
+        if (!header) return note_issue(*job, "header_alloc");
         record_offset = UINT64_MAX;
+        record_loaded = 0;
+        header_ready = false;
         *header = {};
         snprintf(path, sizeof(path), "%s", source);
-        if (!file.open(session, path)) return note_issue(job, "source_open", path);
+        if (!file.open(session, path)) return note_issue(*job, "source_open", path);
         reader = {[](void *ctx, uint64_t offset, uint8_t *out, size_t count) {
             auto &input = *static_cast<Input *>(ctx);
-            if (aborted(&input.job, input.session)) return false;
+            if (aborted(input.job, input.session, !input.reading_header)) return false;
             auto &file = input.file;
             const auto &header = *input.header;
             if (input.record && header.record_bytes && offset >= header.header_bytes &&
@@ -832,12 +891,12 @@ struct Input {
                     return true;
                 }
             }
-            if (!file.seek(offset)) return note_issue(input.job, "source_seek", input.path);
+            if (!file.seek(offset)) return note_issue(*input.job, "source_seek", input.path);
             size_t done = 0;
             while (done < count) {
                 const size_t take = std::min(count - done, SdStorage::READ_CHUNK_BYTES);
                 if (input.read_source(out + done, take) != take)
-                    return note_issue(input.job, "source_read", input.path);
+                    return note_issue(*input.job, "source_read", input.path);
                 done += take;
             }
             return true;
@@ -854,48 +913,52 @@ struct Input {
                 record_capacity = header->record_bytes;
             }
         }
-        if (record_capacity < header->record_bytes) return note_issue(job, "record_alloc", path);
+        if (record_capacity < header->record_bytes) return note_issue(*job, "record_alloc", path);
         return true;
     }
 
     bool load_record(uint32_t index) {
-        if (aborted(&job, session) || index >= header->records || !record ||
+        if (aborted(job, session) || index >= header->records || !record ||
             record_capacity < header->record_bytes) return false;
         const uint64_t base = header->header_bytes + uint64_t(index) * header->record_bytes;
-        if (base == record_offset) return true;
-        record_offset = UINT64_MAX;
-        if (!file.seek(base)) return note_issue(job, "source_seek", path);
-        for (size_t at = 0; at < header->record_bytes;) {
-            if (aborted(&job, session)) return false;
-            const size_t take = std::min<size_t>(header->record_bytes - at, SdStorage::READ_CHUNK_BYTES);
-            if (read_source(record + at, take) != take) return note_issue(job, "source_read", path);
-            at += take;
+        if (base != record_offset) {
+            record_offset = base;
+            record_loaded = 0;
         }
-        record_offset = base;
+        if (record_loaded == header->record_bytes) return true;
+        if (!file.seek(base + record_loaded)) return note_issue(*job, "source_seek", path);
+        while (record_loaded < header->record_bytes) {
+            if (aborted(job, session)) return false;
+            const size_t take = std::min<size_t>(header->record_bytes - record_loaded, SdStorage::READ_CHUNK_BYTES);
+            if (read_source(record + record_loaded, take) != take) return note_issue(*job, "source_read", path);
+            record_loaded += take;
+        }
         return true;
     }
 
     template <typename Sink>
-    bool scan_records(const int *signals, size_t count, uint32_t first, uint32_t end, Sink consume) {
-        if (first > end || end > header->records) return false;
+    bool scan_records(const int *signals, size_t count, uint32_t &next, uint32_t end, Sink consume) {
+        if (next > end || end > header->records) return false;
         bool present = false;
         for (size_t c = 0; c < count; ++c) present |= signals[c] >= 0;
         if (!present) return true;
-        for (uint32_t n = first; n < end; ++n) {
+        for (; next < end; ++next) {
+            const uint32_t n = next;
             if (!load_record(n)) return false;
             if (artifact) {
-                const uint32_t started = job.diagnostics ? micros() : 0;
+                const uint32_t started = job->diagnostics ? micros() : 0;
                 if (!artifact->record(*header, record, header->record_bytes)) {
-                    note_issue(job, artifact->error(), path);
-                    artifact = nullptr;
+                    note_issue(*job, artifact->error(), path);
+                    return false;
                 }
-                if (job.diagnostics) job.tiles_us += uint32_t(micros() - started);
+                if (job->diagnostics) job->tiles_us += uint32_t(micros() - started);
             }
             for (size_t c = 0; c < count; ++c) {
                 if (signals[c] < 0) continue;
                 ReportEdf::RecordSamples samples;
-                if (aborted(&job, session) ||
-                    !ReportEdf::record_samples(*header, record, header->record_bytes, signals[c], samples) ||
+                // Commit all histogram channels with the producer's whole record.
+                // No SD access or cancellation point splits this bounded update.
+                if (!ReportEdf::record_samples(*header, record, header->record_bytes, signals[c], samples) ||
                     !consume(c, uint64_t(n) * samples.signal->samples_per_record, samples)) return false;
             }
         }
@@ -923,18 +986,28 @@ bool artifact_identity(const IndexedSession &entry, uint8_t kind, char (&prefix)
 
 struct ArtifactBuild {
     Input &input;
-    std::unique_ptr<ReportArtifact::Producer> producer;
+    std::unique_ptr<ReportArtifact::Producer> &producer;
+    bool failed = false;
 
-    ArtifactBuild(Input &input, const IndexedSession &entry, uint8_t kind, bool enabled) : input(input) {
+    ArtifactBuild(Input &input, const IndexedSession &entry, uint8_t kind, bool enabled,
+                  std::unique_ptr<ReportArtifact::Producer> &producer) : input(input), producer(producer) {
         if (!enabled) return;
+        if (producer) {
+            if (producer->resume(input.session)) input.artifact = producer.get();
+            else { failed = true; note_issue(*input.job, producer->error(), input.path); }
+            return;
+        }
         char prefix[96];
         uint8_t key[32];
-        if (!artifact_identity(entry, kind, prefix, key)) { note_issue(input.job, "artifact_digest"); return; }
+        if (!artifact_identity(entry, kind, prefix, key)) {
+            failed = true; note_issue(*input.job, "artifact_digest"); return;
+        }
         ReportArtifact::Publication existing;
         const auto lookup = ReportArtifact::lookup(input.session, prefix, key, existing);
         if (lookup == ReportArtifact::Lookup::Ready) return;
         if (lookup != ReportArtifact::Lookup::Missing) {
-            note_issue(input.job, lookup == ReportArtifact::Lookup::Invalid ? "artifact_invalid" : "artifact_lookup", prefix);
+            failed = true;
+            note_issue(*input.job, lookup == ReportArtifact::Lookup::Invalid ? "artifact_invalid" : "artifact_lookup", prefix);
             return;
         }
         ReportArtifact::Selection selection[ReportArtifact::MAX_TRACKS];
@@ -950,10 +1023,11 @@ struct ArtifactBuild {
         if (!count) return;
         producer.reset(new (std::nothrow) ReportArtifact::Producer(input.session, [](void *context) {
             const auto &input = *static_cast<Input *>(context);
-            return aborted(&input.job, input.session);
+            return aborted(input.job, input.session);
         }, &input));
         if (!producer || !producer->begin(prefix, key, *input.header, selection, count)) {
-            note_issue(input.job, producer ? producer->error() : "artifact_alloc", prefix);
+            failed = true;
+            note_issue(*input.job, producer ? producer->error() : "artifact_alloc", prefix);
             producer.reset();
             return;
         }
@@ -961,13 +1035,16 @@ struct ArtifactBuild {
     }
     ~ArtifactBuild() { input.artifact = nullptr; }
     bool needed() const { return producer != nullptr; }
-    void finish() {
+    bool finish() {
         input.artifact = nullptr;
         ReportArtifact::Publication publication;
-        const uint32_t started = input.job.diagnostics ? micros() : 0;
-        if (producer && !producer->finish(publication) && !aborted(&input.job, input.session))
-            note_issue(input.job, producer->error(), input.path);
-        if (input.job.diagnostics) input.job.tiles_us += uint32_t(micros() - started);
+        const uint32_t started = input.job->diagnostics ? micros() : 0;
+        const bool complete = !producer || producer->finish(publication);
+        if (!complete && !aborted(input.job, input.session))
+            note_issue(*input.job, producer->error(), input.path);
+        if (input.job->diagnostics) input.job->tiles_us += uint32_t(micros() - started);
+        if (complete) producer.reset();
+        return complete;
     }
 };
 
@@ -1128,17 +1205,23 @@ size_t total_bins(const CacheHeader &header) {
 bool allocate_data(SessionData &out, bool events = true) {
     const size_t count = total_bins(out.header);
     if (count > MAX_BINS || out.header.events > MAX_DISK_EVENTS) return false;
+    uint64_t *bins = nullptr;
+    Event *event_data = nullptr;
     if (count) {
         const size_t bytes = count * sizeof(uint64_t);
-        out.bins = static_cast<uint64_t *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
-        if (!out.bins) return false;
-        memset(out.bins, 0, bytes);
+        bins = static_cast<uint64_t *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
+        if (!bins) return false;
+        memset(bins, 0, bytes);
     }
     if (events && out.header.events) {
         const size_t bytes = std::min<size_t>(out.header.events, MAX_EVENTS) * sizeof(Event);
-        out.events = static_cast<Event *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
-        if (!out.events) return false;
+        event_data = static_cast<Event *>(aircannect::Memory::alloc_large(bytes, bytes <= INTERNAL_WORK));
+        if (!event_data) { aircannect::Memory::free(bins); return false; }
     }
+    aircannect::Memory::free(out.bins);
+    aircannect::Memory::free(out.events);
+    out.bins = bins;
+    out.events = event_data;
     return true;
 }
 
@@ -1186,7 +1269,7 @@ bool load_cache(const SdStorage::Session &session, const IndexedSession &entry,
 bool read_event(Input &input, uint32_t record, Event &event) {
     ReportEdf::Annotation annotation;
     if (!ReportEdf::read_annotation(input.reader, *input.header, record, annotation))
-        return note_issue(input.job, "annotation_record", input.path);
+        return note_issue(*input.job, "annotation_record", input.path);
     event.time_ms = llround((input.header->start_seconds + annotation.onset_seconds) * 1000);
     event.duration_ms = annotation.has_duration ? llround(annotation.duration_seconds * 1000) : 0;
     event.kind = annotation.kind;
@@ -1289,7 +1372,7 @@ bool prepare_channels(Input &input, uint8_t file, SessionData &data) {
     return true;
 }
 
-bool scan_channels(Input &input, uint8_t file, SessionData &data) {
+bool scan_channels(Input &input, uint8_t file, SessionData &data, uint32_t &next) {
     int signals[CHANNEL_COUNT];
     size_t offsets[CHANNEL_COUNT], offset = 0;
     for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
@@ -1300,7 +1383,7 @@ bool scan_channels(Input &input, uint8_t file, SessionData &data) {
         signals[c] = ReportEdf::find_signal(*input.header, CHANNELS[c].signal);
         if (signals[c] < 0) return false;
     }
-    if (!input.scan_records(signals, CHANNEL_COUNT, 0, input.header->records,
+    if (!input.scan_records(signals, CHANNEL_COUNT, next, input.header->records,
         [&](size_t c, uint64_t, const ReportEdf::RecordSamples &samples) {
             auto &channel = data.header.channels[c];
             auto hist = histogram(channel, data.bins + offsets[c]);
@@ -1382,24 +1465,56 @@ struct CsrPairing {
     }
 };
 
+struct SessionBuild : SessionData {
+    Input input;
+    std::unique_ptr<ReportArtifact::Producer> producer;
+    CsrPairing csr;
+    RetainedIssue accepted_issue;
+    char prefix[32] = {};
+    uint32_t rebuild = 0, next_record = 0, event_count = 0;
+    uint8_t header_kind = 0, numeric_kind = 0, event_kind = 3, readable_numeric = 0;
+    bool allocated = false, finished = false, artifacts;
+
+    SessionBuild(const SdStorage::Session &session, const Job &job,
+                 const IndexedSession &entry, bool artifacts)
+        : input(session, job), rebuild(rebuild_generation), artifacts(artifacts) {
+        snprintf(prefix, sizeof(prefix), "%s", entry.entry.file_prefix);
+        header.key = entry.key;
+        header.day = entry.day;
+        header.partial = entry.key.present != 31 || entry.key.checksums != 31;
+    }
+    bool matches(const IndexedSession &entry, bool charts) const {
+        return header.key == entry.key && header.day == entry.day &&
+            !strcmp(prefix, entry.entry.file_prefix) && rebuild == rebuild_generation && artifacts == charts;
+    }
+    void pause() {
+        if (producer) producer->pause();
+        input.file.close();
+        input.artifact = nullptr;
+    }
+};
+
 bool build_session(const SdStorage::Session &session, const Job &job,
-                   const IndexedSession &entry, SessionData &out, bool artifacts = false) {
-    out.header.key = entry.key;
-    out.header.day = entry.day;
-    out.header.partial = entry.key.present != 31 || entry.key.checksums != 31;
-    Input input(session, job);
-    uint8_t readable_numeric = 0;
+                   const IndexedSession &entry, SessionBuild &work) {
+    SourceIssueScope issues(job, work.accepted_issue);
+    if (work.finished) return true;
+    auto &out = static_cast<SessionData &>(work);
+    auto &input = work.input;
+    input.session = session;
+    const bool artifacts = work.artifacts;
     // Gather descriptors before allocating the bounded exact histograms.
-    for (uint8_t kind : {uint8_t(0), uint8_t(1), uint8_t(2)}) {
+    for (; work.header_kind < 3; ++work.header_kind) {
+        const uint8_t kind = work.header_kind;
         if (!(entry.key.present & (1u << kind))) continue;
         if (!input.open(session, entry, kind)) {
             if (aborted(&job, session)) return false;
             out.header.partial = true;
+            work.accepted_issue.capture(job);
             input.file.close();
             continue;
         }
         if (kind && !prepare_channels(input, kind, out)) return false;
-        readable_numeric |= 1u << kind;
+        work.readable_numeric |= 1u << kind;
         bool chart_present = !kind && ReportEdf::find_signal(*input.header, "Flow.40ms") >= 0;
         for (size_t c = 0; c < CHANNEL_COUNT; ++c)
             chart_present |= CHANNELS[c].file == kind && out.header.channels[c].bins;
@@ -1432,56 +1547,65 @@ bool build_session(const SdStorage::Session &session, const Job &job,
         input.file.close();
     }
     // Cap event retention, but count every supported event independently.
-    uint32_t event_capacity = 0;
-    for (uint8_t kind : {uint8_t(3), uint8_t(4)}) {
+    for (; work.header_kind < 5; ++work.header_kind) {
+        const uint8_t kind = work.header_kind;
         if (!(entry.key.present & (1u << kind))) continue;
         if (!input.open(session, entry, kind)) {
             if (aborted(&job, session)) return false;
             out.header.partial = true;
+            work.accepted_issue.capture(job);
             input.file.close();
             continue;
         }
         if (kind == 3) out.header.events_known = true;
-        event_capacity += std::min<uint32_t>(input.header->records, MAX_EVENTS - event_capacity);
+        out.header.events += std::min<uint32_t>(input.header->records, MAX_EVENTS - out.header.events);
         input.file.close();
     }
-    out.header.events = event_capacity;
-    if (!allocate_data(out)) return false;
-    for (uint8_t kind : {uint8_t(0), uint8_t(1), uint8_t(2)}) {
-        if (!(readable_numeric & (1u << kind))) continue;
+    if (!work.allocated) {
+        if (!allocate_data(out)) return false;
+        work.allocated = true;
+    }
+    for (; work.numeric_kind < 3; ++work.numeric_kind, work.next_record = 0) {
+        const uint8_t kind = work.numeric_kind;
+        if (!(work.readable_numeric & (1u << kind))) continue;
         if (!kind && !artifacts) continue;
         if (!input.open(session, entry, kind)) return false;
-        ArtifactBuild artifact(input, entry, kind, artifacts);
+        ArtifactBuild artifact(input, entry, kind, artifacts, work.producer);
+        if (artifact.failed) return false;
         if (kind) {
-            if (!scan_channels(input, kind, out)) return false;
+            if (!scan_channels(input, kind, out, work.next_record)) return false;
         } else if (artifact.needed()) {
             const int flow = ReportEdf::find_signal(*input.header, "Flow.40ms");
-            if (!input.scan_records(&flow, 1, 0, input.header->records,
+            if (!input.scan_records(&flow, 1, work.next_record, input.header->records,
                 [](size_t, uint64_t, const ReportEdf::RecordSamples &) { return true; })) return false;
         }
         input.file.close();
-        artifact.finish();
+        if (!artifact.finish()) return false;
     }
-    uint32_t events = 0;
-    CsrPairing csr;
-    for (uint8_t kind : {uint8_t(3), uint8_t(4)}) {
+    const uint32_t event_capacity = out.header.events;
+    auto &events = work.event_count;
+    auto &csr = work.csr;
+    for (; work.event_kind < 5; ++work.event_kind, work.next_record = 0) {
+        const uint8_t kind = work.event_kind;
         if (!(entry.key.present & (1u << kind))) continue;
         if (!input.open(session, entry, kind)) {
             if (aborted(&job, session)) return false;
             if (kind == 3) out.header.events_known = false;
             out.header.partial = true;
+            work.accepted_issue.capture(job);
             input.file.close();
             continue;
         }
         if (kind == 4) out.header.csr_known = true;
-        for (uint32_t i = 0; i < input.header->records; ++i) {
+        for (; work.next_record < input.header->records; ++work.next_record) {
             if (aborted(&job, session)) return false;
             Event event;
-            if (!read_event(input, i, event)) {
+            if (!read_event(input, work.next_record, event)) {
                 if (aborted(&job, session)) return false;
                 if (kind == 3) out.header.events_known = false;
                 if (kind == 4) out.header.csr_known = false;
                 out.header.partial = true;
+                work.accepted_issue.capture(job);
                 break;
             }
             if (event.kind == ReportEdf::EventKind::Unknown) continue;
@@ -1514,6 +1638,7 @@ bool build_session(const SdStorage::Session &session, const Job &job,
     if (events) std::sort(out.events, out.events + std::min<uint32_t>(events, event_capacity), [](const Event &a, const Event &b) {
         return a.time_ms < b.time_ms;
     });
+    work.finished = true;
     return true;
 }
 
@@ -1521,18 +1646,43 @@ bool session_data(const SdStorage::Session &session, const Job &job,
                   const IndexedSession &entry, SessionData &out, bool artifacts = false) {
     if (!artifacts && load_cache(session, entry, out)) {
         if (out.header.partial) note_issue(job, "partial_source", entry.entry.file_prefix);
+        job.accepted_issue.capture(job);
         return true;
     }
-    out.~SessionData();
-    ::new (&out) SessionData;
-    if (!build_session(session, job, entry, out, artifacts))
+    if (job.build && !job.build->matches(entry, artifacts)) job.build.reset();
+    if (!job.build) {
+        // One source's private spool has one owner even when a foreground
+        // request overtakes a queued backfill with a different selector.
+        xSemaphoreTake(mutex, portMAX_DELAY);
+        for (auto &other : jobs) {
+            if (&other != &job && other.state == JobState::Queued && other.build &&
+                other.build->matches(entry, artifacts)) {
+                job.build = std::move(other.build);
+                job.build->input.job = &job;
+                break;
+            }
+        }
+        xSemaphoreGive(mutex);
+    }
+    if (!job.build) job.build.reset(new (std::nothrow) SessionBuild(session, job, entry, artifacts));
+    if (!job.build) return note_issue(job, "session_alloc");
+    if (!build_session(session, job, entry, *job.build)) {
+        job.build->pause();
         return note_issue(job, "session_build", entry.entry.file_prefix);
-    if (out.header.partial) note_issue(job, "partial_source", entry.entry.file_prefix);
+    }
+    auto &built = *job.build;
+    if (built.header.partial) note_issue(job, "partial_source", entry.entry.file_prefix);
     // The cache is derived and replaceable; failed persistence does not discard
     // useful parsed data or modify any source EDF/sidecar.
-    if (!out.header.partial && !store_cache(session, job, entry, out) && !aborted(&job, session))
+    if (!built.header.partial && !store_cache(session, job, entry, built) && !aborted(&job, session))
         note_issue(job, "cache_write", entry.entry.file_prefix);
-    return !aborted(&job, session);
+    if (aborted(&job, session)) { built.pause(); return false; }
+    job.accepted_issue.capture(job);
+    out.header = built.header;
+    std::swap(out.bins, built.bins);
+    std::swap(out.events, built.events);
+    job.build.reset();
+    return true;
 }
 
 uint16_t last_day(const Request &request) {
@@ -1561,7 +1711,8 @@ bool summary_json(const SdStorage::Session &session, Job &job);
 bool history_json(const SdStorage::Session &session, Job &job, bool build);
 bool window_events(const SdStorage::Session &session, const Job &job,
                    const IndexedSession &entry, const CacheHeader &header,
-                   int64_t from, int64_t to, Payload &out, bool &comma, bool &truncated);
+                   int64_t from, int64_t to, Payload &out, bool &comma, bool &truncated,
+                   uint32_t &next, CsrPairing &csr);
 
 bool dataset(const SdStorage::Session &session) {
     if (*dataset_id) return true;
@@ -1645,7 +1796,7 @@ bool prepare_period(const SdStorage::Session &session, Job &job) {
     ReportArtifact::Document document;
     if (ReportArtifact::document_lookup(session, prefix, key, document) == ReportArtifact::Lookup::Ready)
         return ReportArtifact::document_read(session, prefix, document, job.body, key);
-    if (!summary_json(session, job) || job.issue || aborted(&job, session)) return false;
+    if (!summary_json(session, job) || job.issue || aborted(&job, session, false)) return false;
     EdfCatalog::Status current;
     EdfCatalog::get_status(current);
     if (current.generation != catalog_generation || SdStorage::files_revision() != file_revision) return false;
@@ -1705,6 +1856,17 @@ bool publish_histograms(const SdStorage::Session &session, const IndexedSession 
             reinterpret_cast<const uint8_t *>(bytes.c_str()), bytes.length(), document);
 }
 
+struct PrepareWork : ReportWork {
+    enum Phase { Numeric, Events, History, Summary, Publish } phase = Numeric;
+    size_t next = 0;
+    bool comma = false, loaded = false, event_comma = false, events_ready = false;
+    uint32_t next_event = 0;
+    CsrPairing csr;
+    Payload envelope, events;
+    std::unique_ptr<SessionData> data;
+    ReportArtifact::Document histogram;
+};
+
 bool prepare_json(const SdStorage::Session &session, Job &job) {
     if (job.request.view == View::Period) return prepare_period(session, job);
     const uint16_t day = last_day(job.request);
@@ -1713,114 +1875,154 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
     publication_prefix(day, manifest);
     if (!publication_key(job.request, manifest_key)) return note_issue(job, "publication_key");
     ReportArtifact::Document saved;
-    const auto known = ReportArtifact::document_lookup(session, manifest, manifest_key, saved);
-    if (known == ReportArtifact::Lookup::Ready) {
-        // Revalidate references only after a source/storage change or eviction.
-        // scan_index clears this owner cache when files_revision changes.
-        auto *cached = cached_day_entry(day, true);
-        const bool checked = cached && cached->artifacts_checked &&
-            !memcmp(cached->artifact_key, manifest_key, sizeof(manifest_key));
-        for (size_t i = 0; !checked && i < index_count; ++i) {
+    if (!job.preparation) {
+        const auto known = ReportArtifact::document_lookup(session, manifest, manifest_key, saved);
+        if (known == ReportArtifact::Lookup::Ready) {
+            // Revalidate references only after a source/storage change or eviction.
+            // scan_index clears this owner cache when files_revision changes.
+            auto *cached = cached_day_entry(day, true);
+            const bool checked = cached && cached->artifacts_checked &&
+                !memcmp(cached->artifact_key, manifest_key, sizeof(manifest_key));
+            for (size_t i = 0; !checked && i < index_count; ++i) {
+                const auto &entry = index[i];
+                if (!selected(entry, day, day)) continue;
+                for (uint8_t kind = 0; kind < 3; ++kind) {
+                    if (!(entry.key.present & (1u << kind))) continue;
+                    char prefix[96]; uint8_t key[32];
+                    ReportArtifact::Publication publication;
+                    if (!artifact_identity(entry, kind, prefix, key) ||
+                        ReportArtifact::lookup(session, prefix, key, publication) != ReportArtifact::Lookup::Ready)
+                        return note_issue(job, "artifact_lookup", entry.entry.file_prefix);
+                }
+            }
+            if (cached) {
+                memcpy(cached->artifact_key, manifest_key, sizeof(manifest_key));
+                cached->artifacts_checked = true;
+            }
+            if (ReportArtifact::document_read(session, manifest, saved, job.body, manifest_key)) return true;
+            return note_issue(job, "publication_read", manifest);
+        }
+        if (known == ReportArtifact::Lookup::Failed || known == ReportArtifact::Lookup::Invalid)
+            return note_issue(job, "publication_read", manifest);
+        if (!artifact_headroom(session, day)) return note_issue(job, "recording_headroom");
+        job.preparation.reset(new (std::nothrow) PrepareWork);
+        if (!job.preparation) return note_issue(job, "artifact_alloc");
+        job.body.clear();
+        aircannect::hex_encode(manifest_key, 32, identity, sizeof(identity), aircannect::HexCase::Lower);
+        start_json(job.body, revision() + 1, job.data_revision);
+        job.body.print("\"dataset\":\"%s\",\"identity\":\"%s\",\"day\":%u,\"artifacts\":[", dataset_id, identity, day);
+    }
+    auto &work = *job.preparation;
+    auto &comma = work.comma;
+    if (work.phase == PrepareWork::Numeric) {
+        for (size_t &i = work.next; i < index_count; ++i) {
             const auto &entry = index[i];
             if (!selected(entry, day, day)) continue;
+            bool missing = false;
             for (uint8_t kind = 0; kind < 3; ++kind) {
                 if (!(entry.key.present & (1u << kind))) continue;
                 char prefix[96]; uint8_t key[32];
                 ReportArtifact::Publication publication;
+                if (!artifact_identity(entry, kind, prefix, key)) return note_issue(job, "artifact_digest");
+                const auto found = ReportArtifact::lookup(session, prefix, key, publication);
+                if (found == ReportArtifact::Lookup::Missing) missing = true;
+                else if (found != ReportArtifact::Lookup::Ready) return note_issue(job, "artifact_lookup", prefix);
+            }
+            if (missing) {
+                std::unique_ptr<SessionData> data(new (std::nothrow) SessionData);
+                if (!data) return note_issue(job, "artifact_alloc");
+                if (!session_data(session, job, entry, *data, true)) return false;
+            }
+            Payload references;
+            bool reference_comma = comma;
+            for (uint8_t kind = 0; kind < 3; ++kind) {
+                if (!(entry.key.present & (1u << kind))) continue;
+                char prefix[96], digest[65]; uint8_t key[32];
+                ReportArtifact::Publication publication;
                 if (!artifact_identity(entry, kind, prefix, key) ||
                     ReportArtifact::lookup(session, prefix, key, publication) != ReportArtifact::Lookup::Ready)
-                    return note_issue(job, "artifact_lookup", entry.entry.file_prefix);
+                    return note_issue(job, "artifact_unavailable", entry.entry.file_prefix);
+                aircannect::hex_encode(publication.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+                references.print("%s{\"session\":%u,\"day\":\"%s\",\"kind\":\"%s\",\"digest\":\"%s\",\"bytes\":%u}",
+                               reference_comma ? "," : "", unsigned(i), entry.entry.therapy_day, SUFFIXES[kind], digest, publication.bytes);
+                reference_comma = true;
             }
+            if (!references.good() || !job.body.append(references.c_str(), references.length())) return false;
+            comma = reference_comma;
         }
-        if (cached) {
-            memcpy(cached->artifact_key, manifest_key, sizeof(manifest_key));
-            cached->artifacts_checked = true;
-        }
-        if (ReportArtifact::document_read(session, manifest, saved, job.body, manifest_key)) return true;
-        return note_issue(job, "publication_read", manifest);
+        job.body.print("],\"event_groups\":[");
+        comma = false;
+        work.next = 0;
+        work.phase = PrepareWork::Events;
     }
-    if (known == ReportArtifact::Lookup::Failed || known == ReportArtifact::Lookup::Invalid)
-        return note_issue(job, "publication_read", manifest);
-    if (!artifact_headroom(session, day)) return note_issue(job, "recording_headroom");
-    job.body.clear();
-    aircannect::hex_encode(manifest_key, 32, identity, sizeof(identity), aircannect::HexCase::Lower);
-    start_json(job.body, revision() + 1, job.data_revision);
-    job.body.print("\"dataset\":\"%s\",\"identity\":\"%s\",\"day\":%u,\"artifacts\":[", dataset_id, identity, day);
-    bool comma = false;
-    for (size_t i = 0; i < index_count; ++i) {
-        const auto &entry = index[i];
-        if (!selected(entry, day, day)) continue;
-        bool missing = false;
-        for (uint8_t kind = 0; kind < 3; ++kind) {
-            if (!(entry.key.present & (1u << kind))) continue;
-            char prefix[96]; uint8_t key[32];
-            ReportArtifact::Publication publication;
-            if (!artifact_identity(entry, kind, prefix, key)) return note_issue(job, "artifact_digest");
-            const auto found = ReportArtifact::lookup(session, prefix, key, publication);
-            if (found == ReportArtifact::Lookup::Missing) missing = true;
-            else if (found != ReportArtifact::Lookup::Ready) return note_issue(job, "artifact_lookup", prefix);
-        }
-        if (missing) {
-            std::unique_ptr<SessionData> data(new (std::nothrow) SessionData);
-            if (!data) return note_issue(job, "artifact_alloc");
-            if (!session_data(session, job, entry, *data, true)) return false;
-        }
-        for (uint8_t kind = 0; kind < 3; ++kind) {
-            if (!(entry.key.present & (1u << kind))) continue;
-            char prefix[96], digest[65]; uint8_t key[32];
-            ReportArtifact::Publication publication;
-            if (!artifact_identity(entry, kind, prefix, key) ||
-                ReportArtifact::lookup(session, prefix, key, publication) != ReportArtifact::Lookup::Ready)
-                return note_issue(job, "artifact_unavailable", entry.entry.file_prefix);
+    if (work.phase == PrepareWork::Events) {
+        for (size_t &i = work.next; i < index_count; ++i) {
+            const auto &entry = index[i];
+            if (!selected(entry, day, day)) continue;
+            if (!work.data) work.data.reset(new (std::nothrow) SessionData);
+            if (!work.data) return note_issue(job, "session_alloc");
+            auto &data = *work.data;
+            if (!work.loaded) {
+                if (!session_data(session, job, entry, data)) return false;
+                work.loaded = true;
+            }
+            auto &histogram = work.histogram;
+            if (!histogram.bytes) {
+                ReportArtifact::Document published;
+                if (!publish_histograms(session, entry, data, published))
+                    return note_issue(job, "histogram_publish");
+                histogram = published;
+            }
+            auto &events = work.events;
+            if (!work.events_ready) {
+                bool truncated = false;
+                if (!events.length()) events.print("{\"events\":[");
+                if (!window_events(session, job, entry, data.header, 0, INT64_MAX,
+                    events, work.event_comma, truncated, work.next_event, work.csr) || truncated)
+                    return note_issue(job, "event_limit");
+                events.print("]}");
+                work.events_ready = true;
+            }
+            char prefix[96], digest[65];
+            cache_path(entry, "events", prefix);
+            uint8_t event_key[32];
+            ReportArtifact::Document publication;
+            if (!events.good() || !ReportArtifact::fingerprint(reinterpret_cast<const uint8_t *>(events.c_str()), events.length(), event_key) ||
+                !ReportArtifact::document_publish(session, prefix, event_key,
+                    reinterpret_cast<const uint8_t *>(events.c_str()), events.length(), publication)) return note_issue(job, "events_publish");
             aircannect::hex_encode(publication.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
-            job.body.print("%s{\"session\":%u,\"day\":\"%s\",\"kind\":\"%s\",\"digest\":\"%s\",\"bytes\":%u}",
-                           comma ? "," : "", unsigned(i), entry.entry.therapy_day, SUFFIXES[kind], digest, publication.bytes);
+            job.body.print("%s{\"session\":%u,\"day\":\"%s\",\"digest\":\"%s\",\"bytes\":%u,",
+                comma ? "," : "", unsigned(i), entry.entry.therapy_day, digest, publication.bytes);
+            aircannect::hex_encode(histogram.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
+            job.body.print("\"histogram\":{\"day\":\"%s\",\"digest\":\"%s\",\"bytes\":%u}}",
+                entry.entry.therapy_day, digest, histogram.bytes);
             comma = true;
+            work.data.reset();
+            work.loaded = work.event_comma = work.events_ready = false;
+            work.histogram = {};
+            work.next_event = 0;
+            work.csr = {};
+            work.events.~Payload();
+            new (&work.events) Payload;
         }
+        job.body.print("],\"summary\":");
+        work.envelope.swap(job.body);
+        work.phase = PrepareWork::History;
     }
-    job.body.print("],\"event_groups\":[");
-    comma = false;
-    for (size_t i = 0; i < index_count; ++i) {
-        const auto &entry = index[i];
-        if (!selected(entry, day, day)) continue;
-        std::unique_ptr<SessionData> storage(new (std::nothrow) SessionData);
-        if (!storage) return note_issue(job, "session_alloc");
-        auto &data = *storage;
-        if (!session_data(session, job, entry, data)) return false;
-        ReportArtifact::Document histogram;
-        if (!publish_histograms(session, entry, data, histogram)) return note_issue(job, "histogram_publish");
-        Payload events;
-        bool event_comma = false, truncated = false;
-        events.print("{\"events\":[");
-        if (!window_events(session, job, entry, data.header, 0, INT64_MAX,
-                           events, event_comma, truncated) || truncated) return note_issue(job, "event_limit");
-        events.print("]}");
-        char prefix[96], digest[65];
-        cache_path(entry, "events", prefix);
-        uint8_t event_key[32];
-        ReportArtifact::Document publication;
-        if (!events.good() || !ReportArtifact::fingerprint(reinterpret_cast<const uint8_t *>(events.c_str()), events.length(), event_key) ||
-            !ReportArtifact::document_publish(session, prefix, event_key,
-                reinterpret_cast<const uint8_t *>(events.c_str()), events.length(), publication)) return note_issue(job, "events_publish");
-        aircannect::hex_encode(publication.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
-        job.body.print("%s{\"session\":%u,\"day\":\"%s\",\"digest\":\"%s\",\"bytes\":%u,",
-            comma ? "," : "", unsigned(i), entry.entry.therapy_day, digest, publication.bytes);
-        aircannect::hex_encode(histogram.digest, 32, digest, sizeof(digest), aircannect::HexCase::Lower);
-        job.body.print("\"histogram\":{\"day\":\"%s\",\"digest\":\"%s\",\"bytes\":%u}}",
-            entry.entry.therapy_day, digest, histogram.bytes);
-        comma = true;
-    }
-    job.body.print("],\"summary\":");
-    Payload envelope;
-    envelope.swap(job.body);
     // History uses the same exact session statistics, never browser aggregates.
-    if (!history_json(session, job, true)) return false;
-    job.body.clear();
-    if (!summary_json(session, job)) return false;
-    envelope.append(job.body.c_str(), job.body.length());
-    envelope.print("}");
-    job.body.swap(envelope);
-    if (!job.body.good() || aborted(&job, session)) return false;
+    if (work.phase == PrepareWork::History) {
+        if (!history_json(session, job, true)) return false;
+        job.body.clear();
+        work.phase = PrepareWork::Summary;
+    }
+    if (work.phase == PrepareWork::Summary) {
+        if (!summary_json(session, job)) return false;
+        work.envelope.append(job.body.c_str(), job.body.length());
+        work.envelope.print("}");
+        job.body.swap(work.envelope);
+        work.phase = PrepareWork::Publish;
+    }
+    if (!job.body.good() || aborted(&job, session, false)) return false;
     if (job.issue) {
         ReportArtifact::Document previous;
         const bool prior = ReportArtifact::document_lookup(session, manifest, nullptr, previous) == ReportArtifact::Lookup::Ready;
@@ -1926,7 +2128,7 @@ void foreground_activity() {
 }
 
 bool cleanup_cancelled(void *context) {
-    return __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) || foreground_wait() || ExportSync::busy() ||
+    return __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) || foreground_wait() || ExportSync::storage_requested() ||
         aborted(nullptr, *static_cast<const SdStorage::Session *>(context));
 }
 
@@ -2095,21 +2297,25 @@ struct Aggregate {
         aircannect::Memory::free(channels);
     }
     bool merge(const SessionData &data, bool &partial) {
+        // Allocate before adding any samples: a retry must merge this session
+        // once even if a later channel cannot be allocated on the first pass.
+        for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
+            const auto &cached = data.header.channels[c];
+            if (!cached.bins || incompatible[c] || channels[c].bins) continue;
+            const size_t bytes = cached.bins * sizeof(uint64_t);
+            auto *bins = static_cast<uint64_t *>(aircannect::Memory::alloc_large(bytes,
+                                                           bytes <= INTERNAL_WORK));
+            if (!bins || !ReportEdf::init_histogram(cached.signal, bins,
+                                                   cached.bins, channels[c])) {
+                aircannect::Memory::free(bins);
+                return false;
+            }
+        }
         size_t offset = 0;
         for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
             const auto &cached = data.header.channels[c];
             if (cached.bins && !incompatible[c]) {
                 auto next = histogram(cached, data.bins + offset);
-                if (!channels[c].bins) {
-                    const size_t bytes = cached.bins * sizeof(uint64_t);
-                    auto *bins = static_cast<uint64_t *>(aircannect::Memory::alloc_large(bytes,
-                                                                   bytes <= INTERNAL_WORK));
-                    if (!bins || !ReportEdf::init_histogram(cached.signal, bins,
-                                                           cached.bins, channels[c])) {
-                        aircannect::Memory::free(bins);
-                        return false;
-                    }
-                }
                 if (!ReportEdf::merge_histogram(channels[c], next)) {
                     incompatible[c] = true;
                     partial = true;
@@ -2123,24 +2329,51 @@ struct Aggregate {
 
 bool history_json(const SdStorage::Session &session, Job &job, bool build);
 
-bool summary_json(const SdStorage::Session &session, Job &job) {
+struct SummaryWork : ReportWork {
     Aggregate aggregate;
-    if (!aggregate.channels) return note_issue(job, "aggregate_alloc");
-    const uint16_t last = last_day(job.request), first = first_day(job.request, last);
+    size_t next = 0;
     bool partial = false, session_comma = false;
     bool usage_known = true, events_known = true, csr_known = true;
+    bool totals_written = false, complete = false;
     uint32_t sessions = 0;
     uint64_t counts[5] = {};
     double seconds = 0, csr_seconds = 0, leak_high_seconds = 0;
-    start_json(job.body, revision() + 1, job.data_revision);
-    job.body.print("\"view\":\"%s\",\"day\":%u,\"first_day\":%u,\"last_day\":%u,\"sessions\":[",
-                   job.request.view == View::Day ? "day" : "period", last, first, last);
-    for (size_t i = 0; i < index_count; ++i) {
+};
+
+bool summary_json(const SdStorage::Session &session, Job &job) {
+    const uint16_t last = last_day(job.request), first = first_day(job.request, last);
+    if (!job.summary) {
+        job.summary.reset(new (std::nothrow) SummaryWork);
+        if (!job.summary) return note_issue(job, "aggregate_alloc");
+        start_json(job.body, revision() + 1, job.data_revision);
+        job.body.print("\"view\":\"%s\",\"day\":%u,\"first_day\":%u,\"last_day\":%u,\"sessions\":[",
+                       job.request.view == View::Day ? "day" : "period", last, first, last);
+    }
+    auto &work = *job.summary;
+    if (work.complete) return true;
+    auto &aggregate = work.aggregate;
+    if (!aggregate.channels) {
+        job.summary.reset();
+        job.body.clear();
+        return note_issue(job, "aggregate_alloc");
+    }
+    auto &partial = work.partial;
+    auto &session_comma = work.session_comma;
+    auto &usage_known = work.usage_known;
+    auto &events_known = work.events_known;
+    auto &csr_known = work.csr_known;
+    auto &sessions = work.sessions;
+    auto &counts = work.counts;
+    auto &seconds = work.seconds;
+    auto &csr_seconds = work.csr_seconds;
+    auto &leak_high_seconds = work.leak_high_seconds;
+    for (size_t &i = work.next; i < index_count; ++i) {
         auto &entry = index[i];
         if (!selected(entry, first, last)) continue;
         if (aborted(&job, session)) return false;
         if (!(entry.key.present & 7)) {
             note_issue(job, "numeric_files_missing", entry.entry.file_prefix);
+            job.accepted_issue.capture(job);
             partial = true;
             usage_known = events_known = csr_known = false;
             continue;
@@ -2150,10 +2383,12 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
         auto &data = *storage;
         if (!session_data(session, job, entry, data)) {
             if (aborted(&job, session)) return false;
+            job.accepted_issue.capture(job);
             partial = true;
             usage_known = events_known = csr_known = false;
             continue;
         }
+        if (!aggregate.merge(data, partial)) return false;
         partial |= data.header.partial;
         usage_known &= data.header.usage_known;
         events_known &= data.header.usage_known;
@@ -2165,7 +2400,6 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
         entry.end_ms = data.header.chart_end_ms;
         entry.event_from_ms = data.header.event_from_ms;
         entry.event_to_ms = data.header.event_to_ms;
-        if (!aggregate.merge(data, partial)) return false;
         if (data.header.recorded) {
             seconds += data.header.used_seconds;
             events_known &= data.header.events_known;
@@ -2180,65 +2414,70 @@ bool summary_json(const SdStorage::Session &session, Job &job) {
         session_comma = true;
         ++sessions;
     }
-    HistoricalStr str(session, job);
-    bool str_expected = false;
-    if (job.request.view == View::Day)
-        for (size_t i = 0; i < index_count; ++i)
-            str_expected |= index[i].day == last && (index[i].entry.flags & EdfCatalog::ENTRY_STR_READY);
-    if (str_expected && !str.load(last)) {
-        if (aborted(&job, session)) return false;
-        str.present = false;
-        partial = true;
-        note_issue(job, "str_read", "/STR.edf");
-    }
-    job.body.print("],\"present\":%s,\"partial\":%s,\"used_seconds\":",
-                   sessions || str.present ? "true" : "false", partial ? "true" : "false");
-    if (usage_known && seconds > 0) job.body.print("%.10g", seconds);
-    else job.body.print("null");
-    job.body.print(",\"rdi\":");
-    if (seconds > 0 && events_known) job.body.print("%.10g", (counts[0] + counts[1] + counts[2] + counts[3] + counts[4]) * 3600.0 / seconds);
-    else job.body.print("null");
-    job.body.print(",\"csr_seconds\":");
-    if (csr_known && seconds > 0) job.body.print("%.10g", csr_seconds);
-    else job.body.print("null");
-    job.body.print(",\"leak_threshold\":%.10g,\"leak_high_seconds\":", LEAK_THRESHOLD);
-    if (!aggregate.incompatible[3] && aggregate.coverage[3] > 0) job.body.print("%.10g", leak_high_seconds);
-    else job.body.print("null");
-    job.body.print(",\"session_count\":%u,\"ahi\":", sessions);
-    if (seconds > 0 && events_known) job.body.print("%.10g", (counts[0] + counts[1] + counts[2] + counts[3]) * 3600.0 / seconds);
-    else job.body.print("null");
-    job.body.print(",\"events_known\":%s,", events_known && seconds > 0 ? "true" : "false");
-    if (events_known && seconds > 0) job.body.print("\"counts\":{\"oa\":%llu,\"ca\":%llu,\"ua\":%llu,\"h\":%llu,\"rera\":%llu},",
-                   static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]),
-                   static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]),
-                   static_cast<unsigned long long>(counts[4]));
-    else job.body.print("\"counts\":{\"oa\":null,\"ca\":null,\"ua\":null,\"h\":null,\"rera\":null},");
-    job.body.print("\"channels\":[");
-    for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
-        ReportEdf::Statistics stats;
-        const bool present = !aggregate.incompatible[c] && aggregate.channels[c].bins &&
-            ReportEdf::summarize(aggregate.channels[c], stats) && stats.present;
-        job.body.print("%s{\"id\":\"%s\",\"label\":\"%s\",\"unit\":\"%s\",\"count\":%llu,",
-                       c ? "," : "", CHANNELS[c].id, CHANNELS[c].label, CHANNELS[c].unit,
-                       static_cast<unsigned long long>(present ? stats.count : 0));
-        job.body.print("\"coverage_seconds\":%.10g,", present ? aggregate.coverage[c] : 0);
-        const double values[] = {present ? stats.min : NAN, present ? stats.mean : NAN,
-            present ? stats.median : str.statistic(c, "50"),
-            present ? stats.p95 : str.statistic(c, "95"), present ? stats.max : str.statistic(c, "Max")};
-        constexpr const char *keys[] = {"min", "mean", "median", "p95", "max"};
-        bool str_value = false;
-        for (size_t n = 0; n < 5; ++n) {
-            job.body.print("\"%s\":", keys[n]);
-            if (std::isfinite(values[n])) { job.body.print("%.10g,", values[n]); str_value |= !present; }
-            else job.body.print("null,");
+    if (!work.totals_written) {
+        HistoricalStr str(session, job);
+        bool str_expected = false;
+        if (job.request.view == View::Day)
+            for (size_t i = 0; i < index_count; ++i)
+                str_expected |= index[i].day == last && (index[i].entry.flags & EdfCatalog::ENTRY_STR_READY);
+        if (str_expected && !str.load(last)) {
+            if (aborted(&job, session)) return false;
+            str.present = false;
+            partial = true;
+            note_issue(job, "str_read", "/STR.edf");
+            job.accepted_issue.capture(job);
         }
-        job.body.print("\"source\":\"%s\"}", present ? "edf" : str_value ? "str" : "");
+        job.body.print("],\"present\":%s,\"partial\":%s,\"used_seconds\":",
+                       sessions || str.present ? "true" : "false", partial ? "true" : "false");
+        if (usage_known && seconds > 0) job.body.print("%.10g", seconds);
+        else job.body.print("null");
+        job.body.print(",\"rdi\":");
+        if (seconds > 0 && events_known) job.body.print("%.10g", (counts[0] + counts[1] + counts[2] + counts[3] + counts[4]) * 3600.0 / seconds);
+        else job.body.print("null");
+        job.body.print(",\"csr_seconds\":");
+        if (csr_known && seconds > 0) job.body.print("%.10g", csr_seconds);
+        else job.body.print("null");
+        job.body.print(",\"leak_threshold\":%.10g,\"leak_high_seconds\":", LEAK_THRESHOLD);
+        if (!aggregate.incompatible[3] && aggregate.coverage[3] > 0) job.body.print("%.10g", leak_high_seconds);
+        else job.body.print("null");
+        job.body.print(",\"session_count\":%u,\"ahi\":", sessions);
+        if (seconds > 0 && events_known) job.body.print("%.10g", (counts[0] + counts[1] + counts[2] + counts[3]) * 3600.0 / seconds);
+        else job.body.print("null");
+        job.body.print(",\"events_known\":%s,", events_known && seconds > 0 ? "true" : "false");
+        if (events_known && seconds > 0) job.body.print("\"counts\":{\"oa\":%llu,\"ca\":%llu,\"ua\":%llu,\"h\":%llu,\"rera\":%llu},",
+                       static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]),
+                       static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]),
+                       static_cast<unsigned long long>(counts[4]));
+        else job.body.print("\"counts\":{\"oa\":null,\"ca\":null,\"ua\":null,\"h\":null,\"rera\":null},");
+        job.body.print("\"channels\":[");
+        for (size_t c = 0; c < CHANNEL_COUNT; ++c) {
+            ReportEdf::Statistics stats;
+            const bool present = !aggregate.incompatible[c] && aggregate.channels[c].bins &&
+                ReportEdf::summarize(aggregate.channels[c], stats) && stats.present;
+            job.body.print("%s{\"id\":\"%s\",\"label\":\"%s\",\"unit\":\"%s\",\"count\":%llu,",
+                           c ? "," : "", CHANNELS[c].id, CHANNELS[c].label, CHANNELS[c].unit,
+                           static_cast<unsigned long long>(present ? stats.count : 0));
+            job.body.print("\"coverage_seconds\":%.10g,", present ? aggregate.coverage[c] : 0);
+            const double values[] = {present ? stats.min : NAN, present ? stats.mean : NAN,
+                present ? stats.median : str.statistic(c, "50"),
+                present ? stats.p95 : str.statistic(c, "95"), present ? stats.max : str.statistic(c, "Max")};
+            constexpr const char *keys[] = {"min", "mean", "median", "p95", "max"};
+            bool str_value = false;
+            for (size_t n = 0; n < 5; ++n) {
+                job.body.print("\"%s\":", keys[n]);
+                if (std::isfinite(values[n])) { job.body.print("%.10g,", values[n]); str_value |= !present; }
+                else job.body.print("null,");
+            }
+            job.body.print("\"source\":\"%s\"}", present ? "edf" : str_value ? "str" : "");
+        }
+        job.body.print("]");
+        if (job.request.view == View::Day) str.settings_json(job.body, last);
+        work.totals_written = true;
     }
-    job.body.print("]");
-    if (job.request.view == View::Day) str.settings_json(job.body, last);
     if (job.request.view == View::Day && !history_json(session, job, false)) return false;
     job.body.print("}");
-    return job.body.good();
+    work.complete = job.body.good();
+    return work.complete;
 }
 
 double chart_scale(size_t c, const ReportEdf::Signal &signal) {
@@ -2332,21 +2571,30 @@ bool build_summary_header(const SdStorage::Session &session, const Job &job,
     return true;
 }
 
+struct HistoryWork : ReportWork {
+    static constexpr size_t DAYS = 14;
+    DailyValues days[DAYS];
+    bool cached[DAYS] = {}, complete = true;
+    size_t next = 0;
+    CacheHeader header;
+};
+
 bool history_json(const SdStorage::Session &session, Job &job, bool build) {
-    constexpr size_t DAYS = 14, METRICS = 6;
+    constexpr size_t DAYS = HistoryWork::DAYS, METRICS = 6;
     constexpr size_t channels[] = {0, 3, 6, 4};
     constexpr const char *names[] = {"usage", "ahi", "pressure", "leak", "vt", "mv"};
-    struct Work { DailyValues days[DAYS]; bool cached[DAYS] = {}; CacheHeader header; };
-    void *memory = aircannect::Memory::alloc_large(sizeof(Work), sizeof(Work) <= INTERNAL_WORK);
-    if (!memory) return false;
-    std::unique_ptr<Work, decltype(&aircannect::Memory::free)> work(new (memory) Work, aircannect::Memory::free);
     const uint16_t last = last_day(job.request), first = last > DAYS - 1 ? last - DAYS + 1 : 0;
-    bool complete = true;
-    for (size_t d = 0; d < DAYS; ++d) {
-        work->cached[d] = cached_day(first + d, work->days[d], build);
-        complete &= work->days[d].ready;
+    if (!job.history) {
+        job.history.reset(new (std::nothrow) HistoryWork);
+        if (!job.history) return false;
+        for (size_t d = 0; d < DAYS; ++d) {
+            job.history->cached[d] = cached_day(first + d, job.history->days[d], build);
+            job.history->complete &= job.history->days[d].ready;
+        }
     }
-    for (size_t i = 0; i < index_count; ++i) {
+    auto &work = job.history;
+    auto &complete = work->complete;
+    for (size_t &i = work->next; i < index_count; ++i) {
         const auto &entry = index[i];
         if (!selected(entry, first, last) || entry.day - first >= DAYS) continue;
         if (work->cached[entry.day - first]) continue;
@@ -2356,6 +2604,8 @@ bool history_json(const SdStorage::Session &session, Job &job, bool build) {
         auto &header = work->header;
         if (!cached_summary_header(session, entry, header) &&
             (!build || !build_summary_header(session, job, entry, header))) {
+            if (aborted(&job, session)) return false;
+            job.accepted_issue.capture(job);
             day.ready = complete = false;
             continue;
         }
@@ -2368,7 +2618,7 @@ bool history_json(const SdStorage::Session &session, Job &job, bool build) {
             day.sum[c] += header.channels[channels[c]].sum;
         }
     }
-    if (aborted(&job, session)) return false;
+    if (aborted(&job, session, false)) return false;
     for (size_t d = 0; d < DAYS; ++d)
         if (!work->cached[d]) remember_day(first + d, work->days[d]);
     job.body.print(",\"history\":{\"first_day\":%u,\"last_day\":%u,\"complete\":%s,\"metrics\":[",
@@ -2395,12 +2645,14 @@ bool history_json(const SdStorage::Session &session, Job &job, bool build) {
         job.body.print("]}");
     }
     job.body.print("]}");
+    job.history.reset();
     return job.body.good();
 }
 
 bool window_events(const SdStorage::Session &session, const Job &job,
                    const IndexedSession &entry, const CacheHeader &header,
-                   int64_t from, int64_t to, Payload &out, bool &comma, bool &truncated) {
+                   int64_t from, int64_t to, Payload &out, bool &comma, bool &truncated,
+                   uint32_t &next, CsrPairing &csr) {
     if (truncated) return true;
     auto append = [&](const Event &event, const char *type = nullptr) {
         const bool intersects = type ?
@@ -2415,7 +2667,6 @@ bool window_events(const SdStorage::Session &session, const Job &job,
     };
     // Pair before viewport filtering, retaining only one pending start per
     // session. A repeated start leaves the preceding boundary unmatched.
-    CsrPairing csr;
     auto consume = [&](const Event &event) {
         csr.consume(event, [&](const Event &value, bool paired) { append(value, paired ? "csr" : nullptr); });
     };
@@ -2423,9 +2674,9 @@ bool window_events(const SdStorage::Session &session, const Job &job,
     cache_path(entry, "stats", path);
     SdStorage::Reader reader;
     if (reader.open(session, path) && reader.size() == header.bytes &&
-        reader.seek(sizeof(header) + total_bins(header) * sizeof(uint64_t))) {
+        reader.seek(sizeof(header) + total_bins(header) * sizeof(uint64_t) + uint64_t(next) * sizeof(Event))) {
         Event block[32];
-        for (uint32_t n = 0; n < header.events;) {
+        for (uint32_t &n = next; n < header.events;) {
             const size_t take = std::min<uint32_t>(32, header.events - n);
             if (aborted(&job, session) || reader.read(reinterpret_cast<uint8_t *>(block),
                 take * sizeof(Event)) != take * sizeof(Event)) return false;
@@ -2437,6 +2688,13 @@ bool window_events(const SdStorage::Session &session, const Job &job,
         return out.good();
     }
     reader.close();
+    // Without a usable cache, replay the small annotation fallback as one
+    // bounded output. The caller never appends it to an earlier partial pass.
+    next = 0;
+    csr = {};
+    comma = false;
+    out.clear();
+    out.print("{\"events\":[");
     // Failed derived-cache persistence is not permission to truncate a late
     // viewport. Read the small annotation sources, never unrelated histograms.
     Input input(session, job);
@@ -2453,6 +2711,15 @@ bool window_events(const SdStorage::Session &session, const Job &job,
     }
     if (csr.active) append(csr.start);
     return out.good();
+}
+
+Job::~Job() = default;
+
+void clear_assembly(Job &job) {
+    job.preparation.reset();
+    job.summary.reset();
+    job.history.reset();
+    job.accepted_issue = {};
 }
 
 void error_body(Job &job, int code, const char *error) {
@@ -3038,7 +3305,7 @@ void defer_job(Job *job) {
 }
 
 bool enqueue_backfill(const SdStorage::Session &session) {
-    if (!backfill_enabled || ExportSync::busy()) return false;
+    if (!backfill_enabled || ExportSync::storage_requested()) return false;
     if (background_retry && int32_t(millis() - background_retry) < 0) return false;
     if (background_retry) { background_retry = 0; backfill_before = UINT16_MAX; backfill_period = 0; }
     const uint32_t current = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
@@ -3103,11 +3370,11 @@ bool work_once() {
     }
     if (!SdStorage::local_access_allowed()) { defer_job(job); publish(State::Blocked, "usb_storage"); return false; }
     if (!SdStorage::mounted()) { defer_job(job); publish(State::Blocked, "no_sd"); return false; }
-    if (job && job->background && ExportSync::busy()) {
+    if (job && job->background && ExportSync::storage_requested()) {
         defer_job(job); publish(State::WaitingStorage, "export_pending"); return false;
     }
     if (!job && !dirty() && !index_commit_pending && !retired_index.bytes && !index_cleanup_pending() && !artifact_cleanup_pending() && published_index_artifacts == status.artifact_revision &&
-        (!backfill_enabled || (!backfill_before && backfill_period >= sizeof(PERIODS) / sizeof(PERIODS[0])) || ExportSync::busy() ||
+        (!backfill_enabled || (!backfill_before && backfill_period >= sizeof(PERIODS) / sizeof(PERIODS[0])) || ExportSync::storage_requested() ||
         (background_retry && int32_t(millis() - background_retry) < 0))) { publish(State::Ready); return false; }
     SdStorage::Session session;
     if (!session.begin()) { defer_job(job); publish(State::WaitingStorage, "storage_busy"); return false; }
@@ -3155,6 +3422,8 @@ bool work_once() {
                 index_error_entry == SIZE_MAX ? -1L : long(index_error_entry));
             reported_index_error = index_error;
             if (job) {
+                job->build.reset();
+                clear_assembly(*job);
                 xSemaphoreTake(mutex, portMAX_DELAY);
                 job->data_revision = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
                 error_body(*job, job->cancelled ? 410 : 503, job->cancelled ? "cancelled" : "index_unavailable");
@@ -3183,17 +3452,17 @@ bool work_once() {
             publish(State::WaitingStorage, "storage_busy");
             return false;
         }
-        const bool checkpoint = index_commit_pending && !ExportSync::busy();
+        const bool checkpoint = index_commit_pending && !ExportSync::storage_requested();
         if (checkpoint && !publish_index(session))
             Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
         const bool more = enqueue_backfill(session);
         // Backfill publishes each day independently. Persist the derived list
         // only when this run finishes or safely pauses, not after every day.
-        if (!more && !checkpoint && !ExportSync::busy() && !publish_index(session))
+        if (!more && !checkpoint && !ExportSync::storage_requested() && !publish_index(session))
             Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
-        const bool cleaning = !more && !ExportSync::busy() && !retired_index.bytes &&
+        const bool cleaning = !more && !ExportSync::storage_requested() && !retired_index.bytes &&
             published_index_artifacts == status.artifact_revision && index_cleanup_pending() && cleanup_indexes(session);
-        const bool collecting = !more && !ExportSync::busy() && !retired_index.bytes && !index_cleanup_pending() &&
+        const bool collecting = !more && !ExportSync::storage_requested() && !retired_index.bytes && !index_cleanup_pending() &&
             published_index_artifacts == status.artifact_revision && artifact_cleanup_pending() && cleanup_artifacts(session);
         session.end();
         publish(State::Ready);
@@ -3201,10 +3470,16 @@ bool work_once() {
     }
     xSemaphoreTake(mutex, portMAX_DELAY);
     job->state = JobState::Running;
-    job->data_revision = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
+    const uint32_t current_data = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
+    if (job->data_revision != current_data) {
+        clear_assembly(*job);
+        if (!recovered_index) job->body.clear();
+    }
+    job->data_revision = current_data;
     job->code = 0;
     job->error = job->issue = nullptr;
     job->issue_path[0] = 0;
+    job->accepted_issue.restore(*job);
     job->storage_yielded = false;
     job->recovered_index = recovered_index;
     job->foreground_epoch = __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
@@ -3214,13 +3489,26 @@ bool work_once() {
     else if (job->request.revision && job->request.revision != job->data_revision)
         error_body(*job, 409, "stale_revision");
     else {
-        if (recovered_index) success = true;
+        bool resumed = true;
+        if (job->build) {
+            const IndexedSession *entry = nullptr;
+            for (size_t i = 0; i < index_count; ++i)
+                if (job->build->matches(index[i], job->build->artifacts)) { entry = &index[i]; break; }
+            if (!entry) job->build.reset();
+            else resumed = build_session(session, *job, *entry, *job->build);
+        }
+        // Resume before repeating day/publication lookups: small recurring SD
+        // grants must advance the source, not be consumed by the same prelude.
+        if (!resumed) success = false;
+        else if (recovered_index) success = true;
         else if (job->request.action == Action::Reindex) success = reindex(session, *job);
         else if (job->request.action == Action::History) {
-            start_json(job->body, revision() + 1, job->data_revision);
-            job->body.print("\"day\":%u", last_day(job->request));
+            if (!job->history) {
+                start_json(job->body, revision() + 1, job->data_revision);
+                job->body.print("\"day\":%u", last_day(job->request));
+            }
             success = history_json(session, *job, true);
-            job->body.print("}");
+            if (success) job->body.print("}");
         } else if (job->request.action == Action::Prepare) success = prepare_json(session, *job);
         else success = job->request.action == Action::Days ? days_json(session, *job) : summary_json(session, *job);
         if (success) job->code = 200;
@@ -3231,8 +3519,8 @@ bool work_once() {
     const bool changed = SdStorage::files_revision() != job->files_revision ||
         job->data_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE) ||
         (!recovered_index && (catalog.generation != catalog_generation || SdStorage::files_revision() != file_revision));
-    const bool yielded = job->storage_yielded || session.yield_requested() ||
-        (job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE));
+    const bool yielded = !success && (job->storage_yielded || session.yield_requested() ||
+        (job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE)));
     if (success && !job->background && job->request.action == Action::Prepare &&
         !interrupted && !changed && !yielded) {
         // Includes post-therapy preparation before export. Failure to checkpoint
@@ -3254,18 +3542,24 @@ bool work_once() {
                 reinterpret_cast<const uint8_t *>(job->issue), strlen(job->issue), refused);
         } else if (!success && (!job->issue || strcmp(job->issue, "recording_headroom"))) background_retry = millis() + 30000;
     }
+    if (job->build) job->build->pause();
     session.end();
     xSemaphoreTake(mutex, portMAX_DELAY);
     if (job->cancelled) error_body(*job, 410, "cancelled");
     else if (interrupted || changed || yielded) {
-        job->body.~Payload();
-        new (&job->body) Payload;
+        if (!job->preparation && !job->summary && !job->history) {
+            job->body.~Payload();
+            new (&job->body) Payload;
+        }
         job->state = JobState::Queued;
+        if (job->consumers) job->background = false;
         job->code = 0;
         xSemaphoreGive(mutex);
         publish(interrupted ? State::Blocked : State::Building, interrupted ? "not_idle" : "");
         return yielded;
     } else if (!success && !job->code) error_body(*job, 503, "report_build_failed");
+    job->build.reset();
+    clear_assembly(*job);
     job->state = JobState::Complete;
     job->completed_ms = millis();
     job->cache_generation = __atomic_load_n(&cache_generation, __ATOMIC_ACQUIRE);

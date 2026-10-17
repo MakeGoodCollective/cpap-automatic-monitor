@@ -71,13 +71,24 @@ Lookup index_candidate(const SdStorage::Session &session, const uint8_t digest[3
 // private binary spool, never source EDF again. No global state or new worker.
 class Producer {
 public:
+    // The token is copied; cancellation context must outlive the producer.
     Producer(const SdStorage::Session &session, bool (*cancelled)(void *), void *context);
     ~Producer();
     Producer(const Producer &) = delete;
     Producer &operator=(const Producer &) = delete;
     bool begin(const char *prefix, const uint8_t fingerprint[32],
                const ReportEdf::Header &header, const Selection *tracks, size_t count);
+    // Close every handle before the owner ends its session. Scratch, digests and
+    // cursors stay in PSRAM; resume borrows a copy of the new session token.
+    void pause();
+    // Clears interruption only, never a permanent producer error.
+    bool resume(const SdStorage::Session &session);
+    uint32_t processed_records() const;
+    // Retry the same record after interruption. Only a complete spool record
+    // advances processed_records() and the source digest.
     bool record(const ReportEdf::Header &header, const uint8_t *data, size_t bytes);
+    // False with error()=="interrupted" is resumable, including inside a tile
+    // or verification pass. Successful finish is idempotent.
     bool finish(Publication &out);
     const char *error() const;
 

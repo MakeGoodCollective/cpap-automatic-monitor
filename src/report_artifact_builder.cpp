@@ -28,6 +28,7 @@ struct Digest {
         mbedtls_sha256_clone(&copy.context, &context);
         return ready && copy.finish(out);
     }
+    void reset() { this->~Digest(); new (this) Digest; }
 };
 
 namespace {
@@ -341,24 +342,54 @@ Lookup index_candidate(const SdStorage::Session &session, const uint8_t digest[3
 }
 
 struct Producer::Work {
-    const SdStorage::Session &session;
+    enum class Phase : uint8_t {
+        Records, Restore, RestoreBytes, RestoreCommit, Header, Tiles, Checkpoint,
+        Seal, VerifyPart, PublishContent, VerifyExisting, RemovePart,
+        Reference, PublishReference, Done
+    };
+    SdStorage::Session session;
     bool (*cancelled)(void *);
     void *context;
     const char *failure = nullptr;
+    bool started = false, published = false, paused = false, interrupted = false;
+    Phase phase = Phase::Records;
+
     Metadata metadata;
     uint16_t signals[MAX_TRACKS] = {};
-    uint32_t offsets[MAX_TRACKS] = {}, stride = 0, records = 0, written_records = 0;
+    uint32_t offsets[MAX_TRACKS] = {}, stride = 0;
     uint8_t key[32] = {};
     char prefix[96] = {}, spool_path[PATH_BYTES] = {}, part_path[PATH_BYTES] = {};
+
     SdStorage::Writer writer;
-    Digest source, content;
+    SdStorage::Reader reader;
+    bool writer_open = false;
+
+    Digest source;
+    uint32_t records = 0, written_records = 0;
+    uint64_t spooled = 0;
+    uint32_t record_channel = 0, record_sample = 0;
+
+    Digest content;
     uint64_t made = 0;
-    bool started = false, finished = false, published = false;
+    size_t channel = 0, level_index = 0;
+    uint32_t first = 0, at = 0, loaded = UINT32_MAX, children = 0;
+    Cell cell;
+    bool base_values = false, tile_started = false;
+
+    uint32_t restored = 0, restore_bytes = 0;
+    uint8_t restore_hash[32] = {};
+    bool restore_tail = false;
+
+    Digest verification;
+    uint32_t verified = 0;
+    Publication publication;
+    // Input cache and the incomplete output tile survive handle closure too.
     uint8_t input[REDUCED_TILE_BYTES], output[MAX_METADATA_BYTES];
 
     Work(const SdStorage::Session &session, bool (*cancelled)(void *), void *context)
         : session(session), cancelled(cancelled), context(context) {}
     ~Work() {
+        reader.close();
         writer.close();
         // Only unpublished scratch paths are removed. A revoked session leaves
         // them for the next explicit attempt, never for a filesystem callback.
@@ -369,19 +400,45 @@ struct Producer::Work {
         if (*prefix && named_path(prefix, "resume.part", scratch))
             session.mutate(scratch, [&](fs::FS &fs) { return !fs.exists(scratch) || fs.remove(scratch); });
     }
-    bool fail(const char *reason) { if (!failure) failure = reason; return false; }
+    bool fail(const char *reason) {
+        if (!session.valid()) interrupted = true;
+        if (!failure && !interrupted) failure = reason;
+        return false;
+    }
     bool active() {
         if (failure) return false;
-        if (!session.valid() || (cancelled && cancelled(context))) return fail("interrupted");
+        if (paused || !session.valid() || session.yield_requested() || (cancelled && cancelled(context))) {
+            interrupted = true;
+            return false;
+        }
         return true;
     }
+    void close() {
+        reader.close();
+        writer.close();
+        writer_open = false;
+    }
+    bool output_file(const char *path, uint64_t complete) {
+        if (writer_open) return true;
+        writer_open = writer.open(session, path, complete, complete != 0);
+        return writer_open;
+    }
     bool append(const uint8_t *bytes, size_t length) {
-        if (!active() || !writer.write(bytes, length) || !content.add(bytes, length)) return fail("artifact_write");
+        if (!active()) return false;
+        if (!output_file(part_path, made) || !writer.write(bytes, length)) {
+            writer.close(); writer_open = false;
+            return fail("artifact_write");
+        }
+        if (!content.add(bytes, length)) return fail("artifact_digest");
         made += length;
         return true;
     }
     bool checkpoint() {
-        if (!active() || !writer.finish(made)) return fail("checkpoint_flush");
+        if (!active()) return false;
+        if (!output_file(part_path, made)) return fail("checkpoint_open");
+        const bool flushed = writer.finish(made);
+        writer_open = false;
+        if (!flushed) return fail("checkpoint_flush");
         uint8_t bytes[48] = {};
         memcpy(bytes, "ABCHK001", 8);
         SdStorage::put_le32(bytes + 8, made);
@@ -389,18 +446,27 @@ struct Producer::Work {
         char path[PATH_BYTES];
         Document document;
         if (!named_path(prefix, "checkpoint", path) ||
-            !document_publish(session, path, metadata.source, bytes, sizeof(bytes), document) ||
-            !writer.open(session, part_path, made)) return fail("checkpoint_write");
+            !document_publish(session, path, metadata.source, bytes, sizeof(bytes), document)) return fail("checkpoint_write");
         return true;
     }
+    void fresh() {
+        close();
+        content.reset();
+        made = 0;
+        phase = Phase::Header;
+    }
     bool restore() {
-        char path[PATH_BYTES], scratch[PATH_BYTES];
+        char path[PATH_BYTES];
         Document document;
         aircannect::LargeTextBuffer saved(128, 128);
         if (!named_path(prefix, "checkpoint", path) ||
             document_lookup(session, path, metadata.source, document) != Lookup::Ready ||
             !document_read(session, path, document, saved, metadata.source) || saved.length() != 48 ||
-            memcmp(saved.c_str(), "ABCHK001", 8)) return false;
+            memcmp(saved.c_str(), "ABCHK001", 8)) {
+            if (!session.valid()) return fail("interrupted");
+            fresh();
+            return true;
+        }
         const auto *bytes = reinterpret_cast<const uint8_t *>(saved.c_str());
         const uint32_t complete = SdStorage::get_le32(bytes + 8);
         bool boundary = complete == metadata.header_bytes;
@@ -409,115 +475,218 @@ struct Producer::Work {
                 const auto &level = metadata.tracks[c].levels[l];
                 boundary |= complete == level.offset + level.bytes;
             }
-        SdStorage::Reader reader;
-        if (!boundary || complete > metadata.bytes || !reader.open(session, part_path) || reader.size() < complete) return false;
-        const bool tail = reader.size() != complete;
-        if (tail && (!named_path(prefix, "resume.part", scratch) || !writer.open(session, scratch))) return false;
-        for (uint32_t at = 0; at < complete;) {
-            const size_t take = std::min(sizeof(input), size_t(complete - at));
-            if (!active() || reader.read(input, take) != take || !content.add(input, take) ||
-                (tail && !writer.write(input, take))) return false;
-            at += take;
+        if (!boundary || complete > metadata.bytes || !reader.open(session, part_path) || reader.size() < complete) {
+            if (!session.valid()) return fail("interrupted");
+            fresh();
+            return true;
+        }
+        restore_tail = reader.size() != complete;
+        restore_bytes = complete;
+        memcpy(restore_hash, bytes + 16, 32);
+        phase = Phase::RestoreBytes;
+        return true;
+    }
+    bool restore_step() {
+        char scratch[PATH_BYTES];
+        if (!reader && !reader.open(session, part_path)) return fail("checkpoint_open");
+        if (restore_tail && (!named_path(prefix, "resume.part", scratch) ||
+            !output_file(scratch, restored))) return fail("checkpoint_open");
+        while (restored < restore_bytes) {
+            if (!active()) return false;
+            const size_t take = std::min(sizeof(input), size_t(restore_bytes - restored));
+            if (!exact_read(reader, restored, input, take)) {
+                if (!session.valid()) return fail("interrupted");
+                fresh();
+                return true;
+            }
+            if (restore_tail && !writer.write(input, take)) {
+                writer.close(); writer_open = false;
+                return fail("checkpoint_write");
+            }
+            if (!content.add(input, take)) return fail("checkpoint_digest");
+            restored += take;
         }
         uint8_t hash[32];
-        if (!content.snapshot(hash) || memcmp(hash, bytes + 16, 32)) return false;
+        if (!content.snapshot(hash) || memcmp(hash, restore_hash, 32)) {
+            fresh();
+            return true;
+        }
         reader.close();
-        if (tail && (!writer.finish(complete) || !session.mutate(scratch, part_path, [&](fs::FS &fs) {
-            return fs.remove(part_path) && fs.rename(scratch, part_path);
-        }))) return false;
-        made = complete;
-        return writer.open(session, part_path, made);
+        phase = Phase::RestoreCommit;
+        return true;
     }
-    bool base(SdStorage::Reader &spool, size_t c) {
-        const auto &track = metadata.tracks[c];
+    bool restore_commit() {
+        if (restore_tail) {
+            char scratch[PATH_BYTES];
+            if (!named_path(prefix, "resume.part", scratch) || !output_file(scratch, restored)) return fail("checkpoint_open");
+            const bool flushed = writer.finish(restored);
+            writer_open = false;
+            if (!flushed) return fail("checkpoint_flush");
+            bool moved = false;
+            session.mutate(scratch, part_path, [&](fs::FS &fs) {
+                moved = (!fs.exists(part_path) || fs.remove(part_path)) && fs.rename(scratch, part_path);
+                return moved;
+            });
+            if (!moved) return fail("checkpoint_restore");
+        }
+        made = restored;
+        phase = Phase::Tiles;
+        return true;
+    }
+    bool base() {
+        const auto &track = metadata.tracks[channel];
         const auto &level = track.levels[0];
-        if (made != level.offset) return fail("artifact_layout");
-        for (uint32_t first = 0; first < track.count; first += TILE_SAMPLES) {
+        if (made != level.offset + uint64_t(first / TILE_SAMPLES) * RAW_TILE_BYTES) return fail("artifact_layout");
+        if (!reader && (!reader.open(session, spool_path) || reader.size() != spooled)) return fail("spool_open");
+        const uint32_t end = first + std::min<uint32_t>(TILE_SAMPLES, track.count - first);
+        while (at < end) {
             if (!active()) return false;
-            memset(output, 0, RAW_TILE_BYTES);
-            const uint32_t end = std::min<uint32_t>(track.count, first + TILE_SAMPLES);
-            for (uint32_t at = first; at < end;) {
-                const uint32_t record = at / track.samples_per_record, slot = at % track.samples_per_record;
-                const uint32_t take = std::min(end - at, track.samples_per_record - slot);
-                const uint64_t begin = uint64_t(record) * stride + offsets[c];
-                const size_t mask_begin = slot / 8, mask_bytes = (slot + take + 7) / 8 - mask_begin;
-                if (!exact_read(spool, begin + slot * 2, input, take * 2) ||
-                    !exact_read(spool, begin + track.samples_per_record * 2 + mask_begin,
-                                input + TILE_SAMPLES * 2, mask_bytes)) return fail("spool_read");
-                for (uint32_t n = 0; n < take; ++n) {
-                    const uint32_t bit = slot + n - mask_begin * 8;
-                    const bool valid = (input[TILE_SAMPLES * 2 + bit / 8] >> (bit % 8)) & 1;
-                    put_raw(output, at + n - first, int16_t(SdStorage::get_le16(input + n * 2)), valid);
-                }
-                at += take;
+            const uint32_t record = at / track.samples_per_record, slot = at % track.samples_per_record;
+            const uint32_t take = std::min(end - at, track.samples_per_record - slot);
+            const uint64_t begin = uint64_t(record) * stride + offsets[channel];
+            const size_t mask_begin = slot / 8, mask_bytes = (slot + take + 7) / 8 - mask_begin;
+            if (!base_values) {
+                if (!exact_read(reader, begin + slot * 2, input, take * 2)) return fail("spool_read");
+                base_values = true;
             }
-            if (!append(output, RAW_TILE_BYTES)) return false;
-        }
-        return true;
-    }
-    bool reduce(size_t c, size_t l) {
-        const auto &track = metadata.tracks[c];
-        const auto &previous = track.levels[l - 1], &level = track.levels[l];
-        if (made != level.offset || !writer.flush(made)) return fail("artifact_flush");
-        SdStorage::Reader reader;
-        if (!reader.open(session, part_path)) return fail("artifact_open");
-        const size_t input_bytes = l == 1 ? RAW_TILE_BYTES : REDUCED_TILE_BYTES;
-        uint32_t loaded = UINT32_MAX;
-        for (uint32_t first = 0; first < level.count; first += TILE_SAMPLES) {
             if (!active()) return false;
-            memset(output, 0, REDUCED_TILE_BYTES);
-            const uint32_t end = std::min<uint32_t>(level.count, first + TILE_SAMPLES);
-            for (uint32_t at = first; at < end; ++at) {
-                Cell cell;
-                for (uint32_t p = at * 4; p < std::min(previous.count, at * 4 + 4); ++p) {
-                    const uint32_t tile = p / TILE_SAMPLES;
-                    if (loaded != tile) {
-                        if (!exact_read(reader, previous.offset + uint64_t(tile) * input_bytes,
-                                        input, input_bytes)) return fail("artifact_read");
-                        loaded = tile;
-                    }
-                    const Cell next = l == 1 ? raw_cell(input, p % TILE_SAMPLES) : get_cell(input, p % TILE_SAMPLES);
-                    if (next.valid > expected(track, previous, p) || !merge(cell, next)) return fail("artifact_cell");
-                }
-                put_cell(output, at - first, cell);
+            if (!exact_read(reader, begin + track.samples_per_record * 2 + mask_begin,
+                            input + TILE_SAMPLES * 2, mask_bytes)) return fail("spool_read");
+            for (uint32_t n = 0; n < take; ++n) {
+                const uint32_t bit = slot + n - mask_begin * 8;
+                const bool valid = (input[TILE_SAMPLES * 2 + bit / 8] >> (bit % 8)) & 1;
+                put_raw(output, at + n - first, int16_t(SdStorage::get_le16(input + n * 2)), valid);
             }
-            if (!append(output, REDUCED_TILE_BYTES)) return false;
-        }
-        return true;
-    }
-    bool verify(const char *path, const Publication &publication) {
-        SdStorage::Reader reader;
-        if (!reader.open(session, path) || reader.size() != publication.bytes) return fail("artifact_length");
-        Digest digest;
-        for (uint64_t at = 0; at < reader.size();) {
-            const size_t take = std::min<uint64_t>(sizeof(input), reader.size() - at);
-            if (!active() || reader.read(input, take) != take || !digest.add(input, take)) return fail("artifact_verify");
             at += take;
+            base_values = false;
+        }
+        return append(output, RAW_TILE_BYTES);
+    }
+    bool reduce() {
+        const auto &track = metadata.tracks[channel];
+        const auto &previous = track.levels[level_index - 1], &level = track.levels[level_index];
+        if (made != level.offset + uint64_t(first / TILE_SAMPLES) * REDUCED_TILE_BYTES) return fail("artifact_layout");
+        if (!reader) {
+            if (!output_file(part_path, made) || !writer.flush(made)) return fail("artifact_flush");
+            if (!reader.open(session, part_path)) return fail("artifact_open");
+        }
+        const size_t input_bytes = level_index == 1 ? RAW_TILE_BYTES : REDUCED_TILE_BYTES;
+        const uint32_t end = first + std::min<uint32_t>(TILE_SAMPLES, level.count - first);
+        while (at < end) {
+            if (!active()) return false;
+            const uint64_t begin = uint64_t(at) * 4;
+            const uint32_t count = std::min<uint64_t>(4, previous.count - begin);
+            while (children < count) {
+                const uint32_t p = begin + children, tile = p / TILE_SAMPLES;
+                if (loaded != tile) {
+                    if (!active()) return false;
+                    if (!exact_read(reader, previous.offset + uint64_t(tile) * input_bytes,
+                                    input, input_bytes)) return fail("artifact_read");
+                    loaded = tile;
+                }
+                const Cell next = level_index == 1 ? raw_cell(input, p % TILE_SAMPLES) : get_cell(input, p % TILE_SAMPLES);
+                if (next.valid > expected(track, previous, p) || !merge(cell, next)) return fail("artifact_cell");
+                ++children;
+            }
+            put_cell(output, at - first, cell);
+            ++at;
+            children = 0;
+            cell = {};
+        }
+        return append(output, REDUCED_TILE_BYTES);
+    }
+    bool tiles() {
+        while (channel < metadata.track_count) {
+            const auto &track = metadata.tracks[channel];
+            if (level_index == track.level_count) {
+                ++channel; level_index = 0;
+                continue;
+            }
+            const auto &level = track.levels[level_index];
+            if (made >= uint64_t(level.offset) + level.bytes) {
+                ++level_index;
+                continue;
+            }
+            if (!tile_started) {
+                memset(output, 0, level_index ? REDUCED_TILE_BYTES : RAW_TILE_BYTES);
+                at = first;
+                tile_started = true;
+            }
+            if (!(level_index ? reduce() : base())) return false;
+            first = at;
+            tile_started = false;
+            if (first == level.count) {
+                reader.close();
+                first = at = 0;
+                loaded = UINT32_MAX;
+                phase = Phase::Checkpoint;
+                return true;
+            }
+        }
+        phase = Phase::Seal;
+        return true;
+    }
+    bool verify(const char *path) {
+        if (!reader && (!reader.open(session, path) || reader.size() != publication.bytes)) return fail("artifact_length");
+        while (verified < publication.bytes) {
+            if (!active()) return false;
+            const size_t take = std::min(sizeof(input), size_t(publication.bytes - verified));
+            if (!exact_read(reader, verified, input, take) || !verification.add(input, take)) return fail("artifact_verify");
+            verified += take;
         }
         uint8_t value[32];
-        return (digest.finish(value) && !memcmp(value, publication.digest, 32)) || fail("artifact_digest");
+        if (!verification.snapshot(value) || memcmp(value, publication.digest, 32)) return fail("artifact_digest");
+        reader.close();
+        return true;
     }
-    bool publish(const Publication &publication) {
+    bool publish() {
         char final[PATH_BYTES], reference[PATH_BYTES];
         if (!content_path(prefix, publication.digest, final) || !reference_path(prefix, key, reference)) return fail("artifact_path");
         bool exists = false;
-        if (!session.run([&](fs::FS &fs) { exists = fs.exists(final); return true; })) return fail("artifact_stat");
-        if (exists) {
-            if (!verify(final, publication)) return false;
-            if (!session.mutate(part_path, [&](fs::FS &fs) { return fs.remove(part_path); })) return fail("artifact_remove_part");
-        } else if (!session.mutate(part_path, final, [&](fs::FS &fs) { return fs.rename(part_path, final); })) return fail("artifact_publish");
+        if (phase == Phase::PublishContent) {
+            if (!session.run([&](fs::FS &fs) { exists = fs.exists(final); return true; })) return fail("artifact_stat");
+            if (exists) {
+                verification.reset(); verified = 0;
+                phase = Phase::VerifyExisting;
+            } else {
+                bool moved = false;
+                session.mutate(part_path, final, [&](fs::FS &fs) { moved = fs.rename(part_path, final); return moved; });
+                if (!moved) return fail("artifact_publish");
+                phase = Phase::Reference;
+            }
+            return true;
+        }
+        if (phase == Phase::VerifyExisting) {
+            if (!verify(final)) return false;
+            phase = Phase::RemovePart;
+            return true;
+        }
+        if (phase == Phase::RemovePart) {
+            if (!session.mutate(part_path, [&](fs::FS &fs) { return !fs.exists(part_path) || fs.remove(part_path); })) return fail("artifact_remove_part");
+            phase = Phase::Reference;
+            return true;
+        }
         uint8_t ref[REFERENCE_BYTES];
         reference_bytes(key, publication, ref);
-        if (!writer.open(session, part_path) || !writer.write(ref, sizeof(ref)) || !writer.finish(sizeof(ref))) return fail("reference_write");
+        if (phase == Phase::Reference) {
+            if (!writer.open(session, part_path) || !writer.write(ref, sizeof(ref)) || !writer.finish(sizeof(ref))) return fail("reference_write");
+            phase = Phase::PublishReference;
+            return true;
+        }
         // Publish the reference last, without unlinking any old valid generation.
         if (!session.run([&](fs::FS &fs) { exists = fs.exists(reference); return true; })) return fail("reference_stat");
         if (exists) {
-            SdStorage::Reader reader;
             if (!reader.open(session, reference) || reader.size() != sizeof(ref) ||
                 !exact_read(reader, 0, input, sizeof(ref)) || memcmp(input, ref, sizeof(ref))) return fail("reference_conflict");
-            return true;
+            reader.close();
+        } else {
+            bool moved = false;
+            session.mutate(part_path, reference, [&](fs::FS &fs) { moved = fs.rename(part_path, reference); return moved; });
+            if (!moved) return fail("reference_publish");
         }
-        return session.mutate(part_path, reference, [&](fs::FS &fs) { return fs.rename(part_path, reference); }) || fail("reference_publish");
+        published = true;
+        phase = Phase::Done;
+        return true;
     }
 };
 
@@ -529,7 +698,28 @@ Producer::~Producer() {
     if (work_) work_->~Work();
     aircannect::Memory::free(work_);
 }
-const char *Producer::error() const { return work_ ? work_->failure : "artifact_alloc"; }
+const char *Producer::error() const {
+    return !work_ ? "artifact_alloc" : work_->failure ? work_->failure : work_->interrupted ? "interrupted" : nullptr;
+}
+
+void Producer::pause() {
+    if (!work_) return;
+    work_->close();
+    work_->paused = true;
+    work_->interrupted = true;
+}
+
+bool Producer::resume(const SdStorage::Session &session) {
+    if (!work_ || work_->failure) return false;
+    auto &w = *work_;
+    w.close();
+    w.session = session;
+    w.paused = false;
+    w.interrupted = false;
+    return w.active();
+}
+
+uint32_t Producer::processed_records() const { return work_ ? work_->written_records : 0; }
 
 bool Producer::begin(const char *prefix, const uint8_t key[32], const ReportEdf::Header &header,
                      const Selection *tracks, size_t count) {
@@ -584,64 +774,112 @@ bool Producer::begin(const char *prefix, const uint8_t key[32], const ReportEdf:
             (fs.exists("/airbridge/report") || fs.mkdir("/airbridge/report")) &&
             (fs.exists(directory) || fs.mkdir(directory));
     }) || !w.writer.open(w.session, w.spool_path)) return w.fail("spool_open");
+    w.writer_open = true;
     return true;
 }
 
 bool Producer::record(const ReportEdf::Header &header, const uint8_t *data, size_t bytes) {
     if (!work_ || !work_->active()) return false;
     auto &w = *work_;
-    if (!w.started || w.finished || !data || w.written_records >= w.records ||
-        bytes != header.record_bytes || !w.source.add(data, bytes)) return w.fail("artifact_record");
-    for (size_t c = 0; c < w.metadata.track_count; ++c) {
+    if (!w.started || w.phase != Work::Phase::Records || !data || w.written_records >= w.records ||
+        bytes != header.record_bytes) return w.fail("artifact_record");
+    if (!w.output_file(w.spool_path, w.spooled)) return w.fail("spool_open");
+    for (; w.record_channel < w.metadata.track_count; ++w.record_channel) {
         ReportEdf::RecordSamples samples;
-        if (!ReportEdf::record_samples(header, data, bytes, w.signals[c], samples)) return w.fail("artifact_record");
+        if (!ReportEdf::record_samples(header, data, bytes, w.signals[w.record_channel], samples)) return w.fail("artifact_record");
         const size_t count = samples.signal->samples_per_record;
-        for (size_t at = 0; at < count;) {
-            const size_t take = std::min(count - at, sizeof(w.input) / 2);
-            for (size_t n = 0; n < take; ++n) SdStorage::put_le16(w.input + n * 2, uint16_t(samples[at + n].raw));
-            if (!w.writer.write(w.input, take * 2)) return w.fail("spool_write");
-            at += take;
-        }
         const size_t mask = (count + 7) / 8;
         if (mask > sizeof(w.input)) return w.fail("artifact_record_size");
+        while (w.record_sample < count) {
+            if (!w.active()) return false;
+            const size_t take = std::min<size_t>(count - w.record_sample, sizeof(w.input) / 2);
+            for (size_t n = 0; n < take; ++n)
+                SdStorage::put_le16(w.input + n * 2, uint16_t(samples[w.record_sample + n].raw));
+            if (!w.writer.write(w.input, take * 2)) {
+                w.writer.close(); w.writer_open = false;
+                return w.fail("spool_write");
+            }
+            w.spooled += take * 2;
+            w.record_sample += take;
+        }
+        if (!w.active()) return false;
         memset(w.input, 0, mask);
         for (size_t n = 0; n < count; ++n) if (samples[n].valid) w.input[n / 8] |= 1u << (n % 8);
-        if (!w.writer.write(w.input, mask)) return w.fail("spool_write");
+        if (!w.writer.write(w.input, mask)) {
+            w.writer.close(); w.writer_open = false;
+            return w.fail("spool_write");
+        }
+        w.spooled += mask;
+        w.record_sample = 0;
     }
+    if (!w.source.add(data, bytes)) return w.fail("artifact_digest");
     ++w.written_records;
+    w.record_channel = 0;
     return true;
 }
 
 bool Producer::finish(Publication &out) {
-    if (!work_ || !work_->active()) return false;
+    if (!work_) return false;
     auto &w = *work_;
-    if (!w.started || w.finished) return w.fail("artifact_state");
-    w.finished = true;
-    if (w.written_records != w.records || !w.writer.finish(uint64_t(w.records) * w.stride) ||
-        !w.source.finish(w.metadata.source)) return w.fail("spool_finish");
-    SdStorage::Reader spool;
-    if (!spool.open(w.session, w.spool_path) || !encode(w.metadata, w.output, sizeof(w.output))) return w.fail("artifact_open");
-    if (!w.restore()) {
+    if (!w.started) return w.fail("artifact_state");
+    while (w.phase != Work::Phase::Done) {
         if (!w.active()) return false;
-        w.writer.close(); w.content.~Digest(); new (&w.content) Digest;
-        w.made = 0;
-        if (!w.writer.open(w.session, w.part_path) || !w.append(w.output, w.metadata.header_bytes) ||
-            !w.checkpoint()) return w.fail("artifact_open");
-    }
-    for (size_t c = 0; c < w.metadata.track_count; ++c) {
-        const auto &track = w.metadata.tracks[c];
-        for (size_t l = 0; l < track.level_count; ++l) {
-            const auto &level = track.levels[l];
-            if (w.made >= level.offset + level.bytes) continue;
-            if (!(l ? w.reduce(c, l) : w.base(spool, c)) || !w.checkpoint()) return false;
+        switch (w.phase) {
+        case Work::Phase::Records: {
+            if (w.written_records != w.records || !w.output_file(w.spool_path, w.spooled)) return w.fail("spool_finish");
+            const bool flushed = w.writer.finish(w.spooled);
+            w.writer_open = false;
+            if (!flushed || !w.source.snapshot(w.metadata.source)) return w.fail("spool_finish");
+            w.phase = Work::Phase::Restore;
+            break;
+        }
+        case Work::Phase::Restore:
+            if (!w.restore()) return false;
+            break;
+        case Work::Phase::RestoreBytes:
+            if (!w.restore_step()) return false;
+            break;
+        case Work::Phase::RestoreCommit:
+            if (!w.restore_commit()) return false;
+            break;
+        case Work::Phase::Header:
+            if (!w.made) {
+                // A rejected checkpoint may leave an arbitrary private tail.
+                if (!encode(w.metadata, w.output, sizeof(w.output))) return w.fail("artifact_layout");
+                if (!w.append(w.output, w.metadata.header_bytes)) return false;
+            }
+            if (!w.checkpoint()) return false;
+            w.phase = Work::Phase::Tiles;
+            break;
+        case Work::Phase::Tiles:
+            if (!w.tiles()) return false;
+            break;
+        case Work::Phase::Checkpoint:
+            if (!w.checkpoint()) return false;
+            ++w.level_index;
+            w.phase = Work::Phase::Tiles;
+            break;
+        case Work::Phase::Seal: {
+            if (w.made != w.metadata.bytes || !w.output_file(w.part_path, w.made)) return w.fail("artifact_finish");
+            const bool flushed = w.writer.finish(w.made);
+            w.writer_open = false;
+            if (!flushed || !w.content.snapshot(w.publication.digest)) return w.fail("artifact_finish");
+            w.publication.bytes = w.metadata.bytes;
+            memcpy(w.publication.source, w.metadata.source, 32);
+            w.phase = Work::Phase::VerifyPart;
+            break;
+        }
+        case Work::Phase::VerifyPart:
+            if (!w.verify(w.part_path)) return false;
+            w.phase = Work::Phase::PublishContent;
+            break;
+        default:
+            if (!w.publish()) return false;
+            break;
         }
     }
-    spool.close();
-    if (w.made != w.metadata.bytes || !w.writer.finish(w.made) || !w.content.finish(out.digest)) return w.fail("artifact_finish");
-    out.bytes = w.metadata.bytes;
-    memcpy(out.source, w.metadata.source, 32);
-    w.published = w.verify(w.part_path, out) && w.publish(out);
-    return w.published;
+    out = w.publication;
+    return true;
 }
 
 }  // namespace ReportArtifact

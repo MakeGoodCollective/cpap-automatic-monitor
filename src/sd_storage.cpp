@@ -9,6 +9,8 @@
 #include "usb_storage.h"
 
 #if AB_STORAGE_HAS_SDCARD
+#include <limits>
+#include <unistd.h>
 #include <SD_MMC.h>
 #include <FS.h>
 #include <freertos/queue.h>
@@ -1041,14 +1043,41 @@ void Reader::close() {
     size_ = offset_ = 0;
 }
 
-bool Writer::open(const Session &session, const char *path, uint64_t append_at) {
+bool Writer::open(const Session &session, const char *path, uint64_t append_at,
+                  bool truncate_tail) {
     close();
 #if AB_STORAGE_HAS_SDCARD
     if (!path || strlen(path) >= sizeof(writer_path) || append_at > UINT32_MAX ||
+        (truncate_tail && path[0] != '/') ||
         !session.mutate(path, [&](fs::FS &fs) {
         if (writer.id) return false;
-        fs::File file = fs.open(path, append_at ? FILE_APPEND : FILE_WRITE);
-        if (!file || file.isDirectory() || (append_at && file.size() != append_at)) return false;
+
+        if (truncate_tail) {
+            fs::File prefix = fs.open(path, FILE_READ);
+            if (!prefix || prefix.isDirectory() || prefix.size() < append_at) {
+                prefix.close();
+                return false;
+            }
+            const bool has_tail = prefix.size() > append_at;
+            prefix.close();
+            if (has_tail) {
+                // Arduino File has no truncate API; use the mounted FAT VFS
+                // only here on the executor, after rejecting short files.
+                const char *mount = fs.mountpoint();
+                char native_path[sizeof(writer_path) + 32];
+                if (!mount || !*mount ||
+                    append_at > uint64_t(std::numeric_limits<off_t>::max())) return false;
+                const int length = snprintf(native_path, sizeof(native_path), "%s%s", mount, path);
+                if (length < 0 || size_t(length) >= sizeof(native_path) ||
+                    ::truncate(native_path, static_cast<off_t>(append_at)) != 0) return false;
+            }
+        }
+
+        fs::File file = fs.open(path, append_at || truncate_tail ? FILE_APPEND : FILE_WRITE);
+        if (!file || file.isDirectory() || ((append_at || truncate_tail) && file.size() != append_at)) {
+            file.close();
+            return false;
+        }
         handle_ = retain_file(writer, file, session.generation_);
         strcpy(writer_path, path);
         return true;

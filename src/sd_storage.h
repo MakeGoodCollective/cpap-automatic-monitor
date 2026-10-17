@@ -183,7 +183,11 @@ public:
     Writer(const Writer &) = delete;
     Writer &operator=(const Writer &) = delete;
     // Nonzero append_at resumes a private build only at its exact flushed size.
-    bool open(const Session &session, const char *path, uint64_t append_at = 0);
+    // truncate_tail opts a caller-owned private scratch path into discarding an
+    // uncommitted tail, even at zero. Missing/short files fail without extension.
+    // append_at must fit UINT32_MAX, and off_t when a tail needs truncating.
+    bool open(const Session &session, const char *path, uint64_t append_at = 0,
+              bool truncate_tail = false);
     bool write(const uint8_t *data, size_t length);
     // Make the completed prefix readable without closing the sequential writer.
     // Only private, unpublished build files may be read while still growing.
