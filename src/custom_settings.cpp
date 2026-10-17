@@ -5,12 +5,15 @@
 #include "qframe.h"
 #include "uart_arbiter.h"
 #include "clinical_jobs.h"
+#include "airsense_state.h"
 #include "memory_manager.h"
 #include "hex_util.h"
 
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <freertos/event_groups.h>
+#include <atomic>
 #include <string.h>
 
 namespace CustomSettings {
@@ -75,6 +78,8 @@ struct Metadata {
 
 namespace {
 SemaphoreHandle_t cache_mutex = nullptr;
+EventGroupHandle_t cache_events = nullptr;
+constexpr EventBits_t CACHE_CHANGED = 1;
 cache_state_t cache_state = CACHE_UNKNOWN;
 Metadata metadata_slots[2];
 Metadata *current = &metadata_slots[0];
@@ -82,7 +87,19 @@ uint32_t retry_at_ms = 0;
 uint32_t cached_language = 0;
 bool language_known = false;
 uint32_t invalidation_generation = 1;
-uint32_t loaded_generation = 0;
+std::atomic<uint32_t> loaded_generation{0};
+
+enum class DiscoveryStep : uint8_t {
+    None, Language, Header, Entry, Capabilities, EnumValue, EnumCount,
+    EnumScan, EnumOption,
+};
+DiscoveryStep discovery_step = DiscoveryStep::None;
+uart_transaction_t *discovery_ticket = nullptr;
+uint16_t entry_index = 0;
+uint8_t registry_version = 0, option_index = 0, option_count = 0;
+bool ticket_background = false;
+uint16_t foreground_waiters = 0;
+uint32_t foreground_until_ms = 0;
 
 void clear_allocations(Metadata &data) {
     aircannect::Memory::free(data.entries);
@@ -193,183 +210,19 @@ bool add_enum_option_locked(cached_entry_t &entry, uint8_t value,
     return true;
 }
 
-query_result_t query_enum_option(const char *name, uint8_t index,
-                                 char *response, uint16_t response_size,
-                                 CustomSettingsProtocol::enum_option_t &option,
-                                 const char *&error_value) {
-    char command[24];
-    snprintf(command, sizeof(command), "G C #%s %02X", name, index);
-    const char *value = nullptr;
-    query_result_t result = query_value(command, response, response_size, value);
-    if (result == QUERY_OK) {
-        if (!CustomSettingsProtocol::parse_enum_option(value, option))
-            return QUERY_TIMEOUT;
-        return QUERY_OK;
-    }
-    error_value = value;
-    return result;
+void complete_discovery_locked(cache_state_t state) {
+    discovery_step = DiscoveryStep::None;
+    if (state != CACHE_READY) reset_cache_locked(state);
+    cache_state = state;
+    current->epoch = loaded_generation;
+    xEventGroupSetBits(cache_events, CACHE_CHANGED);
 }
 
-bool discover_enum_options_locked(cached_entry_t &entry,
-                                   char (&response)[QFRAME_MAX_PAYLOAD + 1]) {
-    entry.option_start = current->option_count;
-    entry.option_count = 0;
-
-    uint8_t total = 0;
-    bool total_known = false;
-    uint32_t current = 0;
-    if (read_raw_locked(entry.name, current) && current <= 0xff) {
-        CustomSettingsProtocol::enum_option_t option = {};
-        const char *error_value = nullptr;
-        query_result_t result = query_enum_option(
-            entry.name, (uint8_t)current, response, sizeof(response), option,
-            error_value);
-        if (result == QUERY_OK) {
-            total = option.count;
-            total_known = true;
-        } else if (result != QUERY_ERROR || !error_is(error_value, "6033")) {
-            return false;
-        }
+void next_entry_locked() {
+    if (++entry_index < current->entry_count) {
+        discovery_step = DiscoveryStep::Entry;
+        return;
     }
-
-    if (!total_known) {
-        for (uint8_t index = 0; index < MAX_ENUM_OPTIONS; index++) {
-            CustomSettingsProtocol::enum_option_t option = {};
-            const char *error_value = nullptr;
-            query_result_t result = query_enum_option(
-                entry.name, index, response, sizeof(response), option,
-                error_value);
-            if (result == QUERY_OK) {
-                total = option.count;
-                total_known = true;
-                break;
-            }
-            if (result != QUERY_ERROR || !error_is(error_value, "6033"))
-                return false;
-        }
-    }
-
-    if (!total_known) return true;
-    if (total > MAX_ENUM_OPTIONS) return false;
-
-    for (uint8_t index = 0; index < total; index++) {
-        CustomSettingsProtocol::enum_option_t option = {};
-        const char *error_value = nullptr;
-        query_result_t result = query_enum_option(
-            entry.name, index, response, sizeof(response), option, error_value);
-        if (result == QUERY_ERROR && error_is(error_value, "6033")) continue;
-        if (result != QUERY_OK || option.count != total ||
-            !add_enum_option_locked(entry, index, option.label, option.label_len)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool discover_locked() {
-    char command[20] = "G C &CSG";
-    auto fail = [&](const char *stage) {
-        Log::logf(CAT_CONFIG, LOG_WARN, "AirSense: Discovery failed: %s (%s)\n",
-                  command, stage);
-        return false;
-    };
-    char response[QFRAME_MAX_PAYLOAD + 1];
-    const char *value = nullptr;
-    query_result_t result = query_value("G C &CSG", response, sizeof(response), value);
-    if (result == QUERY_ERROR && error_is(value, "6009")) {
-        reset_cache_locked(CACHE_UNSUPPORTED);
-        Log::logf(CAT_CONFIG, LOG_DEBUG,
-                  "AirSense: Airbreak custom registry unavailable\n");
-        return true;
-    }
-    if (result != QUERY_OK) return fail("header query");
-
-    CustomSettingsProtocol::header_t header = {};
-    if (!CustomSettingsProtocol::parse_header(value, header)) return fail("header syntax");
-    if (!CustomSettingsProtocol::supported_version(header.version)) {
-        reset_cache_locked(CACHE_INCOMPATIBLE);
-        Log::logf(CAT_CONFIG, LOG_WARN,
-                  "AirSense: Unsupported custom registry version %02X\n",
-                  header.version);
-        return true;
-    }
-
-    if (header.count == 0) {
-        reset_cache_locked(CACHE_READY);
-        return true;
-    }
-
-    current->entries = static_cast<cached_entry_t *>(
-        aircannect::Memory::calloc_large(header.count, sizeof(cached_entry_t)));
-    if (!current->entries) return fail("entry allocation");
-    current->entry_count = header.count;
-    uint32_t initial_text = 1u + (uint32_t)header.count * 64u;
-    if (initial_text > UINT16_MAX) initial_text = UINT16_MAX;
-    if (!reserve_text_locked((uint16_t)initial_text)) return fail("text allocation");
-    current->text_pool[0] = '\0';
-    current->text_size = 1;
-
-    for (uint16_t index = 0; index < current->entry_count; index++) {
-        snprintf(command, sizeof(command), "G C &CSG %02X", index);
-        if (query_value(command, response, sizeof(response), value) != QUERY_OK)
-            return fail("entry query");
-
-        CustomSettingsProtocol::entry_t record = {};
-        if (!CustomSettingsProtocol::parse_entry(value, header.version, record))
-            return fail("entry syntax");
-        for (uint16_t previous = 0; previous < index; previous++) {
-            if (strcmp(current->entries[previous].name, record.name) == 0)
-                return fail("duplicate variable");
-        }
-
-        cached_entry_t &entry = current->entries[index];
-        memcpy(entry.name, record.name, sizeof(entry.name));
-        entry.kind = record.kind == CustomSettingsProtocol::ENTRY_NUMERIC
-            ? KIND_NUMERIC : KIND_ENUM;
-        entry.category = record.category;
-        entry.mop_mask = record.mop_mask;
-        entry.scale = record.scale;
-        entry.step = record.step;
-        entry.decimals = record.decimals;
-        entry.label_offset = add_text_locked(record.label, record.label_len);
-        entry.units_offset = add_text_locked(record.units, record.units_len);
-        if (entry.label_offset == INVALID_OFFSET ||
-            entry.units_offset == INVALID_OFFSET) {
-            return fail("label allocation");
-        }
-        entry.group_count = record.group_count;
-        if (record.group_count) {
-            entry.groups_offset = current->text_size;
-            const char *cursor = record.groups;
-            for (uint8_t group = 0; group < record.group_count; group++) {
-                const char *text;
-                size_t length;
-                if (!CustomSettingsProtocol::parse_text(cursor, text, length) ||
-                    add_text_locked(text, length, true) == INVALID_OFFSET)
-                    return fail("group text");
-            }
-        }
-
-        snprintf(command, sizeof(command), "G C #%s", entry.name);
-        if (query_value(command, response, sizeof(response), value) != QUERY_OK)
-            return fail("capability query");
-
-        if (entry.kind == KIND_NUMERIC) {
-            CustomSettingsProtocol::numeric_caps_t caps = {};
-            if (!CustomSettingsProtocol::parse_numeric_caps(value, caps))
-                return fail("numeric capabilities");
-            entry.flags = caps.flags;
-            entry.width = caps.width;
-            entry.minimum = caps.minimum;
-            entry.maximum = caps.maximum;
-        } else {
-            if (!CustomSettingsProtocol::parse_enum_flags(value, entry.flags))
-                return fail("enum capabilities");
-            entry.width = 4;
-            if (!discover_enum_options_locked(entry, response)) return fail("enum options");
-        }
-    }
-
     if (current->text_size < current->text_capacity) {
         char *text = static_cast<char *>(aircannect::Memory::realloc_large(current->text_pool, current->text_size));
         if (text) {
@@ -385,11 +238,242 @@ bool discover_locked() {
             current->option_capacity = current->option_count;
         }
     }
-    cache_state = CACHE_READY;
+    complete_discovery_locked(CACHE_READY);
     Log::logf(CAT_CONFIG, LOG_DEBUG,
               "AirSense: Cached %u custom settings (%u options, %u text bytes)\n",
               current->entry_count, current->option_count, current->text_size);
+}
+
+bool accept_entry_locked(const char *value) {
+    CustomSettingsProtocol::entry_t record = {};
+    if (!CustomSettingsProtocol::parse_entry(value, registry_version, record)) return false;
+    for (uint16_t previous = 0; previous < entry_index; previous++)
+        if (strcmp(current->entries[previous].name, record.name) == 0) return false;
+
+    cached_entry_t &entry = current->entries[entry_index];
+    memcpy(entry.name, record.name, sizeof(entry.name));
+    entry.kind = record.kind == CustomSettingsProtocol::ENTRY_NUMERIC ? KIND_NUMERIC : KIND_ENUM;
+    entry.category = record.category;
+    entry.mop_mask = record.mop_mask;
+    entry.scale = record.scale;
+    entry.step = record.step;
+    entry.decimals = record.decimals;
+    entry.label_offset = add_text_locked(record.label, record.label_len);
+    entry.units_offset = add_text_locked(record.units, record.units_len);
+    if (entry.label_offset == INVALID_OFFSET || entry.units_offset == INVALID_OFFSET) return false;
+    entry.group_count = record.group_count;
+    if (record.group_count) {
+        entry.groups_offset = current->text_size;
+        const char *cursor = record.groups;
+        for (uint8_t group = 0; group < record.group_count; group++) {
+            const char *text;
+            size_t length;
+            if (!CustomSettingsProtocol::parse_text(cursor, text, length) ||
+                add_text_locked(text, length, true) == INVALID_OFFSET) return false;
+        }
+    }
+    discovery_step = DiscoveryStep::Capabilities;
     return true;
+}
+
+bool accept_discovery_locked(query_result_t result, const char *value) {
+    using Step = DiscoveryStep;
+    if (discovery_step == Step::Language) {
+        language_known = result == QUERY_OK &&
+            aircannect::parse_hex(value, strlen(value), cached_language);
+        discovery_step = Step::Header;
+        return true;
+    }
+    if (discovery_step == Step::Header) {
+        if (result == QUERY_ERROR && error_is(value, "6009")) {
+            complete_discovery_locked(CACHE_UNSUPPORTED);
+            Log::logf(CAT_CONFIG, LOG_DEBUG,
+                      "AirSense: Airbreak custom registry unavailable\n");
+            return true;
+        }
+        CustomSettingsProtocol::header_t header = {};
+        if (result != QUERY_OK || !CustomSettingsProtocol::parse_header(value, header)) return false;
+        if (!CustomSettingsProtocol::supported_version(header.version)) {
+            Log::logf(CAT_CONFIG, LOG_WARN, "AirSense: Unsupported custom registry version %02X\n",
+                      header.version);
+            complete_discovery_locked(CACHE_INCOMPATIBLE);
+            return true;
+        }
+        registry_version = header.version;
+        if (!header.count) {
+            complete_discovery_locked(CACHE_READY);
+            return true;
+        }
+        current->entries = static_cast<cached_entry_t *>(
+            aircannect::Memory::calloc_large(header.count, sizeof(cached_entry_t)));
+        if (!current->entries || !reserve_text_locked(1u + uint16_t(header.count) * 64u)) return false;
+        current->entry_count = header.count;
+        current->text_pool[0] = '\0';
+        current->text_size = 1;
+        entry_index = 0;
+        discovery_step = Step::Entry;
+        return true;
+    }
+    if (discovery_step == Step::Entry)
+        return result == QUERY_OK && accept_entry_locked(value);
+
+    cached_entry_t &entry = current->entries[entry_index];
+    switch (discovery_step) {
+        case Step::Capabilities: {
+            if (result != QUERY_OK) return false;
+            if (entry.kind == KIND_NUMERIC) {
+                CustomSettingsProtocol::numeric_caps_t caps = {};
+                if (!CustomSettingsProtocol::parse_numeric_caps(value, caps)) return false;
+                entry.flags = caps.flags;
+                entry.width = caps.width;
+                entry.minimum = caps.minimum;
+                entry.maximum = caps.maximum;
+                next_entry_locked();
+            } else {
+                if (!CustomSettingsProtocol::parse_enum_flags(value, entry.flags)) return false;
+                entry.width = 4;
+                entry.option_start = current->option_count;
+                discovery_step = Step::EnumValue;
+            }
+            return true;
+        }
+        case Step::EnumValue: {
+            uint32_t raw = 0;
+            const bool valid = result == QUERY_OK &&
+                aircannect::parse_hex(value, strlen(value), raw) && raw <= 0xff;
+            option_index = valid ? raw : 0;
+            discovery_step = valid ? Step::EnumCount : Step::EnumScan;
+            return true;
+        }
+        case Step::EnumCount:
+        case Step::EnumScan:
+        case Step::EnumOption: {
+            const bool hole = result == QUERY_ERROR && error_is(value, "6033");
+            CustomSettingsProtocol::enum_option_t option = {};
+            if (!hole && (result != QUERY_OK ||
+                !CustomSettingsProtocol::parse_enum_option(value, option))) return false;
+            if (discovery_step == Step::EnumOption) {
+                if (!hole && (option.count != option_count || !add_enum_option_locked(
+                        entry, option_index, option.label, option.label_len))) return false;
+                if (++option_index == option_count) next_entry_locked();
+            } else if (!hole) {
+                if (option.count > MAX_ENUM_OPTIONS) return false;
+                option_count = option.count;
+                option_index = 0;
+                discovery_step = Step::EnumOption;
+                if (!option_count) next_entry_locked();
+            } else if (discovery_step == Step::EnumCount) {
+                option_index = 0;
+                discovery_step = Step::EnumScan;
+            } else if (++option_index == MAX_ENUM_OPTIONS) {
+                next_entry_locked();
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+void cancel_discovery_ticket_locked() {
+    if (discovery_ticket) Arbiter::cancel_transaction(discovery_ticket);
+    discovery_ticket = nullptr;
+}
+
+bool refresh_generation_locked() {
+    if (loaded_generation == generation()) return true;
+    cancel_discovery_ticket_locked();
+    discovery_step = DiscoveryStep::None;
+    xEventGroupSetBits(cache_events, CACHE_CHANGED);
+    if (!reset_cache_locked(CACHE_UNKNOWN)) return false;
+    language_known = false;
+    loaded_generation = generation();
+    return true;
+}
+
+bool discovery_allowed(bool foreground) {
+    const auto state = Arbiter::get_state();
+    if (state != SYS_IDLE && state != SYS_THERAPY) return false;
+    if (foreground) return true;
+    AirSenseState::Identity identity;
+    return AirSenseState::device_standby() && AirSenseState::identity(identity);
+}
+
+void advance_discovery_locked() {
+    if (!refresh_generation_locked()) return;
+    if (cache_state == CACHE_READY || cache_state == CACHE_UNSUPPORTED ||
+        cache_state == CACHE_INCOMPATIBLE) return;
+    const int32_t remaining = int32_t(foreground_until_ms - millis());
+    const bool foreground = foreground_waiters && remaining > 0;
+    if (!discovery_allowed(foreground)) {
+        cancel_discovery_ticket_locked();
+        if (foreground_waiters) xEventGroupSetBits(cache_events, CACHE_CHANGED);
+        return;
+    }
+    if (cache_state == CACHE_FAILED) {
+        if (int32_t(millis() - retry_at_ms) < 0) return;
+        if (!reset_cache_locked(CACHE_UNKNOWN)) return;
+    }
+    if (discovery_step == DiscoveryStep::None) discovery_step = DiscoveryStep::Language;
+    // A queued idle-only probe cannot become a foreground read during therapy.
+    if (discovery_ticket && ticket_background && !AirSenseState::device_standby())
+        cancel_discovery_ticket_locked();
+
+    char command[24];
+    switch (discovery_step) {
+        case DiscoveryStep::Language: strcpy(command, "G S #LAN"); break;
+        case DiscoveryStep::Header: strcpy(command, "G C &CSG"); break;
+        case DiscoveryStep::Entry:
+            snprintf(command, sizeof(command), "G C &CSG %02X", entry_index); break;
+        case DiscoveryStep::Capabilities:
+            snprintf(command, sizeof(command), "G C #%s", current->entries[entry_index].name); break;
+        case DiscoveryStep::EnumValue:
+            snprintf(command, sizeof(command), "G S #%s", current->entries[entry_index].name); break;
+        default:
+            snprintf(command, sizeof(command), "G C #%s %02X",
+                     current->entries[entry_index].name, option_index); break;
+    }
+    const bool scalar = discovery_step == DiscoveryStep::Language ||
+                        discovery_step == DiscoveryStep::EnumValue;
+    if (!discovery_ticket) {
+        const uart_send_window_t window = {0, 0, !foreground, true};
+        const auto priority = foreground ? CMD_PRIO_NORMAL : CMD_PRIO_LOW;
+        const uint16_t budget = foreground ? remaining : 0;
+        discovery_ticket = scalar
+            ? Arbiter::begin_var(command + 5, CMD_SRC_INTERNAL, priority, 16, 0, window, budget)
+            : Arbiter::begin_cmd(command, CMD_SRC_INTERNAL, priority, QFRAME_MAX_PAYLOAD + 1,
+                                 0, window, budget);
+        ticket_background = !foreground;
+        return;
+    }
+    char response[QFRAME_MAX_PAYLOAD + 1] = {};
+    uint16_t length = sizeof(response);
+    query_result_t result = QUERY_TIMEOUT;
+    const char *value = nullptr;
+    if (Arbiter::transaction_done(discovery_ticket)) {
+        if (scalar) {
+            if (Arbiter::finish_var(discovery_ticket, response, sizeof(response)) == Arbiter::VarResult::Ok) {
+                value = response;
+                result = QUERY_OK;
+            }
+        } else {
+            uart_transaction_result_t transaction = {};
+            const bool ok = Arbiter::finish_cmd(discovery_ticket, response, &length, &transaction);
+            if (length < sizeof(response)) value = qframe_response_value(response);
+            if (value) result = ok ? QUERY_OK :
+                transaction.terminal_type == QFRAME_TYPE_E ? QUERY_ERROR : QUERY_TIMEOUT;
+        }
+        discovery_ticket = nullptr;
+    } else {
+        if (!Arbiter::transaction_expired(discovery_ticket)) return;
+        cancel_discovery_ticket_locked();
+    }
+    if (loaded_generation != generation()) return;
+    if (!accept_discovery_locked(result, value)) {
+        Log::logf(CAT_CONFIG, LOG_WARN, "AirSense: Discovery failed: %s (%s)\n",
+                  command, value ? value : "no response");
+        complete_discovery_locked(CACHE_FAILED);
+    }
 }
 
 cached_entry_t *find_entry_locked(const char *name) {
@@ -401,12 +485,7 @@ cached_entry_t *find_entry_locked(const char *name) {
 }
 
 bool ensure_loaded_locked() {
-    uint32_t current = generation();
-    if (loaded_generation != current) {
-        if (!reset_cache_locked(CACHE_UNKNOWN)) return false;
-        language_known = false;
-        loaded_generation = current;
-    }
+    if (!refresh_generation_locked()) return false;
     if (cache_state == CACHE_READY) {
         uint32_t language = 0;
         if (read_raw_locked("LAN", language)) {
@@ -430,27 +509,46 @@ bool ensure_loaded_locked() {
         return false;
     }
 
-    if (!reset_cache_locked(CACHE_UNKNOWN)) return false;
-    uint32_t language = 0;
-    language_known = read_raw_locked("LAN", language);
-    if (language_known) cached_language = language;
-
-    if (!discover_locked()) {
-        reset_cache_locked(CACHE_FAILED);
-        return false;
+    if (!discovery_allowed(true)) return false;
+    const uint16_t budget = ClinicalJobs::remaining_ms();
+    if (!budget) return false;
+    const uint32_t expected_generation = loaded_generation;
+    const uint32_t until = millis() + budget;
+    if (!foreground_waiters || int32_t(until - foreground_until_ms) > 0)
+        foreground_until_ms = until;
+    ++foreground_waiters;
+    while (loaded_generation == expected_generation && generation() == expected_generation &&
+           cache_state != CACHE_READY && cache_state != CACHE_UNSUPPORTED &&
+           cache_state != CACHE_INCOMPATIBLE && discovery_allowed(true)) {
+        if (cache_state == CACHE_FAILED && int32_t(millis() - retry_at_ms) < 0) break;
+        const int32_t remaining = int32_t(until - millis());
+        if (remaining <= 0) break;
+        xSemaphoreGive(cache_mutex);
+        xEventGroupWaitBits(cache_events, CACHE_CHANGED, pdTRUE, pdFALSE, pdMS_TO_TICKS(remaining));
+        xSemaphoreTake(cache_mutex, portMAX_DELAY);
     }
-    return cache_state != CACHE_INCOMPATIBLE;
+    --foreground_waiters;
+    return loaded_generation == expected_generation && generation() == expected_generation &&
+        int32_t(until - millis()) > 0 &&
+        (cache_state == CACHE_READY || cache_state == CACHE_UNSUPPORTED);
 }
 
 }  // namespace
 
 void init() {
     if (!cache_mutex) cache_mutex = xSemaphoreCreateMutex();
+    if (!cache_events) cache_events = xEventGroupCreate();
+}
+
+void poll() {
+    if (!cache_mutex || !cache_events || xSemaphoreTake(cache_mutex, 0) != pdTRUE) return;
+    advance_discovery_locked();
+    xSemaphoreGive(cache_mutex);
 }
 
 bool ensure_loaded() {
-    if (!cache_mutex) init();
-    if (!cache_mutex) return false;
+    if (!cache_mutex || !cache_events) init();
+    if (!cache_mutex || !cache_events) return false;
     xSemaphoreTake(cache_mutex, portMAX_DELAY);
     bool result = ensure_loaded_locked();
     xSemaphoreGive(cache_mutex);
@@ -475,8 +573,8 @@ void MetadataLease::reset() {
 
 bool MetadataLease::acquire() {
     reset();
-    if (!cache_mutex) init();
-    if (!cache_mutex) return false;
+    if (!cache_mutex || !cache_events) init();
+    if (!cache_mutex || !cache_events) return false;
     xSemaphoreTake(cache_mutex, portMAX_DELAY);
     bool ok = ensure_loaded_locked() && loaded_generation == CustomSettings::generation();
     if (ok) {

@@ -42,7 +42,7 @@ public:
     ~MetadataLease();
     MetadataLease(const MetadataLease &) = delete;
     MetadataLease &operator=(const MetadataLease &) = delete;
-    bool acquire();  // Worker only; may discover metadata over UART.
+    bool acquire();  // Worker only; waits for and promotes shared discovery.
     void reset();
     uint32_t generation() const;
     uint16_t count() const;
@@ -56,7 +56,8 @@ private:
 };
 
 void init();
-bool ensure_loaded();
+void poll();  // Main-loop discovery; background work requires confirmed standby.
+bool ensure_loaded();  // Worker only; joins discovery within the job deadline.
 bool contains(const char *name);
 void reclaim();  // Nonblocking cleanup of unreferenced retired metadata.
 bool write_raw(const char *name, uint32_t value);

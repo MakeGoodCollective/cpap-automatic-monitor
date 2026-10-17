@@ -207,6 +207,7 @@ void loop() {
     AirSenseState::poll();
     Air10Stream::poll();
     Air10Clock::handle();
+    CustomSettings::poll();
 
     LiveWebConsumer::tick();
 
