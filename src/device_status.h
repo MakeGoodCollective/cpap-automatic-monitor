@@ -5,6 +5,7 @@
 #include "oxi_arbiter.h"
 #include "oxi_ble.h"
 #include "sleep_report.h"
+#include "clinical_jobs.h"
 #include "sd_storage.h"
 #include "wifi_setup.h"
 #include "app_config.h"
@@ -33,6 +34,7 @@ struct Snapshot {
     EdfReport::State report_state = EdfReport::State::Blocked;
     char report_error[48] = {};
     bool report_available = false;
+    uint32_t clinical_revision = 0;
     SdStorage::Status storage = {};
 };
 
@@ -61,6 +63,7 @@ inline Snapshot snapshot() {
     out.report_state = report.local.state;
     memcpy(out.report_error, report.local.error, sizeof(out.report_error));
     out.report_available = report.local.available;
+    out.clinical_revision = ClinicalJobs::revision();
     SdStorage::get_status(out.storage);
     return out;
 }

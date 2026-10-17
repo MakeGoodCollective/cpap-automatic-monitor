@@ -32,6 +32,7 @@ struct Job {
 Job jobs[SLOT_COUNT];
 SemaphoreHandle_t mutex = nullptr;
 std::atomic<TaskHandle_t> task{nullptr};
+std::atomic<uint32_t> completed_revision{0};
 Handler handler = nullptr;
 uint32_t next_id = 1, active_since = 0;
 
@@ -115,6 +116,7 @@ void worker(void *) {
         job->completed_ms = millis();
         job->state = Complete;
         xSemaphoreGive(mutex);
+        ++completed_revision;
     }
     CustomSettings::reclaim();
     vTaskDeleteWithCaps(nullptr);
@@ -154,6 +156,8 @@ void tick() {
     xSemaphoreGive(mutex);
     CustomSettings::reclaim();
 }
+
+uint32_t revision() { return completed_revision.load(); }
 
 Result::~Result() { reset(); }
 

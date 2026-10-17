@@ -12,8 +12,9 @@ enum class Kind : uint8_t { Read, Write, Report };
 constexpr size_t MAX_BODY_SIZE = 2048;
 void init(Handler handler);
 void tick();  // Nonblocking result/cache cleanup from the main loop.
+uint32_t revision();  // Changes after a completed result becomes available.
 // Results outlive HTTP requests: 30 s unread, at least 2 s after completion
-// once delivered. Callers must not resubmit writes after a polling failure.
+// once delivered. Callers must not resubmit writes after a retrieval failure.
 bool submit(Kind kind, String &&body, uint32_t &id,
             SleepReport::Request report = {});
 

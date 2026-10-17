@@ -362,7 +362,7 @@ static void statusClocks(char (&esp_time)[20], char (&resmed_time)[20]) {
 enum StatusFields : uint8_t {
     STATUS_THERAPY = 1, STATUS_OXI = 2, STATUS_HEALTH = 4,
     STATUS_CONFIG = 8, STATUS_IDENTITY = 16, STATUS_REPORT = 32,
-    STATUS_STORAGE = 64, STATUS_ALL = 127,
+    STATUS_STORAGE = 64, STATUS_CLINICAL = 128, STATUS_ALL = 255,
 };
 
 template<class Output>
@@ -441,6 +441,8 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
         jsonAddString(json, "report_error", status.report_error);
         jsonAddBool(json, "report_available", status.report_available);
     }
+    if (fields & STATUS_CLINICAL)
+        jsonAddUInt32(json, "clinical_revision", status.clinical_revision);
     if (fields & STATUS_IDENTITY) appendStatusIdentity(json);
 }
 
@@ -510,8 +512,8 @@ static size_t buildStatusJson(char *out, size_t cap) {
 
 static const uint32_t STATUS_CACHE_TTL_MS = 500;
 // Includes bounded owner strings at the WebUI escape worst case (two bytes)
-// and both uint32 report revisions.
-static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 2400 : 1440;
+// and uint32 owner revisions.
+static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 2432 : 1472;
 static String status_cache;
 static uint32_t status_cache_built_at = 0;
 static uint32_t status_cache_config_revision = 0;
@@ -2567,6 +2569,7 @@ static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
         a.report_state != b.report_state || strcmp(a.report_error, b.report_error) ||
         a.report_available != b.report_available)
         fields |= STATUS_REPORT;
+    if (a.clinical_revision != b.clinical_revision) fields |= STATUS_CLINICAL;
     if (a.storage.mode != b.storage.mode || a.storage.mounted != b.storage.mounted ||
         a.storage.supported != b.storage.supported ||
         a.storage.card_bytes != b.storage.card_bytes || a.storage.used_bytes != b.storage.used_bytes ||

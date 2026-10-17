@@ -1159,6 +1159,7 @@ function initSSE() {
     exportsSnapshot = null;
     bleLoadedRevision = null;
     reportReconnect();
+    wakeClinicalRequests();
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = '';
   };
@@ -1562,6 +1563,10 @@ function updateWifiBars(el, rssi) {
 }
 
 function renderStatus(d) {
+  if (d.clinical_revision !== undefined && d.clinical_revision !== clinicalRevision) {
+    clinicalRevision = d.clinical_revision;
+    wakeClinicalRequests();
+  }
   if (d.ui_language !== undefined) applyUiLanguage(d.ui_language);
   if (d.ui_theme !== undefined) applyUiTheme(d.ui_theme);
   if (d.report_source !== undefined || d.report_revision !== undefined || d.report_data_revision !== undefined || d.report_state !== undefined || d.report_error !== undefined || d.report_available !== undefined) applyReportStatus(d);
@@ -2486,7 +2491,7 @@ async function loadReport(latest = false, refresh = false) {
       reportDirty = false;
     } else {
       const query = '?' + (lastStatus.report_source === 'edf' ? 'source=device&' : '') + 'view=' + view + (day ? '&day=' : '&period=') + selection;
-      data = await settingsRequest(day ? undefined : {method:'POST'}, '/api/report', query);
+      data = await settingsRequest({method:day ? 'GET' : 'POST', signal:reportController.signal}, '/api/report', query);
     }
     if (generation !== reportGeneration) return;
     renderReport(data);
@@ -3472,25 +3477,48 @@ function renderField(s) {
   return div;
 }
 
+let clinicalRevision = null, clinicalEpoch = 0;
+const clinicalWaiters = new Set();
+
+function wakeClinicalRequests() {
+  clinicalEpoch++;
+  clinicalWaiters.forEach(wake => wake());
+}
+
 async function settingsRequest(options, endpoint = '/api/settings', query = '') {
-  const deadline = Date.now() + 35000;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 35000);
+  const signal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+  const timer = setTimeout(() => controller.abort(new Error('settings_timeout')), 35000);
+  let wake = null;
+  const changed = () => { if (wake) { const resolve = wake; wake = null; resolve(); } };
+  clinicalWaiters.add(changed);
+  signal.addEventListener('abort', changed);
   try {
-  let r = await api(endpoint + query, {...options, signal:controller.signal});
-  if (!r) throw new Error('request_cancelled');
-  let data = await r.json();
-  const job = data.job;
-  while (r.status === 202 && job && Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, 250));
-    r = await api(endpoint + '?job=' + job, {signal:controller.signal});
+    signal.throwIfAborted();
+    let epoch = clinicalEpoch;
+    let r = await api(endpoint + query, {...options, signal});
     if (!r) throw new Error('request_cancelled');
-    data = await r.json();
+    let data = await r.json();
+    const job = data.job;
+    while (r.status === 202) {
+      if (!job) throw new Error('settings_job_unavailable');
+      signal.throwIfAborted();
+      // A completion during the previous HTTP request already permits retrieval.
+      if (epoch === clinicalEpoch) await new Promise(resolve => { wake = resolve; });
+      signal.throwIfAborted();
+      epoch = clinicalEpoch;
+      r = await api(endpoint + '?job=' + encodeURIComponent(job), {signal});
+      if (!r) throw new Error('request_cancelled');
+      data = await r.json();
+    }
+    signal.throwIfAborted();
+    if (!r.ok) throw new Error(data.error || 'settings_request_failed');
+    return data;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener('abort', changed);
+    clinicalWaiters.delete(changed);
   }
-  if (r.status === 202) throw new Error('settings_timeout');
-  if (!r.ok) throw new Error(data.error || 'settings_request_failed');
-  return data;
-  } finally { clearTimeout(timer); }
 }
 
 let clinicalRead = null, clinicalGeneration = 0, clinicalSaving = false;
