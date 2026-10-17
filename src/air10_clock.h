@@ -40,6 +40,7 @@ void handle();
 // Owner-published priority work; routine STR yields, mandatory journals do not.
 bool background_work_pending();
 // Manual requests bypass autosync, not standby/STR or post-therapy deferral.
+// Backward writes use confirmed calibration mode, then restore standby.
 void request_sync(bool manual = false);
 // Main-loop notification of confirmed therapy end; starts a 60-second hold.
 void request_post_therapy_sync();

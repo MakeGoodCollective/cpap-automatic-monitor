@@ -20,6 +20,9 @@ static constexpr uint32_t PHASE_PROBE_BUDGET_MS = 1500;
 static constexpr uint32_t PHASE_MAX_BRACKET_MS = 200;
 static constexpr uint32_t PHASE_RETRY_INTERVAL_MS = 5000;
 static constexpr uint32_t CLOCK_POST_THERAPY_DELAY_MS = 60000;
+static constexpr uint32_t CLOCK_MODE_WAIT_MS = 2000;
+static constexpr uint32_t CLOCK_MODE_POLL_MS = 100;
+static constexpr uint32_t CLOCK_RESTORE_RETRY_MS = 5000;
 
 static constexpr uint8_t CLOCK_SYNC_AUTO = 1;
 static constexpr uint8_t CLOCK_SYNC_MANUAL = 2;
@@ -36,6 +39,13 @@ static uart_transaction_t *clock_sync_ticket = nullptr;
 static time_t clock_sync_target = 0;
 static int64_t clock_sync_edge_us = 0;
 static char clock_sync_tic[16];
+enum class ClockCalibration : uint8_t {
+    None, CheckStandby, Enter, WaitReady, Active, Restore, Leave, WaitStandby,
+};
+static ClockCalibration clock_calibration = ClockCalibration::None;
+static uart_transaction_t *clock_mode_ticket = nullptr;
+static uint32_t clock_mode_started_ms = 0, clock_mode_next_ms = 0;
+static bool clock_sync_reserved = false;
 static portMUX_TYPE device_time_mux = portMUX_INITIALIZER_UNLOCKED;
 static char device_time[20] = "--";
 static uint32_t device_time_ms = 0;
@@ -488,6 +498,159 @@ static bool finish_clock_sync() {
     return true;
 }
 
+static void release_clock_sync() {
+    if (clock_mode_ticket) Arbiter::cancel_transaction(clock_mode_ticket);
+    clock_mode_ticket = nullptr;
+    if (clock_calibration != ClockCalibration::None) AirSenseState::request_refresh();
+    clock_calibration = ClockCalibration::None;
+    if (clock_sync_reserved) EdfRecorder::end_clock_write();
+    clock_sync_reserved = false;
+}
+
+static void end_clock_attempt() {
+    if (clock_sync_ticket) Arbiter::cancel_transaction(clock_sync_ticket);
+    clock_sync_ticket = nullptr;
+    if (clock_calibration == ClockCalibration::None ||
+        clock_calibration == ClockCalibration::CheckStandby) {
+        release_clock_sync();
+        return;
+    }
+    // An entry timeout may mean the device changed mode but its reply was lost.
+    if (clock_mode_ticket) Arbiter::cancel_transaction(clock_mode_ticket);
+    clock_mode_ticket = nullptr;
+    clock_calibration = ClockCalibration::Restore;
+    clock_mode_next_ms = millis();
+    AirSenseState::request_refresh();
+}
+
+static void handle_clock_calibration() {
+    const bool restoring = clock_calibration >= ClockCalibration::Restore;
+    const uint32_t now = millis();
+    if (restoring && (!AirSenseState::system_idle() || !AirSenseState::present_recently())) {
+        if (clock_mode_ticket) Arbiter::cancel_transaction(clock_mode_ticket);
+        clock_mode_ticket = nullptr;
+        clock_calibration = ClockCalibration::Restore;
+        if (Arbiter::get_state() == SYS_THERAPY) {
+            Log::logf(CAT_TIME, LOG_WARN, "Clock calibration interrupted by therapy; leaving therapy running\n");
+            release_clock_sync();
+        }
+        return;
+    }
+    if (int32_t(now - clock_mode_next_ms) < 0) return;
+    if (!clock_mode_ticket) {
+        const char *command = clock_calibration == ClockCalibration::Enter ? "P S #ROP 0004" :
+            clock_calibration == ClockCalibration::Leave ? "P S #ROP 0000" : "G S #ZRM";
+        const uart_send_window_t idle_only = {0, 0, true};
+        clock_mode_ticket = Arbiter::begin_cmd(command, CMD_SRC_INTERNAL,
+            CMD_PRIO_NORMAL, 64, CLOCK_TIMEOUT_MS, idle_only);
+        if (clock_mode_ticket) return;
+    } else if (!Arbiter::transaction_done(clock_mode_ticket)) {
+        if (!Arbiter::transaction_expired(clock_mode_ticket)) return;
+        Arbiter::cancel_transaction(clock_mode_ticket);
+        clock_mode_ticket = nullptr;
+    }
+
+    char response[64] = {};
+    uint16_t length = sizeof(response);
+    const bool ok = clock_mode_ticket &&
+        Arbiter::finish_cmd(clock_mode_ticket, response, &length);
+    clock_mode_ticket = nullptr;
+    const char *value = ok ? qframe_response_value(response) : nullptr;
+    const bool standby = value && !strcmp(value, "0001");
+    const bool calibration = value && !strcmp(value, "0006");
+    const bool therapy = value &&
+        (!strcmp(value, "0004") || !strcmp(value, "0005") || !strcmp(value, "0009"));
+
+    switch (clock_calibration) {
+        case ClockCalibration::CheckStandby:
+            if (standby) clock_calibration = ClockCalibration::Enter;
+            else {
+                Log::logf(CAT_TIME, LOG_WARN, "Clock calibration requires confirmed standby\n");
+                release_clock_sync();
+            }
+            return;
+        case ClockCalibration::Enter:
+            if (value && !strcmp(value, "0004")) {
+                clock_calibration = ClockCalibration::WaitReady;
+                clock_mode_started_ms = now;
+                AirSenseState::request_refresh();
+                return;
+            }
+            break;
+        case ClockCalibration::WaitReady:
+            if (calibration) {
+                clock_calibration = ClockCalibration::Active;
+                return;
+            }
+            if (ok && !therapy && now - clock_mode_started_ms < CLOCK_MODE_WAIT_MS) {
+                clock_mode_next_ms = now + CLOCK_MODE_POLL_MS;
+                return;
+            }
+            break;
+        case ClockCalibration::Restore:
+            // Never send standby over a therapy started from the device panel.
+            if (therapy) {
+                Log::logf(CAT_TIME, LOG_WARN, "Clock calibration ended in therapy; leaving therapy running\n");
+                release_clock_sync();
+                return;
+            }
+            if (standby || calibration) {
+                clock_calibration = ClockCalibration::Leave;
+                return;
+            }
+            break;
+        case ClockCalibration::Leave:
+            // Read back even after a lost acknowledgement of ROP=0.
+            clock_calibration = ClockCalibration::WaitStandby;
+            clock_mode_started_ms = now;
+            return;
+        case ClockCalibration::WaitStandby:
+            if (standby || therapy) {
+                release_clock_sync();
+                return;
+            }
+            if (ok && now - clock_mode_started_ms < CLOCK_MODE_WAIT_MS) {
+                clock_mode_next_ms = now + CLOCK_MODE_POLL_MS;
+                return;
+            }
+            break;
+        default:
+            return;
+    }
+    if (restoring) {
+        Log::logf(CAT_TIME, LOG_WARN, "Clock standby restore not confirmed; will retry\n");
+        clock_calibration = ClockCalibration::Restore;
+        clock_mode_next_ms = now + CLOCK_RESTORE_RETRY_MS;
+    } else {
+        Log::logf(CAT_TIME, LOG_WARN, "Clock calibration entry not confirmed; restoring standby\n");
+        end_clock_attempt();
+    }
+}
+
+static void start_clock_sync() {
+    stop_phase_measurement("clock write");
+    stop_calendar_read();
+    Air10Clock::Calendar observed;
+    if (!Air10Clock::read(observed, CLOCK_TIMEOUT_MS)) {
+        Log::logf(CAT_TIME, LOG_WARN, "ResMed clock read before sync failed\n");
+        return;
+    }
+    if (!AirSenseState::device_standby()) return;
+    const time_t now = time(nullptr);
+    struct tm target;
+    localtime_r(&now, &target);
+    const Air10Clock::Calendar requested = {
+        target.tm_year + 1900, target.tm_mon + 1, target.tm_mday,
+        target.tm_hour, target.tm_min, target.tm_sec,
+    };
+    if (Air10Clock::civil_seconds(requested) < Air10Clock::civil_seconds(observed)) {
+        clock_calibration = ClockCalibration::CheckStandby;
+        clock_mode_next_ms = millis();
+        return;
+    }
+    push_time_to_resmed();
+}
+
 bool Air10Clock::pull_time(bool force) {
     Air10Clock::Calendar t;
     if (!Air10Clock::read(t) ||
@@ -497,6 +660,11 @@ bool Air10Clock::pull_time(bool force) {
 }
 
 static void handle_clock_sync() {
+    // Cleanup is owed even after sync was disabled, failed or lost its NTP source.
+    if (clock_calibration >= ClockCalibration::Restore) {
+        handle_clock_calibration();
+        return;
+    }
     if (clock_sync_settling &&
         millis() - clock_sync_therapy_end_ms >= CLOCK_POST_THERAPY_DELAY_MS)
         clock_sync_settling = false;
@@ -508,35 +676,42 @@ static void handle_clock_sync() {
 
     const uint8_t requests = clock_sync_requests.exchange(0);
     if (requests) {
-        if (clock_sync_ticket) {
-            Arbiter::cancel_transaction(clock_sync_ticket);
-            EdfRecorder::end_clock_write();
-        }
-        clock_sync_ticket = nullptr;
+        if (clock_sync_reserved) end_clock_attempt();
         clock_sync_manual = (requests & CLOCK_SYNC_MANUAL) ||
                             (clock_sync_pending && clock_sync_manual);
         clock_sync_pending = true;
         clock_sync_attempted = false;
         clock_sync_window_retries = 0;
+        if (clock_calibration >= ClockCalibration::Restore) return;
     }
     if (!clock_sync_pending) return;
     const bool disabled = !auto_enabled && !clock_sync_manual;
+    const bool in_calibration = clock_calibration != ClockCalibration::None &&
+        clock_calibration != ClockCalibration::CheckStandby;
+    const bool allowed_mode = AirSenseState::device_standby() ||
+        (in_calibration && AirSenseState::system_idle() && AirSenseState::rop() == 4);
     if (disabled || !AirSenseState::present_recently() || !WiFiSetup::time_synced() ||
-        !AirSenseState::device_standby()) {
-        if (clock_sync_ticket) {
-            Arbiter::cancel_transaction(clock_sync_ticket);
-            EdfRecorder::end_clock_write();
-        }
-        clock_sync_ticket = nullptr;
+        !allowed_mode) {
+        if (clock_sync_reserved) end_clock_attempt();
         if (disabled) clock_sync_pending = false;
         return;
     }
     if (clock_sync_settling) return;
+    if (clock_calibration != ClockCalibration::None &&
+        clock_calibration != ClockCalibration::Active) {
+        handle_clock_calibration();
+        return;
+    }
     if (clock_sync_ticket) {
         if (Arbiter::transaction_done(clock_sync_ticket)) {
             if (finish_clock_sync()) clock_sync_pending = false;
-            EdfRecorder::end_clock_write();
+            end_clock_attempt();
         }
+        return;
+    }
+    if (clock_calibration == ClockCalibration::Active) {
+        push_time_to_resmed();
+        if (!clock_sync_ticket) end_clock_attempt();
         return;
     }
     if (clock_sync_attempted && millis() - clock_sync_attempt_ms < 30000) return;
@@ -550,10 +725,11 @@ static void handle_clock_sync() {
         return;
     }
     last_blocked = nullptr;
+    clock_sync_reserved = true;
     clock_sync_attempt_ms = millis();
     clock_sync_attempted = true;
-    push_time_to_resmed();
-    if (!clock_sync_ticket) EdfRecorder::end_clock_write();
+    start_clock_sync();
+    if (!clock_sync_ticket && clock_calibration == ClockCalibration::None) end_clock_attempt();
 }
 
 void Air10Clock::handle() {
@@ -566,9 +742,11 @@ void Air10Clock::handle() {
         AirSenseState::present_recently() && WiFiSetup::time_synced() &&
         (!clock_sync_attempted || millis() - clock_sync_attempt_ms >= 30000);
     handle_clock_sync();
-    handle_calendar_read();
-    handle_phase_measurement();
-    priority_work = priority_work.load() || clock_sync_ticket || calendar_step || phase_measuring;
+    if (!clock_sync_reserved) {
+        handle_calendar_read();
+        handle_phase_measurement();
+    }
+    priority_work = priority_work.load() || clock_sync_reserved || calendar_step || phase_measuring;
 }
 
 bool Air10Clock::background_work_pending() { return priority_work.load(); }
