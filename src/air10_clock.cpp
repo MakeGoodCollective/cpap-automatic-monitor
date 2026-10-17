@@ -37,6 +37,7 @@ static bool clock_sync_attempted = false;
 static uint8_t clock_sync_window_retries = 0;
 static uart_transaction_t *clock_sync_ticket = nullptr;
 static bool clock_sync_verifying = false;
+static bool clock_sync_backward = false;
 static time_t clock_sync_target = 0;
 static int64_t clock_sync_edge_us = 0;
 static char clock_sync_tic[16];
@@ -388,9 +389,22 @@ static bool clock_write_applied(const char *command, bool ok, const char *respon
     if (ok && value && strcmp(value, command + 9) == 0) return true;
 
     const bool rejected = !ok && response[0];
+    const bool date = strncmp(command, "P S #DAC ", 9) == 0;
+    Air10Clock::Calendar returned;
+    const bool not_applied = ok && Air10Clock::parse_calendar(
+        date ? value : "01012000", date ? "000000" : value, returned);
+    if (clock_sync_backward && clock_calibration == ClockCalibration::None &&
+        (rejected || not_applied)) {
+        clock_calibration = ClockCalibration::CheckStandby;
+        clock_mode_next_ms = millis();
+        Log::logf(CAT_TIME, LOG_INFO, "ResMed clock rollback refused; trying calibration\n");
+        Log::logf(CAT_TIME, LOG_DEBUG, "Clock write request=%s response=%s\n",
+                  command, response);
+        return false;
+    }
     if (rejected) clock_sync_pending = false;
     Log::logf(CAT_TIME, LOG_WARN, "ResMed clock %s write %s\n",
-              strncmp(command, "P S #DAC ", 9) == 0 ? "date" : "time",
+              date ? "date" : "time",
               rejected ? "rejected; use TIMESYNC to retry" :
               !ok ? "failed without a response; will retry" :
               value ? "not applied; will retry" : "not confirmed; will retry");
@@ -520,6 +534,7 @@ static void release_clock_sync() {
     clock_mode_ticket = nullptr;
     if (clock_calibration != ClockCalibration::None) AirSenseState::request_refresh();
     clock_calibration = ClockCalibration::None;
+    clock_sync_backward = false;
     if (clock_sync_reserved) EdfRecorder::end_clock_write();
     clock_sync_reserved = false;
 }
@@ -655,11 +670,8 @@ static void start_clock_write(const Air10Clock::Calendar &observed) {
         target.tm_year + 1900, target.tm_mon + 1, target.tm_mday,
         target.tm_hour, target.tm_min, target.tm_sec,
     };
-    if (Air10Clock::civil_seconds(requested) < Air10Clock::civil_seconds(observed)) {
-        clock_calibration = ClockCalibration::CheckStandby;
-        clock_mode_next_ms = millis();
-        return;
-    }
+    clock_sync_backward = Air10Clock::civil_seconds(requested) <
+                          Air10Clock::civil_seconds(observed);
     push_time_to_resmed();
 }
 
@@ -735,7 +747,9 @@ static void handle_clock_sync() {
             if (finish_clock_write()) {
                 clock_sync_verifying = true;
                 start_calendar_read();
-            } else end_clock_attempt();
+            } else if (clock_calibration != ClockCalibration::CheckStandby) {
+                end_clock_attempt();
+            }
         }
         return;
     }
