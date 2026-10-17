@@ -66,6 +66,9 @@ int collect(Snapshot &snapshot) {
     if (!read_raw("MOP", mop)) return fail("{\"error\":\"settings_mode_unavailable\"}");
     if (mop < 0 || mop >= MODE_COUNT) mop = 0;
 
+    int tmu = -1;
+    read_raw("TMU", tmu);
+
     int aoa = -1;
     read_raw("AOA", aoa);
     bool leak_alert_active = false;
@@ -82,6 +85,8 @@ int collect(Snapshot &snapshot) {
             (flags & 0x01);
     }
     auto visible = [&](const char *name) {
+        if (!strcmp(name, "HTS")) return tmu == 0;
+        if (!strcmp(name, "HTF")) return tmu == 1;
         if (!strcmp(name, "ALR")) return aoa != 1 && (aoa != 0 || leak_alert_active);
         if (aoa != 0) return true;
         for (const char *alarm : {"ALV", "HLE", "NMF", "LMA", "APX", "SPX"})
@@ -97,8 +102,11 @@ int collect(Snapshot &snapshot) {
             const var_def_t *v = var_lookup(name);
             if (!v) return;
             if (read) {
-                int raw = mop;
-                bool ok = strcmp(name, "MOP") == 0 || read_raw(name, raw);
+                int raw = 0;
+                bool ok = true;
+                if (!strcmp(name, "MOP")) raw = mop;
+                else if (!strcmp(name, "TMU")) { raw = tmu; ok = tmu >= 0; }
+                else ok = read_raw(name, raw);
                 snapshot.values_[count] = {(uint32_t)raw, (uint16_t)(v - VAR_CATALOG),
                                           group, (uint8_t)(ok ? VALID : 0)};
             }
@@ -122,7 +130,9 @@ int collect(Snapshot &snapshot) {
                     !visible(entry.name)) continue;
                 if (read) {
                     uint32_t raw = 0;
-                    bool ok = snapshot.metadata_.read_raw(i, raw);
+                    bool ok;
+                    if (!strcmp(entry.name, "TMU")) { raw = (uint32_t)tmu; ok = tmu >= 0; }
+                    else ok = snapshot.metadata_.read_raw(i, raw);
                     snapshot.values_[count] = {raw, i, group, (uint8_t)(CUSTOM | (ok ? VALID : 0))};
                 }
                 count++;
