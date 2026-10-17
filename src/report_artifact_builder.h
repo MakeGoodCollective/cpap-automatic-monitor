@@ -55,9 +55,10 @@ bool document_publish(const SdStorage::Session &session, const char *prefix,
 bool index_publish(const SdStorage::Session &session, const uint8_t key[32],
                    const uint8_t *data, size_t length, Document &out, Document &retired);
 // Never removes content referenced by either index, dataset or rebuild head.
-// Caller proves the candidate is an index; its exclusive SD session serializes
-// deletion with reads admitted concurrently by the transport.
-bool index_discard(const SdStorage::Session &session, const uint8_t digest[32]);
+// Caller proves the candidate is an index. Its optional cancellation predicate
+// rechecks owner pins inside the serialized mutation, without I/O or waits.
+bool index_discard(const SdStorage::Session &session, const uint8_t digest[32],
+                   bool (*cancelled)(void *) = nullptr, void *context = nullptr);
 // Read an unreferenced root body once, verifying its content hash. Missing
 // means protected by a head; Invalid means malformed, Failed means retry.
 // The owner must still establish that this body is an index before removal.

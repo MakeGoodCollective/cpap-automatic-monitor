@@ -44,7 +44,7 @@ bool init_started = false;
 bool formatting = false;
 
 struct Request {
-    enum Kind { Run, Acquire, TryAcquire, Release, Close, Begin, End, Mount, Wake, UsbIo } kind;
+    enum Kind { Run, Acquire, TryAcquire, Release, Close, Begin, End, Mount, UsbIo } kind;
     bool (*operation)(fs::FS &, void *);
     void *context;
     uint32_t generation;
@@ -52,20 +52,38 @@ struct Request {
     bool success;
     TaskHandle_t caller;
     uint32_t file_id;
+    Access access;
+    const char *path;
+    const char *destination;
 };
 
 void mount_card();
 void advance_usb();
 
 QueueHandle_t requests = nullptr;
+QueueHandle_t interactive_requests = nullptr;
+QueueHandle_t background_requests = nullptr;
+unsigned interactive_streak = 0;
 uint32_t generation = 1;
-uint32_t active_session = 0;
+struct Lease {
+    uint32_t generation = 0;
+    char read_root[256] = {};
+};
+// Slot zero is the sole background/exclusive owner; the other slots are readers.
+Lease sessions[3];
+uint32_t active_sessions = 0;
+uint32_t exclusive_waiter = 0;
+// A yielded owner retries within 1 s. Reserve its next turn without keeping an
+// abandoned request alive forever; its resumed session gets to finish once.
+constexpr uint32_t BACKGROUND_RESUME_MS = 1500;
+bool background_resume_pending = false;
+uint32_t background_resume_at = 0;
+uint32_t protected_background = 0;
 uint32_t recorder_waiting = 0;
 TaskHandle_t maintenance_waiter = nullptr;
 bool maintenance_granted = false;
 TaskHandle_t worker = nullptr;
 TaskHandle_t direct_owner = nullptr;
-Request wake_request = {};
 #if AB_USB_MSC_ENABLED
 sdmmc_card_t usb_card = {};
 bool usb_host_started = false;
@@ -81,10 +99,7 @@ struct {
 #endif
 
 void wake_worker() {
-    if (!requests) return;
-    Request *pointer = &wake_request;
-    // A full queue already wakes the worker, which advances handoff after each request.
-    xQueueSend(requests, &pointer, 0);
+    if (worker) xTaskNotifyGive(worker);
 }
 
 void configure_host(sdmmc_host_t &host, sdmmc_slot_config_t &slot) {
@@ -102,15 +117,30 @@ void configure_host(sdmmc_host_t &host, sdmmc_slot_config_t &slot) {
 struct OpenFile {
     fs::File file;
     uint32_t id = 0;
-    void close() { file.close(); id = 0; }
+    uint32_t owner = 0;
+    void close() { file.close(); id = owner = 0; }
 };
-OpenFile readers[2];
+// Background parsing needs two inputs; each browser producer needs one.
+// Four readers + writer leave three of the mount's eight handles for callbacks.
+OpenFile readers[4];
 OpenFile writer;
+char writer_path[256] = {};
 uint32_t next_file = 0;
 
-void close_files() {
-    for (OpenFile &reader : readers) reader.close();
-    writer.close();
+void close_files(uint32_t owner = 0) {
+    for (OpenFile &reader : readers)
+        if (!owner || reader.owner == owner) reader.close();
+    if (!owner || writer.owner == owner) writer.close();
+}
+
+void revoke_sessions() {
+    close_files();
+    for (Lease &session : sessions)
+        __atomic_store_n(&session.generation, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&active_sessions, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&exclusive_waiter, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&protected_background, 0, __ATOMIC_RELEASE);
+    background_resume_pending = false;
 }
 
 OpenFile *find_file(uint32_t id) {
@@ -119,10 +149,11 @@ OpenFile *find_file(uint32_t id) {
     return writer.id == id ? &writer : nullptr;
 }
 
-uint32_t retain_file(OpenFile &slot, const fs::File &file) {
+uint32_t retain_file(OpenFile &slot, const fs::File &file, uint32_t owner) {
     if (++next_file == 0) ++next_file;
     slot.id = next_file;
     slot.file = file;
+    slot.owner = owner;
     return slot.id;
 }
 
@@ -132,17 +163,43 @@ bool background_allowed() {
 }
 
 bool background_allowed(uint32_t expected) {
-    return expected && expected == __atomic_load_n(&active_session, __ATOMIC_ACQUIRE) &&
-        background_allowed();
+    if (!expected || !background_allowed()) return false;
+    for (const Lease &session : sessions)
+        if (expected == __atomic_load_n(&session.generation, __ATOMIC_ACQUIRE)) return true;
+    return false;
+}
+
+bool paths_overlap(const char *left, const char *right) {
+    if (!left || !*left || !right || !*right) return false;
+    const size_t a = strlen(left), b = strlen(right);
+    const size_t common = std::min(a, b);
+    if (strncasecmp(left, right, common)) return false;
+    return a == b || common == 1 || (a < b ? right[a] : left[b]) == '/';
+}
+
+bool mutation_blocked(const Request &request) {
+    if (!request.path || !background_allowed(request.generation)) return false;
+    for (size_t i = 1; i < 3; ++i) {
+        const Lease &session = sessions[i];
+        if (session.generation && (paths_overlap(request.path, session.read_root) ||
+                                  paths_overlap(request.destination, session.read_root))) return true;
+    }
+    return false;
+}
+
+bool read_blocked(const char *root) {
+    if (!root || !*root) return false;
+    if (writer.id && paths_overlap(root, writer_path)) return true;
+    Request *pending = nullptr;
+    return background_requests && xQueuePeek(background_requests, &pending, 0) == pdTRUE &&
+        (paths_overlap(root, pending->path) || paths_overlap(root, pending->destination));
 }
 
 void process_request(Request &value) {
     Request *request = &value;
     request->success = false;
-    if (request->kind == Request::Wake) {
-        return;
-    } else if (request->kind == Request::Mount) {
-        if (local_access_allowed() && !direct_owner && !active_session) mount_card();
+    if (request->kind == Request::Mount) {
+        if (local_access_allowed() && !direct_owner && !active_sessions) mount_card();
         request->success = mounted();
 #if AB_USB_MSC_ENABLED
     } else if (request->kind == Request::UsbIo) {
@@ -161,23 +218,64 @@ void process_request(Request &value) {
         done(result == ESP_OK);
 #endif
     } else if (request->kind == Request::Begin) {
-        if (!direct_owner && !active_session && !maintenance_pending() && mounted() && background_allowed()) {
-            if (++generation == 0) ++generation;
-            __atomic_store_n(&active_session, generation, __ATOMIC_RELEASE);
-            request->generation = generation;
-            request->success = true;
+        if (!mounted() || !background_allowed() || maintenance_pending()) return;
+        if (request->access == Access::Exclusive) {
+            if (!exclusive_waiter) {
+                if (protected_background || (background_resume_pending &&
+                    uint32_t(millis() - background_resume_at) < BACKGROUND_RESUME_MS)) return;
+                background_resume_pending = false;
+                if (++generation == 0) ++generation;
+                __atomic_store_n(&exclusive_waiter, generation, __ATOMIC_RELEASE);
+                request->generation = generation;
+            }
+            if (exclusive_waiter != request->generation || active_sessions || direct_owner) return;
+        } else if (direct_owner || exclusive_waiter) {
+            if (exclusive_waiter && request->access == Access::Background)
+                background_resume_pending = true;
+            return;
         }
+
+        Lease *slot = nullptr;
+        if (request->access == Access::ReadOnly) {
+            if (read_blocked(request->path)) return;
+            for (size_t i = 1; i < 3; ++i)
+                if (!sessions[i].generation) { slot = &sessions[i]; break; }
+        } else if (!sessions[0].generation) slot = &sessions[0];
+        if (!slot) return;
+        if (request->path && strlen(request->path) >= sizeof(slot->read_root)) return;
+        if (request->access != Access::Exclusive) {
+            if (++generation == 0) ++generation;
+            request->generation = generation;
+        }
+        snprintf(slot->read_root, sizeof(slot->read_root), "%s", request->path ? request->path : "");
+        __atomic_store_n(&slot->generation, request->generation, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&active_sessions, 1, __ATOMIC_RELEASE);
+        if (request->access == Access::Background && background_resume_pending) {
+            if (uint32_t(millis() - background_resume_at) < BACKGROUND_RESUME_MS)
+                __atomic_store_n(&protected_background, request->generation, __ATOMIC_RELEASE);
+            background_resume_pending = false;
+        }
+        request->success = true;
     } else if (request->kind == Request::End) {
-        if (active_session == request->generation) {
-            close_files();
-            __atomic_store_n(&active_session, 0, __ATOMIC_RELEASE);
+        for (Lease &session : sessions) {
+            if (!request->generation || session.generation != request->generation) continue;
+            if (&session == &sessions[0] && request->generation != exclusive_waiter && exclusive_waiter)
+                background_resume_pending = true;
+            close_files(request->generation);
+            __atomic_store_n(&session.generation, 0, __ATOMIC_RELEASE);
+            __atomic_sub_fetch(&active_sessions, 1, __ATOMIC_RELEASE);
+        }
+        if (protected_background == request->generation)
+            __atomic_store_n(&protected_background, 0, __ATOMIC_RELEASE);
+        if (exclusive_waiter == request->generation) {
+            __atomic_store_n(&exclusive_waiter, 0, __ATOMIC_RELEASE);
+            background_resume_at = millis();
         }
         request->success = true;
     } else if (request->kind == Request::Acquire || request->kind == Request::TryAcquire) {
         if (local_access_allowed() && mounted() && !direct_owner &&
-            (request->kind == Request::Acquire || !active_session)) {
-            close_files();
-            __atomic_store_n(&active_session, 0, __ATOMIC_RELEASE);
+            (request->kind == Request::Acquire || !active_sessions)) {
+            revoke_sessions();
             __atomic_store_n(&direct_owner, request->caller, __ATOMIC_RELEASE);
             request->success = true;
         }
@@ -195,21 +293,41 @@ void process_request(Request &value) {
     }
 }
 
+Request *next_request() {
+    Request *request = nullptr;
+    if (xQueueReceive(requests, &request, 0) == pdTRUE) return request;
+    Request *background = nullptr;
+    const bool background_ready = xQueuePeek(background_requests, &background, 0) == pdTRUE &&
+        !mutation_blocked(*background);
+    if (interactive_streak < 3 || !background_ready) {
+        if (xQueueReceive(interactive_requests, &request, 0) == pdTRUE) {
+            if (interactive_streak < 3) ++interactive_streak;
+            return request;
+        }
+    }
+    if (background_ready && xQueueReceive(background_requests, &request, 0) == pdTRUE) {
+        interactive_streak = 0;
+        return request;
+    }
+    return nullptr;
+}
+
 void io_task(void *) {
-    Request *request;
     while (true) {
-        if (xQueueReceive(requests, &request, portMAX_DELAY) != pdTRUE) continue;
+        advance_usb();
+        Request *request = next_request();
+        if (!request) { ulTaskNotifyTake(pdTRUE, portMAX_DELAY); continue; }
         process_request(*request);
         if (request->done) xSemaphoreGive(request->done);
-        advance_usb();
     }
 }
 
 bool init_worker() {
     if (worker) return true;
     if (!requests) requests = xQueueCreate(4, sizeof(Request *));
-    if (!requests) return false;
-    wake_request.kind = Request::Wake;
+    if (!interactive_requests) interactive_requests = xQueueCreate(4, sizeof(Request *));
+    if (!background_requests) background_requests = xQueueCreate(4, sizeof(Request *));
+    if (!requests || !interactive_requests || !background_requests) return false;
     BaseType_t created = pdFAIL;
     if (aircannect::Memory::psram_available())
         created = xTaskCreatePinnedToCoreWithCaps(io_task, "sd_io", 4096,
@@ -245,8 +363,13 @@ bool dispatch(Request &request, bool control) {
     request.done = xSemaphoreCreateBinaryStatic(&done_state);
     request.success = false;
     Request *pointer = &request;
-    const bool queued = xQueueSend(requests, &pointer, control ? portMAX_DELAY : 0) == pdTRUE;
-    if (queued) xSemaphoreTake(request.done, portMAX_DELAY);
+    QueueHandle_t queue = control ? requests : request.access == Access::Background
+        ? background_requests : interactive_requests;
+    const bool queued = xQueueSend(queue, &pointer, control ? portMAX_DELAY : 0) == pdTRUE;
+    if (queued) {
+        wake_worker();
+        xSemaphoreTake(request.done, portMAX_DELAY);
+    }
     vSemaphoreDelete(request.done);
     return queued && request.success;
 }
@@ -277,7 +400,7 @@ bool factory_format() {
     portENTER_CRITICAL(&status_mux);
     const bool allowed = !init_started && !formatting && !status.mounted &&
         !__atomic_load_n(&direct_owner, __ATOMIC_ACQUIRE) &&
-        !__atomic_load_n(&active_session, __ATOMIC_ACQUIRE);
+        !__atomic_load_n(&active_sessions, __ATOMIC_ACQUIRE);
     if (allowed) formatting = true;
     portEXIT_CRITICAL(&status_mux);
     if (!allowed) {
@@ -473,8 +596,7 @@ void advance_usb() {
     bool usb_failed = false;
     const Mode mode = __atomic_load_n(&status.mode, __ATOMIC_ACQUIRE);
     if (mode == Mode::ToUsb) {
-        close_files();
-        __atomic_store_n(&active_session, 0, __ATOMIC_RELEASE);
+        revoke_sessions();
         if (__atomic_load_n(&direct_owner, __ATOMIC_ACQUIRE)) return;
         // Covers an update/reboot admitted just before the handoff request.
         if (OtaManager::busy()) {
@@ -601,7 +723,7 @@ bool usb_transfer(bool write, uint32_t sector, uint8_t *buffer, size_t size,
     usb_io.done = done;
     usb_io.request.kind = Request::UsbIo;
     Request *pointer = &usb_io.request;
-    if (xQueueSend(requests, &pointer, 0) == pdTRUE) return true;
+    if (xQueueSend(requests, &pointer, 0) == pdTRUE) { wake_worker(); return true; }
     __atomic_store_n(&usb_io_pending, false, __ATOMIC_RELEASE);
     wake_worker();
     return false;
@@ -729,7 +851,7 @@ bool maintenance_ready() {
 #if AB_STORAGE_HAS_SDCARD
     const TaskHandle_t waiting = __atomic_load_n(&maintenance_waiter, __ATOMIC_ACQUIRE);
     return !waiting || (waiting == xTaskGetCurrentTaskHandle() &&
-        !__atomic_load_n(&active_session, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&active_sessions, __ATOMIC_ACQUIRE) &&
         !__atomic_load_n(&direct_owner, __ATOMIC_ACQUIRE));
 #else
     return false;
@@ -745,14 +867,20 @@ void release() {
 #endif
 }
 
-bool Session::begin() {
+bool Session::begin(Access access, const char *read_root) {
 #if AB_STORAGE_HAS_SDCARD
+    if (valid()) return access == access_;
     Request request = {};
     request.kind = Request::Begin;
-    if (!dispatch(request, false)) return false;
+    request.access = access;
+    request.path = read_root;
+    request.generation = generation_;
+    const bool admitted = dispatch(request, false);
     generation_ = request.generation;
-    return true;
+    access_ = access;
+    return admitted;
 #else
+    (void)access; (void)read_root;
     return false;
 #endif
 }
@@ -776,6 +904,16 @@ bool Session::valid() const {
 #endif
 }
 
+bool Session::yield_requested() const {
+#if AB_STORAGE_HAS_SDCARD
+    return access_ == Access::Background && (maintenance_pending() ||
+        (__atomic_load_n(&exclusive_waiter, __ATOMIC_ACQUIRE) &&
+         generation_ != __atomic_load_n(&protected_background, __ATOMIC_ACQUIRE)));
+#else
+    return false;
+#endif
+}
+
 bool Session::run(bool (*operation)(fs::FS &, void *), void *context) const {
 #if AB_STORAGE_HAS_SDCARD
     if (!operation || !valid() || xTaskGetCurrentTaskHandle() == worker) return false;
@@ -784,6 +922,26 @@ bool Session::run(bool (*operation)(fs::FS &, void *), void *context) const {
     request.operation = operation;
     request.context = context;
     request.generation = generation_;
+    request.access = access_;
+    return dispatch(request, false);
+#else
+    return false;
+#endif
+}
+
+bool Session::mutate(const char *path, const char *destination,
+                     bool (*operation)(fs::FS &, void *), void *context) const {
+#if AB_STORAGE_HAS_SDCARD
+    if (!path || !*path || access_ == Access::ReadOnly || !operation || !valid() ||
+        xTaskGetCurrentTaskHandle() == worker) return false;
+    Request request = {};
+    request.kind = Request::Run;
+    request.operation = operation;
+    request.context = context;
+    request.generation = generation_;
+    request.access = access_;
+    request.path = path;
+    request.destination = destination;
     return dispatch(request, false);
 #else
     return false;
@@ -796,13 +954,18 @@ bool Reader::open(const Session &session, const char *path, bool directory) {
     if (!path) return false;
     const bool opened = session.run([&](fs::FS &fs) {
         OpenFile *slot = nullptr;
-        for (OpenFile &reader : readers) if (!reader.id) { slot = &reader; break; }
+        unsigned held = 0;
+        for (OpenFile &reader : readers) {
+            if (reader.owner == session.generation_) ++held;
+            if (!slot && !reader.id) slot = &reader;
+        }
+        if (held >= (session.access_ == Access::ReadOnly ? 1u : 2u)) return false;
         if (!slot) return false;
         fs::File file = fs.open(path, FILE_READ);
         if (!file || file.isDirectory() != directory) return false;
         size_ = file.size();
         modified_ = file.getLastWrite();
-        handle_ = retain_file(*slot, file);
+        handle_ = retain_file(*slot, file, session.generation_);
         return true;
     });
     if (!opened) return false;
@@ -881,11 +1044,13 @@ void Reader::close() {
 bool Writer::open(const Session &session, const char *path, uint64_t append_at) {
     close();
 #if AB_STORAGE_HAS_SDCARD
-    if (!path || append_at > UINT32_MAX || !session.run([&](fs::FS &fs) {
+    if (!path || strlen(path) >= sizeof(writer_path) || append_at > UINT32_MAX ||
+        !session.mutate(path, [&](fs::FS &fs) {
         if (writer.id) return false;
         fs::File file = fs.open(path, append_at ? FILE_APPEND : FILE_WRITE);
         if (!file || file.isDirectory() || (append_at && file.size() != append_at)) return false;
-        handle_ = retain_file(writer, file);
+        handle_ = retain_file(writer, file, session.generation_);
+        strcpy(writer_path, path);
         return true;
     })) return false;
     session_ = session;

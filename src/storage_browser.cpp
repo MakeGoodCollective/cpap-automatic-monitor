@@ -304,7 +304,7 @@ const char *mutate(Job &job, uint32_t &changed) {
         char destination[256];
         if (!rename_target(job.request, destination)) return "invalid_name";
         const char *error = "storage_busy";
-        const bool renamed = job.session.run([&](fs::FS &fs) {
+        const bool renamed = job.session.mutate(job.request.path, destination, [&](fs::FS &fs) {
             if (job.cancelled.load()) { error = "cancelled"; return false; }
             if (!fs.exists(job.request.path)) { error = "not_found"; return false; }
             if (fs.exists(destination)) { error = "destination_exists"; return false; }
@@ -324,7 +324,7 @@ const char *mutate(Job &job, uint32_t &changed) {
     for (size_t i = job.entry_count; i > 0; i--) {
         if (job.cancelled.load() || !job.session.valid()) { error = "cancelled"; break; }
         const ZipEntry &entry = job.entries[i - 1];
-        const bool removed = job.session.run([&](fs::FS &fs) {
+        const bool removed = job.session.mutate(entry.path, [&](fs::FS &fs) {
             if (job.cancelled.load()) return false;
             if (!(entry.directory ? fs.rmdir(entry.path) : fs.remove(entry.path))) return false;
             SdStorage::notify_files_changed();
@@ -483,13 +483,16 @@ void produce(void *context) {
     delete static_cast<std::shared_ptr<Job> *>(context);
     bool success = false;
     job->report(LOG_DEBUG, "started");
-    bool admitted = job->session.begin();
-    // A foreground artifact read has asked background preparation to yield.
-    // Wait only in this producer, never AsyncTCP or the SD executor.
-    while (!admitted && job->request.kind == Kind::Immutable && !job->cancelled.load() &&
+    const SdStorage::Access access = mutating(job->request.kind)
+        ? SdStorage::Access::Exclusive : SdStorage::Access::ReadOnly;
+    const char *read_root = access == SdStorage::Access::ReadOnly && job->request.kind != Kind::List
+        ? job->request.path : nullptr;
+    bool admitted = job->session.begin(access, read_root);
+    // Wait for a checkpoint/overlapping write in this producer, never AsyncTCP.
+    while (!admitted && !job->cancelled.load() &&
            SdStorage::local_access_allowed() && uint32_t(millis() - job->started_ms) < 2000) {
         vTaskDelay(pdMS_TO_TICKS(10));
-        admitted = job->session.begin();
+        admitted = job->session.begin(access, read_root);
     }
     if (admitted && job->request.kind == Kind::Immutable)
         Log::logf(CAT_STORAGE, LOG_DEBUG, "artifact admitted wait=%ums path=%s\n",
@@ -558,10 +561,9 @@ StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &
                   Released released) {
     if (!valid_request(request)) return StartResult::BadRequest;
     if (!SdStorage::local_access_allowed() || !SdStorage::mounted()) return StartResult::Unavailable;
-    // The preceding response can outlive its last byte or an aborted fetch.
-    // Admit one bounded successor; its worker waits for the exclusive SD
-    // session. Other browser operations retain their single-operation limit.
-    const unsigned limit = request.kind == Kind::Immutable ? 2 : 1;
+    // Two readers may coexist, including a response outliving its producer.
+    // Mutations keep a single browser job until their exclusive lease finishes.
+    const unsigned limit = mutating(request.kind) ? 1 : 2;
     unsigned active_count = active_operations.load();
     for (;;) {
         if (active_count >= limit) {

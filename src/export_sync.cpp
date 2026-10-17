@@ -76,7 +76,11 @@ struct RunContext {
     bool network_only;
     uint32_t config_revision;
     Config::Section section;
+    // Reservation expiry cannot undo cancellation already observed by I/O.
+    bool storage_yielded;
 };
+
+enum class RunResult : uint8_t { Finished, Yielded };
 
 struct EngineAdapter {
     Engine id;
@@ -90,7 +94,7 @@ struct EngineAdapter {
     portMUX_TYPE *mux;
     void (*set_state)(State, const char *);
     bool (*check_connection)(RunContext &, char *, size_t);
-    void (*run)(const Request &);
+    RunResult (*run)(const Request &);
 
     bool supports(Action action) const {
         return action <= Action::Repair && (actions & (1u << unsigned(action)));
@@ -261,11 +265,17 @@ static void publish_sleephq_progress(
     publish_change();
 }
 
+static bool run_interrupted(const RunContext &run) {
+    return run.storage_yielded || generation_aborted(run.generation) ||
+           Config::revision(run.section) != run.config_revision ||
+           (run.network_only ? !AirSenseState::device_standby() : !storage.valid());
+}
+
 static bool run_aborted(void *context) {
-    const RunContext *run = static_cast<const RunContext *>(context);
-    return !run || generation_aborted(run->generation) ||
-           Config::revision(run->section) != run->config_revision ||
-           (run->network_only ? !AirSenseState::device_standby() : !storage.valid());
+    RunContext *run = static_cast<RunContext *>(context);
+    if (!run) return true;
+    if (!run->network_only && storage.yield_requested()) run->storage_yielded = true;
+    return run_interrupted(*run);
 }
 
 static bool wait_resolve(StorageSmbClient &client, RunContext &run,
@@ -362,9 +372,12 @@ static bool wait_close(StorageSmbClient &client, RunContext &run,
 }
 
 static void disconnect(StorageSmbClient &client, RunContext &run) {
+    // Cleanup may be interrupted too, but cannot change the transfer's outcome.
+    RunContext cleanup = run;
+    cleanup.operation.ctx = &cleanup;
     for (uint16_t i = 0; i < 200; i++) {
         const StorageSmbOperationResult result =
-            client.step_disconnect(&run.operation);
+            client.step_disconnect(&cleanup.operation);
         if (result != StorageSmbOperationResult::Waiting) return;
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -424,7 +437,7 @@ static bool write_smb_marker(const char *directory, const char *path,
     char partial[88];
     if (snprintf(partial, sizeof(partial), "%s.part", path) >=
         static_cast<int>(sizeof(partial))) return false;
-    return storage.run([&](fs::FS &fs) {
+    return storage.mutate(directory, [&](fs::FS &fs) {
         if (!fs.exists(directory) && !fs.mkdir(directory)) return false;
         fs.remove(partial);
         fs::File file = fs.open(partial, FILE_WRITE);
@@ -488,7 +501,8 @@ struct RootFileState {
 
 static bool read_root_state(const SmbConfig &config, const char *path,
                              uint8_t *buffer, size_t buffer_size,
-                             RootFileState &out, char *error, size_t error_size) {
+                             RootFileState &out, char *error, size_t error_size,
+                             RunContext &run) {
     if (!state_marker_path(config, path + 1, out.directory, sizeof(out.directory),
                            out.path, sizeof(out.path))) return false;
     if (!storage.run([&](fs::FS &fs) { out.exists = fs.exists(path); return true; }))
@@ -503,6 +517,10 @@ static bool read_root_state(const SmbConfig &config, const char *path,
     const uint64_t size = input.size();
     uint32_t crc = crc32_ieee_initial();
     for (uint64_t remaining = size; remaining;) {
+        if (run_aborted(&run)) {
+            copy_text(error, error_size, "preempted");
+            return false;
+        }
         const size_t wanted = remaining < buffer_size ? remaining : buffer_size;
         if (input.read(buffer, wanted) != wanted) {
             copy_text(error, error_size, "local_read_short");
@@ -568,7 +586,7 @@ static bool sync_smb_file(StorageSmbClient &client, const char *local_path,
     }
     // A failed overwrite must not leave confirmation of the previous contents.
     if (root) roots_cached = false;
-    if (root && !storage.run([&](fs::FS &fs) {
+    if (root && !storage.mutate(root->path, [&](fs::FS &fs) {
         return !fs.exists(root->path) || fs.remove(root->path);
     })) {
         copy_text(error, error_size, "state_marker_remove");
@@ -650,7 +668,7 @@ static bool sync_root_files(StorageSmbClient &client, const SmbConfig &config,
                             char *error, size_t error_size) {
     for (const char *path : ROOT_FILES) {
         RootFileState state;
-        if (!read_root_state(config, path, buffer, buffer_size, state, error, error_size))
+        if (!read_root_state(config, path, buffer, buffer_size, state, error, error_size, run))
             return false;
         if (!state.exists) continue;
         if (!sync_smb_file(client, path, &state, buffer, buffer_size,
@@ -679,9 +697,7 @@ static bool snapshot_smb_config(SmbConfig &out,
     return true;
 }
 
-static bool run_smb(const Request &request) {
-    const uint32_t config_revision = request.kind == RequestKind::PostTherapy
-        ? Config::revision(Config::Section::Smb) : request.config_revision;
+static bool run_smb(const Request &request, RunContext &run) {
     char error[64] = {};
     SmbConfig config = {};
     if (!snapshot_smb_config(config, error, sizeof(error))) {
@@ -719,10 +735,6 @@ static bool run_smb(const Request &request) {
         return false;
     }
 
-    RunContext run = {};
-    run.generation = request.generation;
-    run.section = Config::Section::Smb;
-    run.config_revision = config_revision;
     run.operation.started_ms = millis();
     run.operation.last_progress_ms = run.operation.started_ms;
     run.operation.timeout_ms = OPERATION_IDLE_TIMEOUT_MS;
@@ -739,6 +751,10 @@ static bool run_smb(const Request &request) {
 
     if (success) {
         for (uint32_t i = catalog.entries; success && i > 0; i--) {
+            if (run_aborted(&run)) {
+                success = false;
+                break;
+            }
             EdfCatalog::Entry entry;
             if (!storage.run([&](fs::FS &) { return EdfCatalog::read(i - 1, entry); })) {
                 copy_text(error, sizeof(error), "catalog_read");
@@ -768,7 +784,7 @@ static bool run_smb(const Request &request) {
     else client.abort_connection();
     heap_caps_free(buffer);
     if (!success || run_aborted(&run)) {
-        if (run_aborted(&run)) set_state(State::Idle);
+        if (run_interrupted(run)) set_state(State::Idle);
         else set_state(State::Error,
                        error[0] ? error : "smb_sync_failed");
         return false;
@@ -878,9 +894,8 @@ static void sleephq_failed(const char *error, const SleepHqSync::Progress &progr
               request[0] ? request : "-", progress.file[0] ? progress.file : "-");
 }
 
-static bool run_sleephq(const Request &request) {
-    const uint32_t config_revision = request.kind == RequestKind::PostTherapy
-        ? Config::revision(Config::Section::SleepHq) : request.config_revision;
+static bool run_sleephq(const Request &request, RunContext &run) {
+    const uint32_t config_revision = run.config_revision;
     if (request.kind == RequestKind::Manual ||
         sleephq_retry.config_revision != config_revision)
         reset_sleephq_retry(config_revision);
@@ -924,10 +939,6 @@ static bool run_sleephq(const Request &request) {
         return false;
     }
 
-    RunContext run = {};
-    run.generation = request.generation;
-    run.section = Config::Section::SleepHq;
-    run.config_revision = config_revision;
     run.operation.started_ms = millis();
     run.operation.last_progress_ms = run.operation.started_ms;
     run.operation.timeout_ms = SLEEPHQ_IDLE_TIMEOUT_MS;
@@ -984,7 +995,7 @@ static bool run_sleephq(const Request &request) {
     }
 
     if (!success || run_aborted(&run)) {
-        if (run_aborted(&run)) set_sleephq_state(State::Idle);
+        if (run_interrupted(run)) set_sleephq_state(State::Idle);
         else sleephq_failed(error[0] ? error : "sleephq_sync_failed",
                             progress, sync.last_request());
         return false;
@@ -1094,6 +1105,10 @@ static void refresh_backlog() {
         smb_revision == backlog_smb_revision && shq_revision == backlog_shq_revision) return;
     if (uxQueueMessagesWaiting(request_queue) || !catalog.ready ||
         !AirSenseState::device_standby() || !storage.begin()) return;
+    RunContext run = {};
+    run.generation = __atomic_load_n(&abort_generation, __ATOMIC_ACQUIRE);
+    run.section = Config::Section::Smb;
+    run.config_revision = smb_revision;
     __atomic_store_n(&backlog_refresh, false, __ATOMIC_RELEASE);
     const bool files_changed = __atomic_exchange_n(&backlog_files_changed, false, __ATOMIC_ACQ_REL);
     if (files_changed) roots_cached = false;
@@ -1141,7 +1156,7 @@ static void refresh_backlog() {
     }
 
     for (uint32_t i = 0; i < catalog.entries && (smb.known || shq.known); ++i) {
-        if (uxQueueMessagesWaiting(request_queue)) {
+        if (uxQueueMessagesWaiting(request_queue) || run_aborted(&run)) {
             storage.end();
             __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
             return;
@@ -1187,8 +1202,8 @@ static void refresh_backlog() {
         }
         shq.files += cached.shq_files;
         shq.sessions += (cached.flags & SHQ_PENDING) ? 1 : 0;
-        if (!storage.valid()) {
-            cached.flags = 0;
+        if (run_aborted(&run)) {
+            if (!storage.valid()) cached.flags = 0;
             storage.end();
             __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
             return;
@@ -1202,14 +1217,14 @@ static void refresh_backlog() {
         smb.known = buffer != nullptr;
         if (!buffer) copy_text(smb.error, sizeof(smb.error), "backlog_alloc");
         for (const char *path : ROOT_FILES) {
-            if (!smb.known) break;
+            if (!smb.known || run_aborted(&run)) break;
             RootFileState state;
             smb.known = read_root_state(smb_config, path, buffer,
-                SdStorage::READ_CHUNK_BYTES, state, smb.error, sizeof(smb.error));
+                SdStorage::READ_CHUNK_BYTES, state, smb.error, sizeof(smb.error), run);
             if (state.exists && !state.confirmed) ++pending;
         }
         aircannect::Memory::free(buffer);
-        roots_cached = smb.known;
+        roots_cached = smb.known && !run_interrupted(run);
         if (roots_cached) {
             roots_pending = pending;
             roots_endpoint = endpoint_hash(smb_config);
@@ -1217,6 +1232,11 @@ static void refresh_backlog() {
         }
     }
     if (smb.known) smb.files += roots_pending;
+    if (storage.valid() && run.storage_yielded) {
+        storage.end();
+        __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
+        return;
+    }
     if (!storage.valid() || Config::revision(Config::Section::Smb) != smb_revision ||
         Config::revision(Config::Section::SleepHq) != shq_revision) {
         // An interrupted marker read is not evidence that the marker is absent.
@@ -1242,14 +1262,14 @@ static void refresh_backlog() {
 }
 
 template <typename T>
-static void run_logged(const Request &request,
-                        bool (*run)(const Request &), void (*snapshot)(T &),
-                        bool generic_error = true) {
+static RunResult run_logged(const Request &request,
+                             bool (*run)(const Request &, RunContext &),
+                             void (*snapshot)(T &), bool generic_error = true) {
     const char *name = engine_name(request.engine);
     const auto section = engine_adapter(request.engine)->section;
     const uint32_t config_revision = Config::revision(section);
     if (request_aborted(request)) {
-        return;
+        return RunResult::Finished;
     }
     const uint32_t started = millis();
     Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync started reason=%s wait=%lums\n", name,
@@ -1257,7 +1277,11 @@ static void run_logged(const Request &request,
               request.kind == RequestKind::PostTherapy ? "post_therapy" :
               request.kind == RequestKind::Startup ? "startup" : "manual",
               (unsigned long)(started - request.queued_ms));
-    bool success = run(request);
+    RunContext context = {};
+    context.generation = request.generation;
+    context.section = section;
+    context.config_revision = config_revision;
+    const bool success = run(request, context);
     T result;
     snapshot(result);
     if (!success && (generation_aborted(request.generation) || !storage.valid() ||
@@ -1265,6 +1289,8 @@ static void run_logged(const Request &request,
         Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync interrupted: %s\n", name,
                   Config::revision(section) != config_revision ? "configuration changed" :
                   generation_aborted(request.generation) ? "therapy started" : "storage changed");
+    } else if (!success && context.storage_yielded) {
+        Log::logf(CAT_EXPORT, LOG_DEBUG, "[%s] Sync paused for storage\n", name);
     } else if (!success) {
         if (generic_error)
             Log::logf(CAT_EXPORT, LOG_ERROR, "[%s] Sync failed: %s\n", name, result.last_error);
@@ -1284,6 +1310,7 @@ static void run_logged(const Request &request,
     Log::logf(CAT_EXPORT, LOG_DEBUG, "[%s] Worker stack minimum free=%u/%u bytes\n",
               name, (unsigned)uxTaskGetStackHighWaterMark(nullptr),
               (unsigned)EXPORT_TASK_STACK);
+    return !success && context.storage_yielded ? RunResult::Yielded : RunResult::Finished;
 }
 
 constexpr uint8_t SYNC_CHECK_ACTIONS = (1u << unsigned(Action::Sync)) |
@@ -1293,7 +1320,7 @@ const EngineAdapter engines[] = {
      &AirBridgeConfig::smb_enabled, &AirBridgeConfig::smb_auto_after_therapy,
      [] { return !Config::get().smb_endpoint.isEmpty(); },
      &status.state, &status.check, &status_mux, set_state, check_smb,
-     [](const Request &request) { run_logged(request, run_smb, get_status); }},
+     [](const Request &request) { return run_logged(request, run_smb, get_status); }},
     {Engine::SleepHq, Config::Section::SleepHq,
      SYNC_CHECK_ACTIONS | (1u << unsigned(Action::Repair)),
      &AirBridgeConfig::sleephq_enabled, &AirBridgeConfig::sleephq_auto_after_therapy,
@@ -1303,8 +1330,8 @@ const EngineAdapter engines[] = {
      [](const Request &request) {
          if (request.kind != RequestKind::Manual && request.kind != RequestKind::Retry &&
              sleephq_retry.config_revision == Config::revision(Config::Section::SleepHq) &&
-             (sleephq_retry.pending || sleephq_retry.blocked)) return;
-         run_logged(request, run_sleephq, get_sleephq_status, false);
+             (sleephq_retry.pending || sleephq_retry.blocked)) return RunResult::Finished;
+         return run_logged(request, run_sleephq, get_sleephq_status, false);
      }},
 };
 static_assert(sizeof(engines) / sizeof(engines[0]) == size_t(Engine::Count),
@@ -1366,18 +1393,13 @@ static void export_task(void *) {
         const uint32_t preparation = request.kind == RequestKind::PostTherapy
             ? EdfReport::prepare_before_export(request.entry.therapy_day) : 0;
         const uint32_t preparation_started = millis();
-        bool admitted = false;
         while (!request_aborted(request)) {
             const bool preparing = EdfReport::preparation_pending(preparation) &&
                 uint32_t(millis() - preparation_started) < 60000;
-            if (!preparing && AirSenseState::device_standby() && storage.begin()) {
-                admitted = true;
-                break;
-            }
+            if (!preparing) break;
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        if (!admitted || request_aborted(request)) {
-            storage.end();
+        if (request_aborted(request)) {
             settle_request(request);
             continue;
         }
@@ -1392,9 +1414,20 @@ static void export_task(void *) {
             selected.engine = engine.id;
             if (request.kind == RequestKind::PostTherapy)
                 selected.config_revision = Config::revision(engine.section);
-            engine.run(selected);
+            while (!request_aborted(selected)) {
+                if (WiFi.status() != WL_CONNECTED ||
+                    !AirSenseState::device_standby() || !storage.begin()) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    continue;
+                }
+                const RunResult result = engine.run(selected);
+                const bool yielded = result == RunResult::Yielded && storage.valid() &&
+                    !request_aborted(selected);
+                storage.end();
+                if (!yielded) break;
+                engine.set_state(State::Pending, nullptr);
+            }
         }
-        storage.end();
         settle_request(request);
     }
 }

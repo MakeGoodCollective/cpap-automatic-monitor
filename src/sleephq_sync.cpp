@@ -239,7 +239,7 @@ static bool decode_journal(const uint8_t *data, Journal &journal) {
 static JournalLoad load_journal(SdStorage::Session &access, const StatePaths &paths,
                                 Journal &journal, bool recover = true) {
     JournalLoad result = JournalLoad::Missing;
-    const bool loaded = access.run([&](fs::FS &storage) {
+    auto read = [&](fs::FS &storage) {
         if (recover) recover_journal(storage, paths);
         const char *path = !recover && !storage.exists(paths.journal)
             ? paths.journal_backup : paths.journal;
@@ -254,12 +254,15 @@ static JournalLoad load_journal(SdStorage::Session &access, const StatePaths &pa
         }
         result = valid ? JournalLoad::Valid : JournalLoad::Invalid;
         return true;
-    });
+    };
+    const bool loaded = recover
+        ? access.mutate(paths.journal_backup, paths.journal, read)
+        : access.run(read);
     return loaded ? result : JournalLoad::Unavailable;
 }
 
 static bool remove_journal(SdStorage::Session &access, const StatePaths &paths) {
-    return access.run([&](fs::FS &storage) {
+    return access.mutate(paths.directory, [&](fs::FS &storage) {
         // Remove recovery copies first so a failed cleanup cannot resurrect one.
         for (const char *path : {paths.journal_backup, paths.journal_part, paths.journal})
             if (storage.exists(path) && !storage.remove(path)) return false;
@@ -328,7 +331,7 @@ static bool write_marker(SdStorage::Session &access, const StatePaths &paths,
                      backup, sizeof(backup))) return false;
     uint8_t data[MARKER_SIZE];
     encode_marker(entry, data);
-    return access.run([&](fs::FS &storage) {
+    return access.mutate(paths.directory, [&](fs::FS &storage) {
         return ensure_state_directory(storage, paths) &&
                replace_file(storage, path, part, backup, data, sizeof(data));
     });
@@ -568,7 +571,7 @@ static bool day_paths(const Config &config, const char *day, StatePaths &paths) 
 static JournalLoad load_day(SdStorage::Session &storage, const StatePaths &paths,
                             const char *day, DayState &state, bool recover = true) {
     JournalLoad result = JournalLoad::Missing;
-    const bool ok = storage.run([&](fs::FS &fs) {
+    auto read = [&](fs::FS &fs) {
         if (recover) recover_journal(fs, paths);
         const char *path = !recover && !fs.exists(paths.journal)
             ? paths.journal_backup : paths.journal;
@@ -589,7 +592,10 @@ static JournalLoad load_day(SdStorage::Session &storage, const StatePaths &paths
             memcpy(state.processed_at, b + 20, sizeof(state.processed_at));
         }
         return true;
-    });
+    };
+    const bool ok = recover
+        ? storage.mutate(paths.journal_backup, paths.journal, read)
+        : storage.run(read);
     return ok ? result : JournalLoad::Unavailable;
 }
 
@@ -614,7 +620,7 @@ static bool save_day(SdStorage::Session &storage, const StatePaths &paths,
     memcpy(b + 20, state.processed_at, sizeof(state.processed_at));
     memcpy(b + 52, day, 8);
     SdStorage::put_le32(b + 60, crc32_ieee(b, 60));
-    return storage.run([&](fs::FS &fs) {
+    return storage.mutate(paths.directory, [&](fs::FS &fs) {
         return ensure_state_directory(fs, paths) &&
             replace_file(fs, paths.journal, paths.journal_part,
                          paths.journal_backup, b, sizeof(b));
@@ -855,7 +861,7 @@ static bool verify_source(const SdStorage::Session &storage,
                            BackgroundOperationControl &operation,
                            char *error, size_t error_size) {
     if (!operation_allows(operation, error, error_size)) return false;
-    // The captured SD lease excludes writers; recorder acquisition revokes it.
+    // Read-only sessions may coexist, but source mutation needs this lease to end.
     if (!storage.valid()) {
         set_error(error, error_size, "source_changed");
         return false;

@@ -15,6 +15,7 @@ constexpr size_t READ_CHUNK_BYTES = 4096;
 constexpr size_t WRITE_CHUNK_BYTES = 4096;
 
 enum class Mode : uint8_t { Local, ToUsb, Usb, ToLocal };
+enum class Access : uint8_t { Background, ReadOnly, Exclusive };
 
 struct Status {
     bool supported;
@@ -100,15 +101,21 @@ void release();
 
 class Session {
 public:
-    // One auxiliary operation at a time. Copies borrow the token; the owner
-    // must end it after closing its Readers/Writer. Recorder acquisition revokes it.
-    bool begin();
+    // One background session and two interactive readers may coexist. A read
+    // root protects a download's file/subtree from mutation, not all SD work.
+    // Exclusive access reserves admission until other sessions finish. Call
+    // end even after failed admission to abandon that reservation. Copies borrow
+    // the token; the owner ends it after its Readers/Writer. Recording revokes all.
+    bool begin(Access access = Access::Background, const char *read_root = nullptr);
     void end();
     bool valid() const;
+    // Cooperative checkpoint hint, not revocation; admitted I/O may still finish.
+    bool yield_requested() const;
 
     // Blocking task API, not for HTTP/RX callbacks. The operation must finish
-    // one bounded filesystem step and must not retain File objects or do UART
-    // or network work. Caller context remains alive until completion.
+    // one bounded read/metadata step and must not retain File objects or do UART
+    // or network work. Caller context remains alive until completion. Mutations
+    // use mutate so existing downloads keep their stable source.
     bool run(bool (*operation)(fs::FS &, void *), void *context) const;
     template <typename F> bool run(F &&operation) const {
         return run([](fs::FS &fs, void *context) {
@@ -116,8 +123,24 @@ public:
         }, &operation);
     }
 
+    // Waits for overlapping download scopes; a rename protects both paths.
+    bool mutate(const char *path, const char *destination,
+                bool (*operation)(fs::FS &, void *), void *context) const;
+    template <typename F> bool mutate(const char *path, const char *destination,
+                                      F &&operation) const {
+        return mutate(path, destination, [](fs::FS &fs, void *context) {
+            return (*static_cast<typename std::remove_reference<F>::type *>(context))(fs);
+        }, &operation);
+    }
+    template <typename F> bool mutate(const char *path, F &&operation) const {
+        return mutate(path, nullptr, operation);
+    }
+
 private:
     uint32_t generation_ = 0;
+    Access access_ = Access::Background;
+    friend class Reader;
+    friend class Writer;
 };
 
 class Reader {
@@ -150,9 +173,9 @@ private:
     uint64_t offset_ = 0;
 };
 
-// One sequential output alongside the two readers, all held by the SD worker.
+// One output and two background inputs, plus one input per interactive reader.
 // For replaceable files: create/truncate a temporary path, finish, then publish
-// via Session::run. Revocation closes it before recorder/USB access begins.
+// via Session::mutate. Revocation closes it before recorder/USB access begins.
 class Writer {
 public:
     Writer() = default;

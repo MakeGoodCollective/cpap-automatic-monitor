@@ -295,7 +295,7 @@ struct Job {
     uint16_t consumers = 1, deliveries = 0;
     bool delivered = false, cancelled = false, shared = false;
     bool background = false, recovered_index = false;
-    mutable bool artifact_preempted = false;
+    mutable bool storage_yielded = false;
     uint32_t foreground_epoch = 0;
     int code = 0;
     const char *error = nullptr;
@@ -575,8 +575,8 @@ bool aborted(const Job *job, const SdStorage::Session &session) {
     static uint32_t batch_us = 0;
     const uint32_t now = micros();
     if (uint32_t(now - batch_us) >= 4000) { vTaskDelay(1); batch_us = micros(); }
-    if (__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) || SdStorage::maintenance_pending()) {
-        if (job) job->artifact_preempted = true;
+    if (session.yield_requested()) {
+        if (job) job->storage_yielded = true;
         return true;
     }
     return (job && __atomic_load_n(&job->cancelled, __ATOMIC_ACQUIRE)) ||
@@ -646,7 +646,7 @@ bool refresh_index(const SdStorage::Session &session) {
         incremental = EdfCatalog::changes_since(catalog_generation, changes);
         return changes.catalog.ready;
     })) {
-        if (!session.valid() || !AirSenseState::local_background_allowed()) index_failure = IndexFailure::Preempted;
+        if (aborted(nullptr, session)) index_failure = IndexFailure::Preempted;
         else if (!changes.catalog.ready) index_failure = IndexFailure::WaitingCatalog;
         return false;
     }
@@ -1202,7 +1202,7 @@ struct PartGuard {
         writer.close();
         if (complete) return;
         cache_usage_known = false;
-        (void)session.run([&](fs::FS &fs) { return !fs.exists(path) || fs.remove(path); });
+        (void)session.mutate(path, [&](fs::FS &fs) { return !fs.exists(path) || fs.remove(path); });
     }
 };
 
@@ -1926,15 +1926,15 @@ void foreground_activity() {
 }
 
 bool cleanup_cancelled(void *context) {
-    return foreground_wait() || ExportSync::busy() ||
+    return __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) || foreground_wait() || ExportSync::busy() ||
         aborted(nullptr, *static_cast<const SdStorage::Session *>(context));
 }
 
 bool discard_index(const SdStorage::Session &session, const uint8_t digest[32]) {
-    // SD ownership serializes unlink with the actual read, not its admission.
-    // A newly admitted reader waits for this session, then opens the file;
-    // retained heads are never candidates. Do not reject it during an unlink.
-    return !__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) && ReportArtifact::index_discard(session, digest);
+    // Keep admitted artifact graphs alive. The SD mutation also serializes an
+    // unlink with any overlapping stable read already admitted by storage.
+    return !__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) && ReportArtifact::index_discard(session, digest,
+        [](void *) { return __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) != 0; });
 }
 
 bool retire_index(const SdStorage::Session &session) {
@@ -2050,7 +2050,11 @@ bool cleanup_indexes(const SdStorage::Session &session) {
 }
 
 bool publish_index(const SdStorage::Session &session) {
-    if (!retire_index(session)) return false;
+    if (retired_index.bytes && __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE)) {
+        // Readers delay collection, not publication. Rediscover the displaced
+        // body in GC rather than retaining an unbounded list in RAM.
+        index_cleanup.files = UINT32_MAX;
+    } else if (!retire_index(session)) return false;
     const uint32_t artifacts = status.artifact_revision;
     const uint32_t data = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
     if (published_index_data == data && published_index_artifacts == artifacts) {
@@ -2244,7 +2248,7 @@ double chart_scale(size_t c, const ReportEdf::Signal &signal) {
 }
 
 bool start_part(PartGuard &part, const uint8_t *header, size_t bytes) {
-    if (!part.session.run([&](fs::FS &fs) {
+    if (!part.session.mutate(part.path, [&](fs::FS &fs) {
         if ((!fs.exists("/airbridge") && !fs.mkdir("/airbridge")) ||
             (!fs.exists(CACHE_DIR) && !fs.mkdir(CACHE_DIR))) return false;
         char directory[96];
@@ -2259,7 +2263,7 @@ bool start_part(PartGuard &part, const uint8_t *header, size_t bytes) {
 bool finish_part(PartGuard &part, const char *path, uint64_t bytes) {
     if (!part.writer.finish(bytes)) return false;
     uint64_t old_bytes = 0;
-    const bool success = part.session.run([&](fs::FS &fs) {
+    const bool success = part.session.mutate(part.path, path, [&](fs::FS &fs) {
         fs::File old = fs.open(path, FILE_READ);
         if (old) old_bytes = old.size();
         old.close();
@@ -2301,7 +2305,7 @@ bool migrate_cache(const SdStorage::Session &session) {
             cache_path(entry, base + 16, path);
             snprintf(parent, sizeof(parent), "%s/%s", CACHE_DIR, entry.entry.therapy_day);
             // A rename is restart-safe. Never overwrite an independently existing copy.
-            if (!session.run([&](fs::FS &fs) {
+            if (!session.mutate(old, path, [&](fs::FS &fs) {
                 return fs.exists(path) || ((!fs.exists(parent) ? fs.mkdir(parent) : true) && fs.rename(old, path));
             })) return false;
             break;
@@ -2824,7 +2828,12 @@ struct DayCleanup {
             if (!file.discard || file.keep || body != bodies) continue;
             if (!active()) return Lookup::Failed;
             char path[224]; snprintf(path, sizeof(path), "%s/%s", file.legacy ? CACHE_DIR : directory, file.name);
-            const bool ok = session.run([&](fs::FS &fs) { return !fs.exists(path) || fs.remove(path); });
+            // A downloaded manifest can refer to a different leaf. Collection
+            // protects the graph, unlike unrelated per-file build mutations.
+            const bool ok = session.mutate(CACHE_DIR, [&](fs::FS &fs) {
+                if (__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE)) return false;
+                return !fs.exists(path) || fs.remove(path);
+            });
             if (!ok) return Lookup::Failed;
             ++removed; removed_bytes += file.bytes;
             uint32_t shard;
@@ -2841,7 +2850,11 @@ struct DayCleanup {
             if (retained) continue;
             char path[100]; snprintf(path, sizeof(path), "%s/%02x", directory, shard);
             // rmdir succeeds only if empty; unknown files/subdirectories survive.
-            if (!session.run([&](fs::FS &fs) { fs.rmdir(path); return true; })) return Lookup::Failed;
+            if (!session.mutate(CACHE_DIR, [&](fs::FS &fs) {
+                if (__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE)) return false;
+                fs.rmdir(path);
+                return true;
+            })) return Lookup::Failed;
         }
         return Lookup::Ready;
     }
@@ -3090,12 +3103,6 @@ bool work_once() {
     }
     if (!SdStorage::local_access_allowed()) { defer_job(job); publish(State::Blocked, "usb_storage"); return false; }
     if (!SdStorage::mounted()) { defer_job(job); publish(State::Blocked, "no_sd"); return false; }
-    if (__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE)) {
-        defer_job(job); publish(State::WaitingStorage, "artifact_read"); return false;
-    }
-    if ((!job || job->background) && foreground_wait()) {
-        defer_job(job); publish(State::Ready); return false;
-    }
     if (job && job->background && ExportSync::busy()) {
         defer_job(job); publish(State::WaitingStorage, "export_pending"); return false;
     }
@@ -3136,12 +3143,12 @@ bool work_once() {
     timing.index_us = timing.stamp() - index_started;
     if (!indexed) {
         const bool preempted = !session.valid() || !AirSenseState::local_background_allowed();
+        const bool yielding = session.yield_requested();
         session.end();
-        const bool reading = __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE);
-        if (preempted || reading || index_failure == IndexFailure::Preempted || index_failure == IndexFailure::WaitingCatalog) {
+        if (preempted || yielding || index_failure == IndexFailure::Preempted || index_failure == IndexFailure::WaitingCatalog) {
             defer_job(job);
             publish(preempted ? State::Blocked : State::WaitingStorage,
-                    preempted ? "not_idle" : reading ? "artifact_read" : "catalog_not_ready");
+                    preempted ? "not_idle" : yielding || index_failure == IndexFailure::Preempted ? "storage_busy" : "catalog_not_ready");
         } else {
             Log::logf(CAT_REPORT, reported_index_error == index_error ? LOG_DEBUG : LOG_WARN,
                 "EDF index failed: %s entry=%ld\n", index_error,
@@ -3171,6 +3178,11 @@ bool work_once() {
         reported_index_error = nullptr;
     }
     if (!job) {
+        if (session.yield_requested()) {
+            session.end();
+            publish(State::WaitingStorage, "storage_busy");
+            return false;
+        }
         const bool checkpoint = index_commit_pending && !ExportSync::busy();
         if (checkpoint && !publish_index(session))
             Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
@@ -3193,7 +3205,7 @@ bool work_once() {
     job->code = 0;
     job->error = job->issue = nullptr;
     job->issue_path[0] = 0;
-    job->artifact_preempted = false;
+    job->storage_yielded = false;
     job->recovered_index = recovered_index;
     job->foreground_epoch = __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
     xSemaphoreGive(mutex);
@@ -3219,7 +3231,7 @@ bool work_once() {
     const bool changed = SdStorage::files_revision() != job->files_revision ||
         job->data_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE) ||
         (!recovered_index && (catalog.generation != catalog_generation || SdStorage::files_revision() != file_revision));
-    const bool yielded = job->artifact_preempted || __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) ||
+    const bool yielded = job->storage_yielded || session.yield_requested() ||
         (job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE));
     if (success && !job->background && job->request.action == Action::Prepare &&
         !interrupted && !changed && !yielded) {
@@ -3275,10 +3287,10 @@ void worker(void *) {
         if (work_once()) continue;
         Status publication;
         get_status(publication);
-        const uint32_t quiet = foreground_wait();
-        xSemaphoreTake(wake, quiet ? pdMS_TO_TICKS(quiet) :
-            background_retry || publication.state == State::WaitingStorage || publication.state == State::Blocked
-                ? pdMS_TO_TICKS(1000) : portMAX_DELAY);
+        const bool retry = background_retry || publication.state == State::WaitingStorage ||
+            publication.state == State::Blocked;
+        const uint32_t quiet = publication.state == State::Ready ? foreground_wait() : 0;
+        xSemaphoreTake(wake, retry ? pdMS_TO_TICKS(1000) : quiet ? pdMS_TO_TICKS(quiet) : portMAX_DELAY);
     }
 }
 
@@ -3485,11 +3497,9 @@ StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
     for (const char *p = digest; *p; ++p)
         if (!(*p >= '0' && *p <= '9') && !(*p >= 'a' && *p <= 'f')) return StorageBrowser::StartResult::BadRequest;
     if (root && !document) return StorageBrowser::StartResult::BadRequest;
-    // Keep priority until the reader releases SD, not just until backfill
-    // observes an epoch change and immediately starts its next attempt.
+    // Admission pins artifact graphs against GC, not unrelated report work.
     foreground_activity();
     __atomic_add_fetch(&artifact_reads, 1, __ATOMIC_ACQ_REL);
-    __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
     operation.kind = StorageBrowser::Kind::Immutable;
     operation.selection[0] = 0;
     snprintf(operation.path, sizeof(operation.path), "%s/%s%s%.*s%s%s.%s", CACHE_DIR,

@@ -237,7 +237,7 @@ static bool publish_document(const SdStorage::Session &session, const char *pref
     auto &part = scratch->part;
     if (!document_path(prefix, out.digest, path) || !named_path(prefix, "document.part", part)) return false;
     bool exists = false;
-    if (!session.run([&](fs::FS &fs) {
+    if (!session.mutate(part, path, [&](fs::FS &fs) {
         if ((!fs.exists("/airbridge") && !fs.mkdir("/airbridge")) ||
             (!fs.exists("/airbridge/report") && !fs.mkdir("/airbridge/report"))) return false;
         char directory[PATH_BYTES];
@@ -264,7 +264,7 @@ static bool publish_document(const SdStorage::Session &session, const char *pref
         at += count;
     }
     reader.close();
-    if (!exists && !session.run([&](fs::FS &fs) { return fs.rename(part, path); })) return false;
+    if (!exists && !session.mutate(part, path, [&](fs::FS &fs) { return fs.rename(part, path); })) return false;
     if (old == Lookup::Ready && !memcmp(previous.digest, out.digest, 32) &&
         !memcmp(previous.key, key, 32)) { out = previous; return true; }
     uint8_t head[84] = {};
@@ -279,7 +279,7 @@ static bool publish_document(const SdStorage::Session &session, const char *pref
         reader.read(block, sizeof(head)) != sizeof(head) || memcmp(block, head, sizeof(head))) return false;
     reader.close();
     snprintf(path, sizeof(path), "%s.head%u", prefix, unsigned(out.generation & 1));
-    const bool committed = session.run([&](fs::FS &fs) {
+    const bool committed = session.mutate(part, path, [&](fs::FS &fs) {
         // Only the inactive head is replaced. The previous content/head survive.
         return (!fs.exists(path) || fs.remove(path)) && fs.rename(part, path);
     });
@@ -310,13 +310,18 @@ static Lookup root_reference(const SdStorage::Session &session, const uint8_t di
     return Lookup::Missing;
 }
 
-bool index_discard(const SdStorage::Session &session, const uint8_t digest[32]) {
+bool index_discard(const SdStorage::Session &session, const uint8_t digest[32],
+                   bool (*cancelled)(void *), void *context) {
     const auto state = root_reference(session, digest);
     if (state == Lookup::Ready) return true;
     if (state != Lookup::Missing) return false;
     char path[PATH_BYTES];
     if (!document_path("/airbridge/report/index", digest, path)) return false;
-    return session.run([&](fs::FS &fs) { return !fs.exists(path) || fs.remove(path); });
+    // Root documents can retain dependencies outside the document's own path.
+    return session.mutate("/airbridge/report", [&](fs::FS &fs) {
+        if (cancelled && cancelled(context)) return false;
+        return !fs.exists(path) || fs.remove(path);
+    });
 }
 
 Lookup index_candidate(const SdStorage::Session &session, const uint8_t digest[32],
@@ -359,10 +364,10 @@ struct Producer::Work {
         // them for the next explicit attempt, never for a filesystem callback.
         if (!published) return;
         for (const char *path : {spool_path, part_path}) if (*path)
-            session.run([&](fs::FS &fs) { return !fs.exists(path) || fs.remove(path); });
+            session.mutate(path, [&](fs::FS &fs) { return !fs.exists(path) || fs.remove(path); });
         char scratch[PATH_BYTES];
         if (*prefix && named_path(prefix, "resume.part", scratch))
-            session.run([&](fs::FS &fs) { return !fs.exists(scratch) || fs.remove(scratch); });
+            session.mutate(scratch, [&](fs::FS &fs) { return !fs.exists(scratch) || fs.remove(scratch); });
     }
     bool fail(const char *reason) { if (!failure) failure = reason; return false; }
     bool active() {
@@ -417,7 +422,7 @@ struct Producer::Work {
         uint8_t hash[32];
         if (!content.snapshot(hash) || memcmp(hash, bytes + 16, 32)) return false;
         reader.close();
-        if (tail && (!writer.finish(complete) || !session.run([&](fs::FS &fs) {
+        if (tail && (!writer.finish(complete) || !session.mutate(scratch, part_path, [&](fs::FS &fs) {
             return fs.remove(part_path) && fs.rename(scratch, part_path);
         }))) return false;
         made = complete;
@@ -499,8 +504,8 @@ struct Producer::Work {
         if (!session.run([&](fs::FS &fs) { exists = fs.exists(final); return true; })) return fail("artifact_stat");
         if (exists) {
             if (!verify(final, publication)) return false;
-            if (!session.run([&](fs::FS &fs) { return fs.remove(part_path); })) return fail("artifact_remove_part");
-        } else if (!session.run([&](fs::FS &fs) { return fs.rename(part_path, final); })) return fail("artifact_publish");
+            if (!session.mutate(part_path, [&](fs::FS &fs) { return fs.remove(part_path); })) return fail("artifact_remove_part");
+        } else if (!session.mutate(part_path, final, [&](fs::FS &fs) { return fs.rename(part_path, final); })) return fail("artifact_publish");
         uint8_t ref[REFERENCE_BYTES];
         reference_bytes(key, publication, ref);
         if (!writer.open(session, part_path) || !writer.write(ref, sizeof(ref)) || !writer.finish(sizeof(ref))) return fail("reference_write");
@@ -512,7 +517,7 @@ struct Producer::Work {
                 !exact_read(reader, 0, input, sizeof(ref)) || memcmp(input, ref, sizeof(ref))) return fail("reference_conflict");
             return true;
         }
-        return session.run([&](fs::FS &fs) { return fs.rename(part_path, reference); }) || fail("reference_publish");
+        return session.mutate(part_path, reference, [&](fs::FS &fs) { return fs.rename(part_path, reference); }) || fail("reference_publish");
     }
 };
 
@@ -574,7 +579,7 @@ bool Producer::begin(const char *prefix, const uint8_t key[32], const ReportEdf:
     char *end = strrchr(directory, '/');
     if (!end) return w.fail("artifact_path");
     *end = 0;
-    if (!w.session.run([&](fs::FS &fs) {
+    if (!w.session.mutate(w.spool_path, [&](fs::FS &fs) {
         return (fs.exists("/airbridge") || fs.mkdir("/airbridge")) &&
             (fs.exists("/airbridge/report") || fs.mkdir("/airbridge/report")) &&
             (fs.exists(directory) || fs.mkdir(directory));
