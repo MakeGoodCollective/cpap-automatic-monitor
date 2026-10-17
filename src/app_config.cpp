@@ -1,4 +1,5 @@
 #include "app_config.h"
+#include "ui_languages_generated.h"
 #include "auth_utils.h"
 #include "network_hints.h"
 #include "debug_log.h"
@@ -55,6 +56,7 @@ struct KVEntry {
 #define KV_U16(k, n, f, d, s) {k, n, KVEntry::U16, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
 // Choice labels are used at build time, not retained in firmware RAM.
 #define KV_ENUM(k, n, f, d, s, ...) KV_U8(k, n, f, d, s)
+#define KV_LANGUAGE(k, n, f, d, s) KV_STR(k, n, f, d, s)
 #define KV_BOOL(k, n, f, d, s, ...) {k, n, KVEntry::BOOL, &cfg.f, {uint32_t(d)}, false, Config::Section::s}
 
 static const KVEntry kv_table[] = {
@@ -78,6 +80,7 @@ static const KVEntry kv_table[] = {
     KV_STR("http_user", "http_user", http_user, "admin", Access),
     KV_SECRET("http_pass", "http_pass", http_pass, "airbridge", Access),
     KV_STR("auth_whitelist", "auth_wl", auth_whitelist, "", Access),
+    KV_LANGUAGE("ui_language", "ui_language", ui_language, "auto", Access),
     KV_STR("update_url", "update_url", update_url, AB_DEFAULT_UPDATE_URL, Updates),
     KV_STR("ntp_server", "ntp_server", ntp_server, "", Time),
     KV_STR("tz", "tz", tz, "UTC0", Time),
@@ -375,7 +378,19 @@ bool Config::is_sensitive(const char *key) {
     return false;
 }
 
+const char *Config::ui_language() {
+    for (const char *tag : UI_LANGUAGE_TAGS)
+        if (cfg.ui_language == tag) return tag;
+    return "auto";
+}
+
 bool Config::set_value(const char *key, const char *value) {
+    if (strcasecmp(key, "ui_language") == 0 && strcmp(value, "auto") != 0) {
+        bool supported = false;
+        for (const char *tag : UI_LANGUAGE_TAGS)
+            if (strcmp(value, tag) == 0) supported = true;
+        if (!supported) return false;
+    }
     if (strcasecmp(key, "auth_whitelist") == 0) {
         if (!aircannect::valid_auth_whitelist(value)) return false;
     } else if (strcasecmp(key, "syslog_host") == 0 && *value) {

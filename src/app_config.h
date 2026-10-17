@@ -46,6 +46,7 @@ struct AirBridgeConfig {
     String      http_user;
     String      http_pass;
     String      auth_whitelist;
+    String      ui_language;
 
     String      update_url;          // release manifest, empty disables checks
 
@@ -84,6 +85,7 @@ namespace Config {
     bool complete_onboarding(const char *user, const char *password);
 
     AirBridgeConfig& get();
+    const char *ui_language();
 
     bool is_sensitive(const char *key);
     bool get_value(const char *key, String &out);

@@ -429,6 +429,7 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
     if (fields & STATUS_CONFIG) {
         jsonAddUInt32(json, "config_revision", Config::revision());
         jsonAddInt(json, "onboarding_complete", Config::onboarding_complete());
+        jsonAddString(json, "ui_language", status.ui_language);
     }
     if (fields & STATUS_REPORT) {
         jsonAddString(json, "report_source", SleepReport::source_name(status.report_source));
@@ -2538,6 +2539,7 @@ static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
     if (a.rop != b.rop || a.sys != b.sys || a.mhr != b.mhr || a.mop != b.mop)
         fields |= STATUS_THERAPY;
     if (a.ip != b.ip || a.ap_ip != b.ap_ip) fields |= STATUS_HEALTH;
+    if (strcmp(a.ui_language, b.ui_language)) fields |= STATUS_CONFIG;
     if (a.oxi != b.oxi || a.feeding != b.feeding ||
         strcmp(a.oxi_source, b.oxi_source) || strcmp(a.oxi_name, b.oxi_name) ||
         a.reading.valid != b.reading.valid ||

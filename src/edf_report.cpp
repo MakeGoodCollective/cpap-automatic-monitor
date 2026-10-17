@@ -1080,13 +1080,16 @@ struct HistoricalStr {
                 const double saved = value(spec.label);
                 if (!std::isfinite(saved) || !signal || strcmp(signal->unit, spec.dimension)) return;
                 char text[48];
-                if (def->type != SET_ENUM || saved < 0 || saved > INT32_MAX || saved != std::floor(saved) ||
-                    !setting_enum_label(def, int(saved), text, sizeof(text)))
+                const bool option = def->type == SET_ENUM && saved >= 0 && saved <= INT32_MAX &&
+                    saved == std::floor(saved) && setting_enum_label(def, int(saved), text, sizeof(text));
+                if (!option)
                     snprintf(text, sizeof(text), "%.8g", saved);
                 // Text and labels come only from the static Air10 catalog or
                 // numeric formatting, never live metadata or file strings.
-                body.print("%s{\"tag\":\"%s\",\"label\":\"%s\",\"value\":\"%s\",\"unit\":\"%s\"}",
+                body.print("%s{\"tag\":\"%s\",\"label\":\"%s\",\"value\":\"%s\",\"unit\":\"%s\"",
                            comma ? "," : "", tag, def->label, text, spec.dimension);
+                if (option) body.print(",\"option\":%d", int(saved));
+                body.print("}");
                 comma = true;
                 return;
             }

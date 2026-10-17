@@ -352,22 +352,22 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
       <small id="verBuild" style="color:#555"></small>
     </div>
     <nav>
-      <a class="nav-item active" data-tab="status"><span class="icon"><svg aria-hidden="true"><use href="#icon-dashboard"/></svg></span> Dashboard</a>
-      <a class="nav-item" data-tab="report"><span class="icon"><svg aria-hidden="true"><use href="#icon-report"/></svg></span> Sleep Report</a>
-      <a class="nav-item" data-tab="sync" hidden><span class="icon"><svg aria-hidden="true"><use href="#icon-sync"/></svg></span> Sync</a>
-      <a class="nav-item" data-tab="clinical"><span class="icon"><svg aria-hidden="true"><use href="#icon-clinical"/></svg></span> Clinical</a>
-      <a class="nav-item" data-tab="bluetooth"><span class="icon"><svg aria-hidden="true"><use href="#icon-oximetry"/></svg></span> Oximetry</a>
-      <a class="nav-item" data-tab="console"><span class="icon"><svg aria-hidden="true"><use href="#icon-console"/></svg></span> Console</a>
-      <a class="nav-item" data-tab="storage" hidden><span class="icon"><svg aria-hidden="true"><use href="#icon-storage"/></svg></span> Storage</a>
-      <a class="nav-item" data-tab="device"><span class="icon"><svg aria-hidden="true"><use href="#icon-config"/></svg></span> Config</a>
-      <a class="nav-item" data-tab="ota"><span class="icon"><svg aria-hidden="true"><use href="#icon-ota"/></svg></span> OTA Upload</a>
+      <a class="nav-item active" data-tab="status"><span class="icon"><svg aria-hidden="true"><use href="#icon-dashboard"/></svg></span> <span data-i18n="nav.dashboard"></span></a>
+      <a class="nav-item" data-tab="report"><span class="icon"><svg aria-hidden="true"><use href="#icon-report"/></svg></span> <span data-i18n="nav.report"></span></a>
+      <a class="nav-item" data-tab="sync" hidden><span class="icon"><svg aria-hidden="true"><use href="#icon-sync"/></svg></span> <span data-i18n="nav.sync"></span></a>
+      <a class="nav-item" data-tab="clinical"><span class="icon"><svg aria-hidden="true"><use href="#icon-clinical"/></svg></span> <span data-i18n="nav.clinical"></span></a>
+      <a class="nav-item" data-tab="bluetooth"><span class="icon"><svg aria-hidden="true"><use href="#icon-oximetry"/></svg></span> <span data-i18n="nav.oximetry"></span></a>
+      <a class="nav-item" data-tab="console"><span class="icon"><svg aria-hidden="true"><use href="#icon-console"/></svg></span> <span data-i18n="nav.console"></span></a>
+      <a class="nav-item" data-tab="storage" hidden><span class="icon"><svg aria-hidden="true"><use href="#icon-storage"/></svg></span> <span data-i18n="nav.storage"></span></a>
+      <a class="nav-item" data-tab="device"><span class="icon"><svg aria-hidden="true"><use href="#icon-config"/></svg></span> <span data-i18n="nav.config"></span></a>
+      <a class="nav-item" data-tab="ota"><span class="icon"><svg aria-hidden="true"><use href="#icon-ota"/></svg></span> <span data-i18n="nav.ota"></span></a>
     </nav>
   </aside>
 
   <div class="main">
     <div class="topbar">
       <div class="left">
-        <span id="liveIndicator" style="width:8px;height:8px;border-radius:50%;background:var(--accent);display:inline-block" title="SSE connected"></span>
+        <span id="liveIndicator" style="width:8px;height:8px;border-radius:50%;background:var(--accent);display:inline-block" title="" data-i18n-title="status.sseConnected"></span>
       </div>
       <div class="right">
         <span id="topUptime">--</span>
@@ -375,8 +375,8 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
           <span id="topWifi" class="wifi-bars" title="--"><span></span><span></span><span></span><span></span></span>
           <span id="topSsid">WiFi: --</span>
         </span>
-        <span title="Free memory"><span id="topHeap">-- heap</span><span id="topPsram" hidden></span></span>
-        <button class="btn icon-button" id="refreshButton" type="button" onclick="loadStatus()" aria-label="Refresh" title="Refresh"><svg aria-hidden="true"><use href="#icon-refresh"/></svg></button>
+        <span title="" data-i18n-title="status.freeMemory"><span id="topHeap">-- heap</span><span id="topPsram" hidden></span></span>
+        <button class="btn icon-button" id="refreshButton" type="button" onclick="loadStatus()" aria-label="" data-i18n-aria-label="common.refresh" title="" data-i18n-title="common.refresh"><svg aria-hidden="true"><use href="#icon-refresh"/></svg></button>
       </div>
     </div>
 
@@ -387,58 +387,58 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
         <div class="card-grid dashboard-grid">
           <div class="card">
             <div class="card-header">
-              <span class="label">Device</span>
-              <span class="badge badge-idle" id="dashRopBadge">Standby</span>
+              <span class="label"><span data-i18n="status.device"></span></span>
+              <span class="badge badge-idle" id="dashRopBadge"><span data-i18n="common.standby"></span></span>
             </div>
             <div class="card-title" id="dashPna">--</div>
             <div class="time-row">
-              <span class="label">Serial</span>
+              <span class="label"><span data-i18n="status.serial"></span></span>
               <span class="value" id="dashSrn">--</span>
             </div>
             <div class="time-row">
-              <span class="label">Therapy mode</span>
+              <span class="label"><span data-i18n="status.therapyMode"></span></span>
               <span class="value" id="dashMode">--</span>
             </div>
             <div class="time-row">
-              <span class="label">Motor Hours</span>
+              <span class="label"><span data-i18n="status.motorHours"></span></span>
               <span class="value" id="dashMhr">--</span>
             </div>
             <div class="btn-group">
-              <button class="btn" onclick="ropCmd('start')" id="btnTherapy" style="font-size:11px;padding:6px 14px">Therapy</button>
-              <button class="btn" onclick="ropCmd('standby')" id="btnStandby" style="font-size:11px;padding:6px 14px">Standby</button>
-              <button class="btn" onclick="ropCmd('energy_save')" id="btnPwrSave" style="font-size:11px;padding:6px 14px">Power Save</button>
+              <button class="btn" onclick="ropCmd('start')" id="btnTherapy" style="font-size:11px;padding:6px 14px"><span data-i18n="common.therapy"></span></button>
+              <button class="btn" onclick="ropCmd('standby')" id="btnStandby" style="font-size:11px;padding:6px 14px"><span data-i18n="common.standby"></span></button>
+              <button class="btn" onclick="ropCmd('energy_save')" id="btnPwrSave" style="font-size:11px;padding:6px 14px"><span data-i18n="status.powerSave"></span></button>
             </div>
           </div>
 
           <div class="card">
             <div class="card-header">
-              <span class="label">System</span>
+              <span class="label"><span data-i18n="status.system"></span></span>
             </div>
             <div class="time-row">
-              <span class="label">AirBridge Time</span>
+              <span class="label"><span data-i18n="status.airbridgeTime"></span></span>
               <span class="value" id="dashEspTime">--</span>
             </div>
             <div class="time-row">
-              <span class="label">ResMed Time</span>
+              <span class="label"><span data-i18n="status.resmedTime"></span></span>
               <span class="value" id="dashResmedTime">--</span>
             </div>
             <div class="btn-group">
               <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('ntp_sync')">NTP</button>
-              <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('sync_to_resmed')">To ResMed</button>
-              <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('sync_from_resmed')">From ResMed</button>
+              <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('sync_to_resmed')"><span data-i18n="status.toResmed"></span></button>
+              <button class="btn" style="font-size:11px;padding:6px 14px" onclick="timeAction('sync_from_resmed')"><span data-i18n="status.fromResmed"></span></button>
             </div>
             <div class="time-row">
-              <span class="label">SD card</span>
+              <span class="label"><span data-i18n="common.sd"></span></span>
               <span class="value" id="dashStorageSummary">--</span>
             </div>
-            <div class="storage-meter" id="dashStorageMeter" role="meter" aria-label="SD card usage" aria-valuemin="0" aria-valuemax="100" hidden>
+            <div class="storage-meter" id="dashStorageMeter" role="meter" aria-label="" data-i18n-aria-label="status.sdUsage" aria-valuemin="0" aria-valuemax="100" hidden>
               <div class="storage-meter-fill" id="dashStorageFill"></div>
             </div>
           </div>
 
           <div class="card">
             <div class="card-header">
-              <span class="label">Oximetry</span>
+              <span class="label"><span data-i18n="nav.oximetry"></span></span>
               <span class="badge badge-idle" id="dashOxiBadge">--</span>
             </div>
             <div class="oxi-values">
@@ -452,7 +452,7 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
               </div>
             </div>
             <div class="time-row oxi-source-row">
-              <span class="label">Source</span>
+              <span class="label"><span data-i18n="common.source"></span></span>
               <div class="oxi-source-value">
                 <span class="oxi-source-name" id="dashOxiName">--</span>
                 <span class="oxi-address" id="dashOxiAddr"></span>
@@ -460,7 +460,7 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
             </div>
             <div class="time-row">
               <span class="label">AirSense</span>
-              <span class="badge badge-idle" id="dashFeedBadge">Feed: --</span>
+              <span class="badge badge-idle" id="dashFeedBadge"><span data-i18n="status.feedUnknown"></span></span>
             </div>
           </div>
         </div>
@@ -470,7 +470,7 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 
         <!-- Telemetry -->
         <div class="telemetry-header">
-          <h3>Live Telemetry</h3>
+          <h3><span data-i18n="status.live"></span></h3>
         </div>
 
         <div class="chart-card">
@@ -518,26 +518,26 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
       <!-- SLEEP REPORT -->
       <div class="pane" id="p-report">
         <div class="card">
-          <h3>Sleep Report</h3>
+          <h3><span data-i18n="nav.report"></span></h3>
           <div class="report-controls">
-          <div class="row" id="reportSourceRow" hidden><label for="reportSourceChoice">Source</label><select id="reportSourceChoice" onchange="loadReport(true)"><option value="">EDF</option><option value="device">AirSense</option></select></div>
-          <div class="row"><label for="reportView">View</label><select id="reportView" onchange="loadReport()"><option value="day">Day</option><option value="1">7 days</option><option value="2">30 days</option><option value="3">90 days</option><option value="4">180 days</option><option value="5">365 days</option></select></div>
-          <div class="row" id="reportDayRow"><label id="reportDateLabel" for="reportDay">Therapy date</label><input type="date" id="reportDay" onchange="loadReport()">
+          <div class="row" id="reportSourceRow" hidden><label for="reportSourceChoice"><span data-i18n="common.source"></span></label><select id="reportSourceChoice" onchange="loadReport(true)"><option value="">EDF</option><option value="device">AirSense</option></select></div>
+          <div class="row"><label for="reportView"><span data-i18n="report.view"></span></label><select id="reportView" onchange="loadReport()"><option value="day" data-i18n="report.day"></option><option value="1" data-i18n="report.days7"></option><option value="2" data-i18n="report.days30"></option><option value="3" data-i18n="report.days90"></option><option value="4" data-i18n="report.days180"></option><option value="5" data-i18n="report.days365"></option></select></div>
+          <div class="row" id="reportDayRow"><label id="reportDateLabel" for="reportDay"><span data-i18n="report.therapyDate"></span></label><input type="date" id="reportDay" onchange="loadReport()">
             <div class="report-picker" id="reportDatePicker" hidden>
-              <div class="report-date-controls"><button class="btn" id="reportDayPrevious" aria-label="Previous recorded day" onclick="stepReportDay(-1)">&lt;</button><button class="btn" id="reportDateButton" aria-expanded="false" aria-controls="reportCalendar" onclick="toggleReportCalendar()">Last saved day</button><button class="btn" id="reportDayNext" aria-label="Next recorded day" onclick="stepReportDay(1)">&gt;</button></div>
+              <div class="report-date-controls"><button class="btn" id="reportDayPrevious" aria-label="" data-i18n-aria-label="report.previousDay" onclick="stepReportDay(-1)">&lt;</button><button class="btn" id="reportDateButton" aria-expanded="false" aria-controls="reportCalendar" onclick="toggleReportCalendar()"><span data-i18n="report.latest"></span></button><button class="btn" id="reportDayNext" aria-label="" data-i18n-aria-label="report.nextDay" onclick="stepReportDay(1)">&gt;</button></div>
               <div class="report-calendar" id="reportCalendar" hidden>
-                <div class="report-calendar-head"><button class="btn" id="reportMonthPrevious" aria-label="Previous month" onclick="stepReportMonth(-1)">&lt;</button><span id="reportMonth"></span><button class="btn" id="reportMonthNext" aria-label="Next month" onclick="stepReportMonth(1)">&gt;</button></div>
+                <div class="report-calendar-head"><button class="btn" id="reportMonthPrevious" aria-label="" data-i18n-aria-label="report.previousMonth" onclick="stepReportMonth(-1)">&lt;</button><span id="reportMonth"></span><button class="btn" id="reportMonthNext" aria-label="" data-i18n-aria-label="report.nextMonth" onclick="stepReportMonth(1)">&gt;</button></div>
                 <div class="report-calendar-grid" id="reportCalendarGrid"></div>
               </div>
             </div>
           </div>
-          <div class="btn-row"><button class="btn" id="reportLatest" onclick="loadReport(true)" title="Last saved day">Latest</button><button class="btn btn-accent" id="reportRefresh" onclick="loadReport(false,true)">Refresh</button></div>
+          <div class="btn-row"><button class="btn" id="reportLatest" onclick="loadReport(true)" title="" data-i18n-title="report.latest"><span data-i18n="common.latest"></span></button><button class="btn btn-accent" id="reportRefresh" onclick="loadReport(false,true)"><span data-i18n="common.refresh"></span></button></div>
           </div>
           <div class="msg" id="reportMsg" role="status"></div>
           <p class="report-note" id="reportAvailability" role="status"></p>
         </div>
         <div class="card" aria-busy="false" id="reportResult">
-          <div class="report-result-head"><h3 id="reportTitle">Therapy day</h3><span class="report-selection" id="reportSelection"></span><span class="report-load-state"><span id="reportLoadState" role="status"></span><span class="spinner" id="reportSpinner"></span></span></div>
+          <div class="report-result-head"><h3 id="reportTitle"><span data-i18n="report.therapyDay"></span></h3><span class="report-selection" id="reportSelection"></span><span class="report-load-state"><span id="reportLoadState" role="status"></span><span class="spinner" id="reportSpinner"></span></span></div>
           <p class="report-note" id="reportNote"></p>
           <div id="reportGrid" class="status-grid"></div>
           <div id="reportStatsCard" hidden>
@@ -545,23 +545,23 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
             <div class="report-history" id="reportHistory" hidden>
               <div class="report-history-head"><b id="reportHistoryTitle"></b><span id="reportHistoryBaseline"></span></div>
               <p class="report-note" id="reportHistoryNote" role="status"></p>
-              <svg id="reportHistoryChart" role="img" aria-label="14-day history"></svg>
+              <svg id="reportHistoryChart" role="img" aria-label="" data-i18n-aria-label="report.history"></svg>
             </div>
-            <div class="report-events" id="reportTotals" aria-label="Therapy totals"></div>
-            <details class="report-statistics"><summary>Statistics</summary><div class="report-table-wrap"><table class="report-table"><thead><tr><th>Channel</th><th>Min</th><th>Mean</th><th>Median</th><th>P95</th><th>Max</th></tr></thead><tbody id="reportStats"></tbody></table></div></details>
-            <details class="report-statistics report-settings" id="reportSettings" hidden><summary>Settings</summary><div class="status-grid" id="reportSettingsFields"></div></details>
+            <div class="report-events" id="reportTotals" aria-label="" data-i18n-aria-label="report.totals"></div>
+            <details class="report-statistics"><summary><span data-i18n="report.statistics"></span></summary><div class="report-table-wrap"><table class="report-table"><thead><tr><th><span data-i18n="report.channel"></span></th><th><span data-i18n="report.minimum"></span></th><th><span data-i18n="report.mean"></span></th><th><span data-i18n="report.median"></span></th><th>P95</th><th><span data-i18n="report.maximum"></span></th></tr></thead><tbody id="reportStats"></tbody></table></div></details>
+            <details class="report-statistics report-settings" id="reportSettings" hidden><summary><span data-i18n="common.settings"></span></summary><div class="status-grid" id="reportSettingsFields"></div></details>
           </div>
         </div>
         <div class="card" id="reportMaskCard" hidden>
-          <h3 id="reportIntervalTitle">Mask intervals</h3>
+          <h3 id="reportIntervalTitle"><span data-i18n="report.maskIntervals"></span></h3>
           <div id="reportIntervals"></div>
         </div>
         <div class="card report-plots" id="reportChartsCard" hidden>
-          <div class="report-chart-toolbar"><h3>Charts</h3><div class="report-chart-actions"><span id="reportCursor" aria-live="off"></span><button class="btn" aria-label="Zoom in" onclick="zoomReportViewport(0.5)">+</button><button class="btn" aria-label="Zoom out" onclick="zoomReportViewport(2)">-</button><button class="btn" onclick="resetReportViewport()" title="Reset zoom (double-click a chart)">Reset</button></div></div>
-          <div class="report-sessions" id="reportSessions" role="group" aria-label="Sessions"></div>
+          <div class="report-chart-toolbar"><h3><span data-i18n="report.charts"></span></h3><div class="report-chart-actions"><span id="reportCursor" aria-live="off"></span><button class="btn" aria-label="" data-i18n-aria-label="report.zoomIn" onclick="zoomReportViewport(0.5)">+</button><button class="btn" aria-label="" data-i18n-aria-label="report.zoomOut" onclick="zoomReportViewport(2)">-</button><button class="btn" onclick="resetReportViewport()" title="" data-i18n-title="report.resetZoom"><span data-i18n="common.reset"></span></button></div></div>
+          <div class="report-sessions" id="reportSessions" role="group" aria-label="" data-i18n-aria-label="report.sessions"></div>
           <p class="report-note" id="reportSeriesNote" role="status"></p>
           <div class="report-channel-options" id="reportChannelOptions"></div>
-          <div class="chart-card" id="reportEventCard"><div class="report-chart-head">Events</div><canvas id="reportEventStrip" height="76" aria-label="Respiratory events" tabindex="0"></canvas></div>
+          <div class="chart-card" id="reportEventCard"><div class="report-chart-head"><span data-i18n="report.events"></span></div><canvas id="reportEventStrip" height="76" aria-label="" data-i18n-aria-label="report.respiratoryEvents" tabindex="0"></canvas></div>
           <div id="reportPlots"></div>
         </div>
       </div>
@@ -569,40 +569,40 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
       <!-- CLINICAL -->
       <div class="pane" id="p-clinical">
         <div class="spinner" id="clinicalSpinner"></div>
-        <div class="card"><h3>Therapy</h3><div id="therapyFields"></div></div>
-        <div class="card"><h3>Comfort</h3><div id="comfortFields"></div></div>
-        <div class="card"><h3>Accessories</h3><div id="accessoriesFields"></div></div>
-        <div class="card"><h3>Options</h3><div id="optionsFields"></div></div>
-        <div class="card"><h3>Configuration</h3><div id="configurationFields"></div></div>
-        <div class="btn-row"><button class="btn btn-accent" onclick="saveSettings()">Save All</button></div>
+        <div class="card"><h3><span data-i18n="common.therapy"></span></h3><div id="therapyFields"></div></div>
+        <div class="card"><h3><span data-i18n="clinical.comfort"></span></h3><div id="comfortFields"></div></div>
+        <div class="card"><h3><span data-i18n="clinical.accessories"></span></h3><div id="accessoriesFields"></div></div>
+        <div class="card"><h3><span data-i18n="clinical.options"></span></h3><div id="optionsFields"></div></div>
+        <div class="card"><h3><span data-i18n="clinical.configuration"></span></h3><div id="configurationFields"></div></div>
+        <div class="btn-row"><button class="btn btn-accent" onclick="saveSettings()"><span data-i18n="clinical.saveAll"></span></button></div>
         <div class="msg" id="clinicalMsg"></div>
       </div>
 
       <!-- BLUETOOTH / OXIMETRY -->
       <div class="pane" id="p-bluetooth">
         <div class="card">
-          <h3>Oximeter Status</h3>
+          <h3><span data-i18n="ble.status"></span></h3>
           <div class="status-grid" id="bleStatusGrid"></div>
           <div class="btn-group" style="justify-content:flex-end">
-            <button class="btn btn-accent" id="btnFeed" onclick="bleAction('start_feed')">Start Feed</button>
-            <button class="btn btn-danger" onclick="bleAction('disconnect')">Disconnect</button>
-            <button class="btn" id="btnOxiToggle" onclick="toggleOxi()">Disable</button>
-            <button class="btn" onclick="loadBle()">Refresh</button>
+            <button class="btn btn-accent" id="btnFeed" onclick="bleAction('start_feed')"><span data-i18n="ble.startFeed"></span></button>
+            <button class="btn btn-danger" onclick="bleAction('disconnect')"><span data-i18n="common.disconnect"></span></button>
+            <button class="btn" id="btnOxiToggle" onclick="toggleOxi()"><span data-i18n="common.disable"></span></button>
+            <button class="btn" onclick="loadBle()"><span data-i18n="common.refresh"></span></button>
           </div>
         </div>
         <div class="card">
-          <h3>Scan for Devices</h3>
+          <h3><span data-i18n="ble.scanDevices"></span></h3>
           <div style="margin-bottom:12px">
-            <button class="btn btn-accent" id="btnScan" onclick="bleScan()">Start Scan</button>
+            <button class="btn btn-accent" id="btnScan" onclick="bleScan()"><span data-i18n="ble.startScan"></span></button>
             <span class="spinner" id="bleScanSpinner" style="display:none;vertical-align:middle;margin-left:8px"></span>
           </div>
           <div id="bleDevices"></div>
           <div class="msg" id="bleMsg"></div>
         </div>
         <div class="card">
-          <h3>Known Devices</h3>
+          <h3><span data-i18n="ble.knownDevices"></span></h3>
           <div id="bleBonds"></div>
-          <div class="btn-row" id="bleForgetAll" hidden><button class="btn btn-danger" onclick="if(confirm('Forget all known devices?')) bleAction('delete_all_bonds', undefined, {}, 'bleKnownMsg')">Forget All</button></div>
+          <div class="btn-row" id="bleForgetAll" hidden><button class="btn btn-danger" onclick="if(confirm(t('ble.forgetAllConfirm'))) bleAction('delete_all_bonds', undefined, {}, 'bleKnownMsg')"><span data-i18n="ble.forgetAll"></span></button></div>
           <div class="msg" id="bleKnownMsg"></div>
         </div>
       </div>
@@ -610,11 +610,11 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
       <!-- CONSOLE -->
       <div class="pane" id="p-console">
         <div class="card">
-          <h3>Command Console</h3>
+          <h3><span data-i18n="console.title"></span></h3>
           <div id="cmdOutput" style="background:#08081a;border:1px solid var(--border);border-radius:6px;padding:12px;font-family:monospace;font-size:13px;color:var(--green);height:400px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;margin-bottom:8px"></div>
           <div style="display:flex;gap:8px">
-            <input type="text" id="cmdInput" style="flex:1;width:auto;font-family:monospace;border-radius:6px" placeholder="Enter command..." onkeydown="if(event.key==='Enter')sendCmd()">
-            <button class="btn btn-accent" onclick="sendCmd()">Send</button>
+            <input type="text" id="cmdInput" style="flex:1;width:auto;font-family:monospace;border-radius:6px" placeholder="" data-i18n-placeholder="console.placeholder" onkeydown="if(event.key==='Enter')sendCmd()">
+            <button class="btn btn-accent" onclick="sendCmd()"><span data-i18n="common.send"></span></button>
           </div>
           <div style="font-size:12px;color:#555;margin-top:6px">$STATUS, $CONFIG GET key, $OXI SCAN, G S #BID, P S #ROP 0001</div>
         </div>
@@ -623,27 +623,27 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
       <!-- INITIAL SETUP -->
       <div class="pane" id="p-setup">
         <div class="card">
-          <div class="card-header"><h3 id="setupTitle" tabindex="-1">Initial setup</h3><span id="setupProgress"></span></div>
+          <div class="card-header"><h3 id="setupTitle" tabindex="-1"><span data-i18n="setup.title"></span></h3><span id="setupProgress"></span></div>
           <p id="setupNote" class="sync-note"></p>
           <div id="setupNetwork" hidden>
             <div class="sync-note" id="setupWifiStatus" aria-live="polite"></div>
-            <div class="row"><label for="setupSsid">Network name</label><input type="text" id="setupSsid" autocomplete="off" maxlength="32" oninput="setupNetworkSelected()"></div>
-            <div class="row"><label for="setupPass">WiFi password</label><input id="setupPass" type="password" autocomplete="new-password"></div>
-            <div class="sync-note">Leave the network name empty to keep saved networks. Your current access point stays available while connecting.</div>
-            <a id="setupWifiLink" class="btn" hidden>Open on the local network</a>
+            <div class="row"><label for="setupSsid"><span data-i18n="setup.networkName"></span></label><input type="text" id="setupSsid" autocomplete="off" maxlength="32" oninput="setupNetworkSelected()"></div>
+            <div class="row"><label for="setupPass"><span data-i18n="setup.wifiPassword"></span></label><input id="setupPass" type="password" autocomplete="new-password"></div>
+            <div class="sync-note"><span data-i18n="setup.keepNetworks"></span></div>
+            <a id="setupWifiLink" class="btn" hidden></a>
           </div>
           <div id="setupDevice" class="sync-note" aria-live="polite" hidden></div>
           <div id="setupForms"></div>
           <div id="setupFinish" hidden>
-            <p>Setup saved. You can change these settings in Config and Sync.</p>
-            <div class="btn-row"><a class="btn btn-accent" href="/">Open dashboard</a><a class="btn" href="/#bluetooth">Set up oximetry</a></div>
+            <p><span data-i18n="setup.saved"></span></p>
+            <div class="btn-row"><a class="btn btn-accent" href="/"><span data-i18n="setup.dashboard"></span></a><a class="btn" href="/#bluetooth"><span data-i18n="setup.oximetry"></span></a></div>
           </div>
           <div class="msg" id="setupMsg" role="status"></div>
           <div class="btn-row" id="setupActions">
-            <button class="btn" id="setupBack" onclick="setupMove(-1)">Back</button>
-            <button class="btn" id="setupSkip" onclick="setupMove(1, true)">Skip</button>
-            <button class="btn btn-accent" id="setupNext" onclick="setupMove(1)">Next</button>
-            <button class="btn" onclick="showTab('device')">Later</button>
+            <button class="btn" id="setupBack" onclick="setupMove(-1)"><span data-i18n="common.back"></span></button>
+            <button class="btn" id="setupSkip" onclick="setupMove(1, true)"><span data-i18n="common.skip"></span></button>
+            <button class="btn btn-accent" id="setupNext" onclick="setupMove(1)"><span data-i18n="common.next"></span></button>
+            <button class="btn" onclick="showTab('device')"><span data-i18n="common.later"></span></button>
           </div>
         </div>
       </div>
@@ -651,18 +651,18 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
       <!-- DEVICE CONFIG -->
       <div class="pane" id="p-device">
         <div class="card">
-          <h3>Device Configuration</h3>
-          <div class="btn-row"><button class="btn" onclick="startSetup()">Initial setup</button></div>
+          <h3><span data-i18n="config.title"></span></h3>
+          <div class="btn-row"><button class="btn" onclick="startSetup()"><span data-i18n="setup.title"></span></button></div>
           <div id="configWifi" hidden>
-            <h4 class="config-section-title">WiFi networks</h4>
+            <h4 class="config-section-title"><span data-i18n="config.networks"></span></h4>
             <div id="wifiNetList"></div>
             <div class="btn-group" style="margin-top:12px">
-              <button class="btn btn-accent" onclick="wifiAddPrompt()">Add Network</button>
+              <button class="btn btn-accent" onclick="wifiAddPrompt()"><span data-i18n="config.addNetwork"></span></button>
             </div>
             <div style="font-size:12px;color:var(--text-dim);margin-top:8px" id="wifiState"></div>
             <div class="msg" id="wifiMsg"></div>
           </div>
-          <div class="btn-group" id="configCategories" aria-label="Configuration categories"></div>
+          <div class="btn-group" id="configCategories" aria-label="" data-i18n-aria-label="config.categories"></div>
           <div id="configFields"></div>
         </div>
       </div>
@@ -670,31 +670,31 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
       <!-- SYNC -->
       <div class="pane" id="p-sync">
         <div class="msg" id="syncMsg"></div>
-        <div class="card" id="syncUnavailable">Sync requires a build with SD support.</div>
+        <div class="card" id="syncUnavailable"><span data-i18n="sync.unsupported"></span></div>
         <div class="card-grid" id="syncCards" hidden></div>
       </div>
 
       <div class="pane" id="p-storage">
         <div class="card">
-          <div class="card-header"><span class="label">SD card</span><span id="storageState" class="badge badge-idle">--</span></div>
+          <div class="card-header"><span class="label"><span data-i18n="common.sd"></span></span><span id="storageState" class="badge badge-idle">--</span></div>
           <div id="storageUsage"></div>
           <div class="storage-toolbar">
-            <div id="storagePath" aria-label="Current folder">/</div>
-            <button class="btn" id="storageUp" onclick="storageUp()">Up</button>
-            <button class="btn" id="storageRefresh" onclick="loadStorage()">Refresh</button>
+            <div id="storagePath" aria-label="" data-i18n-aria-label="storage.folder">/</div>
+            <button class="btn" id="storageUp" onclick="storageUp()"><span data-i18n="storage.up"></span></button>
+            <button class="btn" id="storageRefresh" onclick="loadStorage()"><span data-i18n="common.refresh"></span></button>
           </div>
           <div class="storage-actions">
-            <button class="btn" id="storageUsb" onclick="storageUsb()" hidden>Share via USB</button>
-            <button class="btn" id="storageZip" onclick="storageDownload('archive')">Download folder ZIP</button>
-            <button class="btn btn-accent" id="storageSelected" onclick="storageDownload('archive', null, true)">Download selected ZIP</button>
-            <button class="btn btn-danger" id="storageDelete" onclick="storageDelete()">Delete selected</button>
+            <button class="btn" id="storageUsb" onclick="storageUsb()" hidden><span data-i18n="storage.usbShare"></span></button>
+            <button class="btn" id="storageZip" onclick="storageDownload('archive')"><span data-i18n="storage.folderZip"></span></button>
+            <button class="btn btn-accent" id="storageSelected" onclick="storageDownload('archive', null, true)"><span data-i18n="storage.selectedZip"></span></button>
+            <button class="btn btn-danger" id="storageDelete" onclick="storageDelete()"><span data-i18n="storage.deleteSelected"></span></button>
           </div>
           <div id="storageMessage" role="status" aria-live="polite"></div>
           <div id="storageEntries"></div>
           <div class="storage-pagination">
-            <button class="btn" id="storagePrev" onclick="loadStorage(storagePath, storageOffset - 32)">Previous</button>
+            <button class="btn" id="storagePrev" onclick="loadStorage(storagePath, storageOffset - 32)"><span data-i18n="common.previous"></span></button>
             <span id="storagePage"></span>
-            <button class="btn" id="storageNext" onclick="loadStorage(storagePath, storageOffset + 32)">Next</button>
+            <button class="btn" id="storageNext" onclick="loadStorage(storagePath, storageOffset + 32)"><span data-i18n="common.next"></span></button>
           </div>
         </div>
       </div>
@@ -707,24 +707,24 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
           <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
             <div class="icon" style="width:24px;height:24px"><svg aria-hidden="true"><use href="#icon-ota"/></svg></div>
             <div>
-              <div style="font-weight:600;font-size:15px">AirBridge Firmware</div>
+              <div style="font-weight:600;font-size:15px"><span data-i18n="ota.airbridgeFirmware"></span></div>
               <div style="font-size:12px;color:var(--text-dim)">ESP32 &middot; <span id="espFwTarget">--</span> &middot; <span id="espFwVer">--</span></div>
             </div>
           </div>
           <div class="row">
-            <label>Latest release</label>
+            <label><span data-i18n="ota.latest"></span></label>
             <span class="value" id="espFwLatest">--</span>
           </div>
           <div class="btn-row" style="margin-bottom:14px">
-            <button class="btn" id="btnOtaCheck" onclick="otaCheckRelease()">Check for updates</button>
-            <button class="btn btn-accent" id="btnOtaInstall" onclick="otaInstallRelease()" style="display:none">Install update</button>
+            <button class="btn" id="btnOtaCheck" onclick="otaCheckRelease()"><span data-i18n="ota.check"></span></button>
+            <button class="btn btn-accent" id="btnOtaInstall" onclick="otaInstallRelease()" style="display:none"><span data-i18n="ota.install"></span></button>
           </div>
           <div class="progress" id="otaReleaseProgress"><div class="bar" id="otaReleaseBar" style="background:var(--accent)"></div></div>
           <div class="msg" id="otaReleaseMsg"></div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
             <div>
               <div class="upload-area" id="espDropZone" style="padding:24px;border-color:var(--accent)">
-                <p style="font-size:13px">Select firmware .bin or .bin.zlib<br><small style="color:var(--text-dim)">or drag and drop here</small></p>
+                <p style="font-size:13px"><span data-i18n="ota.selectEsp"></span><br><small style="color:var(--text-dim)"><span data-i18n="ota.drop"></span></small></p>
                 <input type="file" id="espFileInput" style="display:none" accept=".bin,.zlib">
               </div>
             </div>
@@ -732,7 +732,7 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
               <div id="espFileInfo" style="font-size:13px;color:var(--text-dim)"></div>
               <div class="progress" id="espUploadProgress"><div class="bar" id="espUploadBar" style="background:var(--accent)"></div></div>
               <div class="msg" id="espUploadMsg"></div>
-              <button class="btn btn-danger" id="btnEspReboot" onclick="espReboot()" style="display:none;margin-top:8px">Reboot to new firmware</button>
+              <button class="btn btn-danger" id="btnEspReboot" onclick="espReboot()" style="display:none;margin-top:8px"><span data-i18n="ota.reboot"></span></button>
             </div>
           </div>
         </div>
@@ -742,14 +742,14 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
           <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
             <div style="font-size:24px">&#9741;</div>
             <div>
-              <div style="font-weight:600;font-size:15px">ResMed Firmware</div>
+              <div style="font-weight:600;font-size:15px"><span data-i18n="ota.resmedFirmware"></span></div>
               <div style="font-size:12px;color:var(--text-dim)">STM32F4 &middot; AirSense 10</div>
             </div>
           </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
             <div>
               <div class="upload-area" id="dropZone" style="padding:24px;border-color:var(--orange)">
-                <p style="font-size:13px">Select firmware image<br><small style="color:var(--text-dim)">or drag and drop here</small></p>
+                <p style="font-size:13px"><span data-i18n="ota.selectResmed"></span><br><small style="color:var(--text-dim)"><span data-i18n="ota.drop"></span></small></p>
                 <input type="file" id="fileInput" style="display:none" accept=".bin,.img,.dat">
               </div>
             </div>
@@ -764,30 +764,30 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 
         <!-- ResMed Flash Controls (shown after upload) -->
         <div class="card" id="flashCard" style="display:none;border-left:3px solid var(--orange)">
-          <h3 style="color:var(--orange)">Flash to ResMed</h3>
+          <h3 style="color:var(--orange)"><span data-i18n="ota.flashResmed"></span></h3>
           <div class="row">
-            <label>Block type</label>
+            <label><span data-i18n="ota.blockType"></span></label>
             <select id="flashBlock">
-              <option value="">Auto-detect</option>
-              <option value="FULL">Full image (CCX+CDX, skip BLX)</option>
-              <option value="CMX">CMX (Config+Firmware)</option>
-              <option value="CDX">CDX (Firmware only)</option>
-              <option value="CCX">CCX (Config only)</option>
-              <option value="BLX">BLX (Bootloader)</option>
+              <option value="" data-i18n="ota.autoDetect"></option>
+              <option value="FULL" data-i18n="ota.fullImage"></option>
+              <option value="CMX" data-i18n="ota.cmx"></option>
+              <option value="CDX" data-i18n="ota.cdx"></option>
+              <option value="CCX" data-i18n="ota.ccx"></option>
+              <option value="BLX" data-i18n="ota.blx"></option>
             </select>
           </div>
           <div class="row" id="blxFlashRow" style="display:none">
-            <label>Include bootloader (BLX)</label>
+            <label><span data-i18n="ota.includeBootloader"></span></label>
             <input type="checkbox" id="flashBlx">
           </div>
           <div class="row" id="blxForceRow" style="display:none">
-            <label style="color:var(--red)">Force BLX even if BID mismatches</label>
+            <label style="color:var(--red)"><span data-i18n="ota.forceBootloader"></span></label>
             <input type="checkbox" id="forceBlx">
           </div>
           <div id="flashDetected" style="font-size:13px;color:var(--text-dim);padding:8px 0"></div>
           <div class="btn-group" style="justify-content:flex-end">
-            <button class="btn" onclick="startFlash()" id="btnFlash" style="border-color:var(--orange);color:var(--orange)">Flash</button>
-            <button class="btn btn-danger" id="btnFlashCancel" onclick="cancelFlash()" style="display:none">Cancel</button>
+            <button class="btn" onclick="startFlash()" id="btnFlash" style="border-color:var(--orange);color:var(--orange)"><span data-i18n="ota.flash"></span></button>
+            <button class="btn btn-danger" id="btnFlashCancel" onclick="cancelFlash()" style="display:none"><span data-i18n="common.cancel"></span></button>
           </div>
           <div class="progress" id="flashProgress" style="display:none"><div class="bar" id="flashBar" style="background:var(--orange)"></div></div>
           <div id="flashPhase" style="font-size:13px;color:var(--text-dim);margin-top:4px"></div>
@@ -801,14 +801,14 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 
 <!-- Mobile bottom nav -->
 <nav class="bottom-nav">
-  <a class="bnav-item active" data-tab="status"><span class="icon"><svg aria-hidden="true"><use href="#icon-dashboard"/></svg></span>Home</a>
-  <a class="bnav-item" data-tab="report"><span class="icon"><svg aria-hidden="true"><use href="#icon-report"/></svg></span>Report</a>
-  <a class="bnav-item" data-tab="sync" hidden><span class="icon"><svg aria-hidden="true"><use href="#icon-sync"/></svg></span>Sync</a>
-  <a class="bnav-item" data-tab="clinical"><span class="icon"><svg aria-hidden="true"><use href="#icon-clinical"/></svg></span>Clinical</a>
-  <a class="bnav-item" data-tab="bluetooth"><span class="icon"><svg aria-hidden="true"><use href="#icon-oximetry"/></svg></span>Oxi</a>
+  <a class="bnav-item active" data-tab="status"><span class="icon"><svg aria-hidden="true"><use href="#icon-dashboard"/></svg></span><span data-i18n="nav.home"></span></a>
+  <a class="bnav-item" data-tab="report"><span class="icon"><svg aria-hidden="true"><use href="#icon-report"/></svg></span><span data-i18n="nav.shortReport"></span></a>
+  <a class="bnav-item" data-tab="sync" hidden><span class="icon"><svg aria-hidden="true"><use href="#icon-sync"/></svg></span><span data-i18n="nav.sync"></span></a>
+  <a class="bnav-item" data-tab="clinical"><span class="icon"><svg aria-hidden="true"><use href="#icon-clinical"/></svg></span><span data-i18n="nav.clinical"></span></a>
+  <a class="bnav-item" data-tab="bluetooth"><span class="icon"><svg aria-hidden="true"><use href="#icon-oximetry"/></svg></span><span data-i18n="nav.shortOxi"></span></a>
   <a class="bnav-item" data-tab="console"><span class="icon"><svg aria-hidden="true"><use href="#icon-console"/></svg></span>CLI</a>
-  <a class="bnav-item" data-tab="storage" hidden><span class="icon"><svg aria-hidden="true"><use href="#icon-storage"/></svg></span>Storage</a>
-  <a class="bnav-item" data-tab="device"><span class="icon"><svg aria-hidden="true"><use href="#icon-config"/></svg></span>Config</a>
+  <a class="bnav-item" data-tab="storage" hidden><span class="icon"><svg aria-hidden="true"><use href="#icon-storage"/></svg></span><span data-i18n="nav.storage"></span></a>
+  <a class="bnav-item" data-tab="device"><span class="icon"><svg aria-hidden="true"><use href="#icon-config"/></svg></span><span data-i18n="nav.config"></span></a>
   <a class="bnav-item" data-tab="ota"><span class="icon"><svg aria-hidden="true"><use href="#icon-ota"/></svg></span>OTA</a>
 </nav>
 
@@ -816,6 +816,131 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 <div class="toast-container" id="toastContainer"></div>
 
 <script>
+const UI_CATALOGS = /* UI_CATALOGS */ {};
+let uiLanguage = null;
+let uiPluralRules = new Intl.PluralRules('en');
+const uiFormatters = new Map();
+const uiBindings = new WeakMap();
+const UI_ATTRIBUTES = {'data-i18n':'textContent', 'data-i18n-title':'title',
+  'data-i18n-placeholder':'placeholder', 'data-i18n-aria-label':'aria-label'};
+
+function resolveUiLanguage(override) {
+  if (Object.hasOwn(UI_CATALOGS, override)) return override;
+  for (const preference of navigator.languages?.length ? navigator.languages : [navigator.language]) {
+    const tag = String(preference || '').toLowerCase();
+    const supported = Object.keys(UI_CATALOGS).find(language => language.toLowerCase() === tag) || tag.split('-')[0];
+    if (Object.hasOwn(UI_CATALOGS, supported)) return supported;
+  }
+  return 'en';
+}
+
+function uiNumber(value, maximumFractionDigits = 2, minimumFractionDigits = 0) {
+  const key = 'number:' + maximumFractionDigits + ':' + minimumFractionDigits;
+  if (!uiFormatters.has(key)) uiFormatters.set(key, new Intl.NumberFormat(uiLanguage,
+    {maximumFractionDigits, minimumFractionDigits}));
+  return uiFormatters.get(key).format(value);
+}
+
+function uiDate(value, options) {
+  const key = 'date:' + JSON.stringify(options);
+  if (!uiFormatters.has(key)) uiFormatters.set(key, new Intl.DateTimeFormat(uiLanguage,
+    {timeZone:'UTC', ...options}));
+  return uiFormatters.get(key).format(value);
+}
+
+function uiMessage(key, params = {}, fallback) {
+  return {key, params, fallback};
+}
+
+function uiClockMessage(value) {
+  const match = /^(\d{4}-\d\d-\d\d)[ T](\d\d:\d\d)(:\d\d)?(?: (.*))?$/.exec(value || '');
+  if (!match) return value || '--';
+  return uiMessage('common.value', {value:{items:[{date:Date.parse(match[1] + 'T' + match[2] + (match[3] || ':00') + 'Z'),
+    options:{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',
+      ...(match[3] ? {second:'2-digit'} : {}),hourCycle:'h23'}},match[4]].filter(Boolean),separator:' '}});
+}
+
+function uiValue(value) {
+  if (value?.key) return t(value.key, value.params, value.fallback);
+  if (value?.items) return value.items.map(uiValue).join(value.separator);
+  if (value?.date !== undefined) return uiDate(value.date, value.options);
+  if (value?.number !== undefined) return Number.isFinite(value.number)
+    ? uiNumber(value.number, value.max ?? 2, value.min ?? 0) : '--';
+  return typeof value === 'number' ? uiNumber(value) : String(value ?? '');
+}
+
+function uiError(error) {
+  if (error?.ui) return error.ui;
+  const code = error?.message ?? error;
+  return UI_CATALOGS.en['error.' + code] ? uiMessage('error.' + code) : String(code ?? '');
+}
+
+function uiFailure(key, params = {}) {
+  return Object.assign(new Error(key), {ui:uiMessage(key, params)});
+}
+
+function t(key, params = {}, fallback = key) {
+  let value = UI_CATALOGS[uiLanguage]?.[key] ?? UI_CATALOGS.en?.[key];
+  if (value === undefined) return String(fallback);
+  if (typeof value === 'object') value = value[uiPluralRules.select(params.count)] ?? value.other;
+  return String(value).replace(/\{(\w+)\}/g, (_, name) => {
+    return uiValue(params[name]);
+  });
+}
+
+function uiText(el, value, attribute = 'textContent') {
+  if (!el) return;
+  const marker = Object.keys(UI_ATTRIBUTES).find(key => UI_ATTRIBUTES[key] === attribute);
+  let bindings = uiBindings.get(el);
+  if (value?.key) {
+    if (!bindings) { bindings = {}; uiBindings.set(el, bindings); }
+    bindings[attribute] = value;
+    el.setAttribute(marker, value.key);
+    value = t(value.key, value.params, value.fallback);
+  } else {
+    if (bindings) delete bindings[attribute];
+    el.removeAttribute(marker);
+  }
+  if (attribute === 'textContent') el.textContent = value ?? '';
+  else el.setAttribute(attribute, value ?? '');
+}
+
+function translateUi(root = document) {
+  const selector = Object.keys(UI_ATTRIBUTES).map(key => '[' + key + ']').join(',');
+  const elements = [...root.querySelectorAll(selector)];
+  if (root.matches?.(selector)) elements.unshift(root);
+  for (const el of elements) {
+    for (const [marker, attribute] of Object.entries(UI_ATTRIBUTES)) {
+      if (!el.hasAttribute(marker)) continue;
+      const bound = uiBindings.get(el)?.[attribute];
+      const value = bound ? t(bound.key, bound.params, bound.fallback) : t(el.getAttribute(marker));
+      if (attribute === 'textContent') el.textContent = value;
+      else el.setAttribute(attribute, value);
+    }
+  }
+}
+
+function applyUiLanguage(override) {
+  const language = resolveUiLanguage(override);
+  if (language === uiLanguage && document.documentElement.lang === language) return;
+  uiLanguage = language;
+  uiPluralRules = new Intl.PluralRules(language);
+  uiFormatters.clear();
+  document.documentElement.lang = language;
+  translateUi();
+  if (reportPlot.summary) {
+    renderReportMetrics(reportPlot.summary);
+    renderReportHistory();
+  }
+  if (!document.getElementById('reportCalendar').hidden) {
+    const day = document.activeElement?.dataset.day;
+    renderReportCalendar();
+    if (day) document.querySelector('#reportCalendar [data-day="'+day+'"]')?.focus();
+  }
+  if (reportPlot.view) scheduleReportDraw();
+  if (document.getElementById('p-status').classList.contains('active')) updateCharts();
+}
+
 const G = {};
 let settings = [], curMode = 0;
 
@@ -865,7 +990,7 @@ function initSSE() {
   evtSrc.onerror = () => {
     exportsFresh = false;
     renderExports();
-    if (otaWatch) showMsg(document.getElementById('otaReleaseMsg'), 'Connection lost; waiting for device...', 'err', 0);
+    if (otaWatch) showMsg(document.getElementById('otaReleaseMsg'), uiMessage('ota.connectionLost'), 'err', 0);
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = '#555';
   };
@@ -914,7 +1039,7 @@ function updateBleFromPush(d) {
   if (st && dashboard) {
     var b = document.getElementById('dashOxiBadge');
     if (b) {
-      b.textContent = st;
+      uiText(b, uiMessage('state.' + st, {}, st));
       b.className = 'badge ' + (st === 'STREAMING' ? 'badge-streaming' : st === 'DISCONNECTED' ? 'badge-idle' : 'badge-idle');
     }
   }
@@ -929,7 +1054,7 @@ function updateBleFromPush(d) {
   if (d.feeding !== undefined && dashboard) {
     var fb = document.getElementById('dashFeedBadge');
     if (fb) {
-      fb.textContent = 'Feed: ' + d.feeding;
+      uiText(fb, uiMessage('status.feed', {state:uiMessage('common.' + d.feeding)}));
       fb.className = 'badge ' + (d.feeding === 'yes' ? 'badge-feed' : 'badge-idle');
     }
   }
@@ -956,16 +1081,17 @@ function updateBleFromPush(d) {
   for (var k in fields) {
     if (fields[k] === undefined) continue;
     var el = g.querySelector('[data-field="' + k + '"]');
-    if (el) el.textContent = fields[k];
+    if (el) uiText(el, k === 'state' ? uiMessage('state.' + fields[k], {}, fields[k])
+      : k === 'feeding' ? uiMessage('common.' + fields[k], {}, fields[k]) : fields[k]);
   }
   var sp = document.getElementById('bleScanSpinner');
   if (sp && st) sp.style.display = st === 'SCANNING' ? 'inline-block' : 'none';
   if (d.feeding !== undefined) {
     const feed = document.getElementById('btnFeed');
-    feed.textContent = d.feeding === 'yes' ? 'Stop Feed' : 'Start Feed';
+    uiText(feed, uiMessage(d.feeding === 'yes' ? 'ble.stopFeed' : 'ble.startFeed'));
     feed.onclick = () => bleAction(lastStatus.feeding === 'yes' ? 'stop_feed' : 'start_feed');
   }
-  if (st) document.getElementById('btnOxiToggle').textContent = st === 'DISABLED' ? 'Enable' : 'Disable';
+  if (st) uiText(document.getElementById('btnOxiToggle'), uiMessage(st === 'DISABLED' ? 'common.enable' : 'common.disable'));
   if (st || d.oxi_addr !== undefined) updateBleConnections();
 }
 
@@ -1016,14 +1142,7 @@ function updateOxiChart(d) {
 let setupStep = 'network';
 let setupBusy = false;
 let setupWifiRead = null;
-const SETUP_STEPS = {
-  network: ['Network', 'Add a network or keep using the AirBridge access point.'],
-  airsense: ['AirSense', 'Connect the Air10 service cable. You can continue without the device.'],
-  time: ['Time', 'Choose your timezone. NTP uses the configured server when a network is available.'],
-  smb: ['SMB (optional)', 'Configure a shared folder, or skip this step.'],
-  sleephq: ['SleepHQ (optional)', 'Configure your SleepHQ endpoint, or skip this step.'],
-  access: ['Access', 'Changes to the Web UI login apply only when you finish. Leave the password untouched to keep it.']
-};
+const SETUP_STEPS = ['network', 'airsense', 'time', 'smb', 'sleephq', 'access'];
 
 function setupActive() {
   return document.getElementById('p-setup').classList.contains('active');
@@ -1034,7 +1153,7 @@ function rememberSetup(step) {
 }
 
 function setupSteps() {
-  return Object.keys(SETUP_STEPS).filter(id => configStorageSupported || (id !== 'smb' && id !== 'sleephq'));
+  return SETUP_STEPS.filter(id => configStorageSupported || (id !== 'smb' && id !== 'sleephq'));
 }
 
 function setupLock(busy) {
@@ -1047,8 +1166,8 @@ function renderSetupDevice() {
   const el = document.getElementById('setupDevice');
   const state = lastStatus.system;
   const identity = [lastStatus.pna, lastStatus.srn].filter(Boolean).join(' | ');
-  el.textContent = (!state || state === 'ERROR' ? 'AirSense communication not confirmed yet.' :
-    'AirSense status: ' + state + '.') + (identity ? ' ' + identity : '');
+  uiText(el, uiMessage(!state || state === 'ERROR' ? 'setup.deviceUnknown' : 'setup.deviceStatus',
+    {state:uiMessage('state.' + state, {}, state), identity}));
 }
 
 function setupNetworkSelected() {
@@ -1062,18 +1181,18 @@ async function loadSetupWifi() {
   setupWifiRead = (async () => {
     try {
       const r = await api('/api/wifi', undefined, 5000);
-      if (!r || !r.ok) throw new Error('Cannot read WiFi status');
+      if (!r || !r.ok) throw new Error('wifi_read_failed');
       const d = await r.json();
       if (serial !== wifiSerial) return null;
-      document.getElementById('setupWifiStatus').textContent =
-        'State: ' + d.state + (d.ssid ? ' | ' + d.ssid : '') +
-        ' | Saved: ' + (d.networks.map(n => n.ssid).join(', ') || 'none');
+      uiText(document.getElementById('setupWifiStatus'), uiMessage('setup.wifiState',
+        {state:uiMessage('wifi.state.' + d.state, {}, d.state), ssid:d.ssid || '--',
+          saved:d.networks.map(n => n.ssid).join(', ') || uiMessage('common.none')}));
       const link = document.getElementById('setupWifiLink');
       link.hidden = !d.ip;
-      if (d.ip) { link.href = 'http://' + d.ip + '/wizard'; link.textContent = 'Continue at ' + d.ip; }
+      if (d.ip) { link.href = 'http://' + d.ip + '/wizard'; uiText(link, uiMessage('setup.continueAt', {ip:d.ip})); }
       return d;
     } catch(e) {
-      showMsg(document.getElementById('setupMsg'), e.message, 'err');
+      showMsg(document.getElementById('setupMsg'), uiError(e), 'err');
       return null;
     } finally {
       setupWifiRead = null;
@@ -1089,14 +1208,14 @@ async function renderSetup() {
     const steps = setupSteps();
     const index = steps.indexOf(setupStep);
     rememberSetup(setupStep);
-    document.getElementById('setupTitle').textContent = SETUP_STEPS[setupStep][0];
-    document.getElementById('setupProgress').textContent = (index + 1) + ' of ' + steps.length;
-    document.getElementById('setupNote').textContent = SETUP_STEPS[setupStep][1];
+    uiText(document.getElementById('setupTitle'), uiMessage('setup.' + setupStep + '.title'));
+    uiText(document.getElementById('setupProgress'), uiMessage('setup.progress', {step:index + 1, total:steps.length}));
+    uiText(document.getElementById('setupNote'), uiMessage('setup.' + setupStep + '.note'));
     document.getElementById('setupNetwork').hidden = setupStep !== 'network';
     document.getElementById('setupDevice').hidden = setupStep !== 'airsense';
-    document.getElementById('setupNext').textContent = setupStep === 'access' ? 'Finish' : 'Save & next';
-    document.getElementById('setupSkip').textContent = setupStep === 'access' ? 'Keep access & finish' : 'Skip';
-    document.getElementById('setupMsg').textContent = '';
+    uiText(document.getElementById('setupNext'), uiMessage(setupStep === 'access' ? 'setup.finish' : 'setup.saveNext'));
+    uiText(document.getElementById('setupSkip'), uiMessage(setupStep === 'access' ? 'setup.keepAccess' : 'common.skip'));
+    uiText(document.getElementById('setupMsg'), '');
     document.getElementById('setupMsg').className = 'msg';
     const forms = document.getElementById('setupForms');
     Array.from(forms.children).forEach(root => { root.hidden = true; });
@@ -1137,7 +1256,7 @@ async function startSetup() {
     const status = await loadStatus();
     setupLock(false);
     if (!status) {
-      showMsg(document.getElementById('setupMsg'), 'Cannot read device status. Reload to retry.', 'err');
+      showMsg(document.getElementById('setupMsg'), uiMessage('setup.statusFailed'), 'err');
       document.getElementById('setupNext').disabled = true;
       document.getElementById('setupSkip').disabled = true;
       return;
@@ -1166,7 +1285,7 @@ async function setupMove(direction, skip = false) {
           if (!wifi) return;
           const mode = root.querySelector('[data-key="wifi_mode"]');
           if (mode.value !== '1' && !ssid.value && !wifi.networks.some(n => n.enabled === '1'))
-            throw new Error('Add a network or select AP only.');
+            throw new Error('setup_network_required');
           if (ssid.value) {
             const idx = wifi.networks.findIndex(n => n.ssid === ssid.value);
             if (!await wifiAction(idx < 0 ? 'add' : 'update', ssid.value, pass.value,
@@ -1184,14 +1303,13 @@ async function setupMove(direction, skip = false) {
         const r = await api('/api/onboarding', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
         if (!r) { initSSE(); return; }
         const d = await r.json();
-        if (!r.ok || d.ok !== true) throw new Error(d.error || 'Setup save failed');
+        if (!r.ok || d.ok !== true) throw new Error(d.error || 'setup_save_failed');
         lastStatus.onboarding_complete = 1;
         rememberSetup('done');
         document.getElementById('setupForms').innerHTML = '';
         document.getElementById('setupActions').hidden = true;
         document.getElementById('setupFinish').hidden = false;
-        document.getElementById('setupNote').textContent =
-          Object.keys(changes).length ? 'Use your new credentials when opening the dashboard.' : 'Initial setup is complete.';
+        uiText(document.getElementById('setupNote'), uiMessage(Object.keys(changes).length ? 'setup.credentials' : 'setup.complete'));
         return;
       }
       if (skip && root) root.innerHTML = '';
@@ -1204,7 +1322,7 @@ async function setupMove(direction, skip = false) {
     setupStep = steps[Math.max(0, steps.indexOf(setupStep) + direction)];
   } catch(e) {
     if (!evtSrc) initSSE();
-    showMsg(document.getElementById('setupMsg'), 'Save not confirmed: ' + e.message, 'err');
+    showMsg(document.getElementById('setupMsg'), uiMessage('setup.notConfirmed', {detail:uiError(e)}), 'err');
     return;
   } finally { setupLock(false); }
   await renderSetup();
@@ -1242,7 +1360,8 @@ function showTab(id) {
     checkFlashReady();
     if (otaStatus) renderOtaStatus(otaStatus);
     var ev = document.getElementById('espFwVer');
-    if (ev && lastStatus.version) ev.textContent = lastStatus.version + (lastStatus.built ? ' (' + lastStatus.built + ')' : '');
+    if (ev && lastStatus.version) uiText(ev, uiMessage('common.value', {value:{items:[lastStatus.version,
+      lastStatus.built ? uiClockMessage(lastStatus.built) : null].filter(Boolean),separator:' / '}}));
   }
 }
 
@@ -1254,11 +1373,11 @@ document.querySelectorAll('.nav-item, .bnav-item').forEach(n => {
 
 async function api(url, opts, timeoutMs = 0) {
   const r = await fetch(url, timeoutMs ? {...opts, signal:AbortSignal.timeout(timeoutMs)} : opts);
-  if (r.status === 401) { alert('Authentication failed'); return null; }
+  if (r.status === 401) { alert(t('error.authentication_failed')); return null; }
   return r;
 }
 
-const ROP_NAMES = {0:'Standby',1:'Running',2:'Power Recovery',3:'Power Save',4:'Calibration',5:'Upgrade'};
+
 
 function fmtRssi(rssi) {
   var v = Number(rssi);
@@ -1282,6 +1401,7 @@ function updateWifiBars(el, rssi) {
 }
 
 function renderStatus(d) {
+  if (d.ui_language !== undefined) applyUiLanguage(d.ui_language);
   if (d.report_source !== undefined || d.report_revision !== undefined || d.report_data_revision !== undefined || d.report_state !== undefined || d.report_error !== undefined || d.report_available !== undefined) applyReportStatus(d);
   if (d.system !== undefined || d.rop !== undefined) renderReportAvailability();
   if (d.sd !== undefined) {
@@ -1291,11 +1411,11 @@ function renderStatus(d) {
   }
   // Topbar - update from any push, even without full status
   var el;
-  el = document.getElementById('topHeap'); if (el && d.heap !== undefined) el.textContent = (d.heap/1024).toFixed(1) + ' KB heap';
+  el = document.getElementById('topHeap'); if (el && d.heap !== undefined) uiText(el, uiMessage('status.heap', {value:{number:d.heap/1024,max:1,min:1}}));
   if (d.psram_free !== undefined) {
     el = document.getElementById('topPsram');
     el.hidden = d.psram_free < 0;
-    el.textContent = el.hidden ? '' : ' / ' + (d.psram_free/1048576).toFixed(1) + ' MB PSRAM';
+    uiText(el, el.hidden ? '' : uiMessage('status.psram', {value:{number:d.psram_free/1048576,max:1,min:1}}));
   }
   if (d.ssid !== undefined) {
     el = document.getElementById('topSsid');
@@ -1304,29 +1424,27 @@ function renderStatus(d) {
   if (d.rssi !== undefined) updateWifiBars(document.getElementById('topWifi'), d.rssi);
   if (d.ssid !== undefined || d.rssi !== undefined || d.ip !== undefined || d.ap_ip !== undefined) {
     const details = [];
-    if (lastStatus.ssid) details.push('Network: ' + lastStatus.ssid);
-    if (lastStatus.rssi < 0) details.push('Signal: ' + fmtRssi(lastStatus.rssi));
-    if (lastStatus.ip) details.push('LAN IP: ' + lastStatus.ip);
-    if (lastStatus.ap_ip) details.push('Access point IP: ' + lastStatus.ap_ip);
-    const tooltip = details.join('\n') || 'No WiFi connection';
-    document.getElementById('topSsid').title = tooltip;
-    document.getElementById('topSsid').setAttribute('aria-label', tooltip.replace(/\n/g, ', '));
-    document.getElementById('topWifi').title = tooltip;
+    if (lastStatus.ssid) details.push(uiMessage('status.network', {ssid:lastStatus.ssid}));
+    if (lastStatus.rssi < 0) details.push(uiMessage('status.signal', {rssi:fmtRssi(lastStatus.rssi)}));
+    if (lastStatus.ip) details.push(uiMessage('status.lanIp', {ip:lastStatus.ip}));
+    if (lastStatus.ap_ip) details.push(uiMessage('status.apIp', {ip:lastStatus.ap_ip}));
+    const tooltip = details.length ? uiMessage('common.value', {value:{items:details, separator:'\n'}}) : uiMessage('status.noWifi');
+    uiText(document.getElementById('topSsid'), tooltip, 'title');
+    uiText(document.getElementById('topSsid'), details.length ? uiMessage('common.value', {value:{items:details, separator:', '}}) : tooltip, 'aria-label');
+    uiText(document.getElementById('topWifi'), tooltip, 'title');
   }
   if (d.uptime !== undefined) {
     var s = d.uptime, days = (s/86400)|0, hrs = ((s%86400)/3600)|0, mins = ((s%3600)/60)|0;
-    var ut = '';
-    if (days) ut += days + 'd ';
-    ut += hrs + 'h ' + mins + 'm';
-    el = document.getElementById('topUptime'); if (el) el.textContent = 'Up: ' + ut;
+    const duration = uiMessage(days ? 'duration.uptime' : 'duration.shortUptime', {days,hours:hrs,minutes:mins});
+    uiText(document.getElementById('topUptime'), uiMessage('status.uptime', {duration}));
   }
   if (d.version) {
     document.getElementById('ver').textContent = d.version;
     var vb = document.getElementById('verBuild');
-    if (vb && d.built) vb.textContent = d.built;
+    if (vb && d.built) uiText(vb, uiClockMessage(d.built));
   }
   if (d.target !== undefined) {
-    document.getElementById('verBuild').title = d.target ? 'Build target: ' + d.target : '';
+    uiText(document.getElementById('verBuild'), d.target ? uiMessage('status.buildTarget', {target:d.target}) : '', 'title');
     document.getElementById('espFwTarget').textContent = d.target || '--';
   }
 
@@ -1342,12 +1460,12 @@ function renderStatus(d) {
   el = document.getElementById('dashMhr');
   if (el && d.mhr !== undefined && d.mhr >= 0) {
     var h = Math.round(d.mhr / 3600);
-    el.textContent = h.toLocaleString() + ' hrs';
+    uiText(el, uiMessage('status.hours', {count:h}));
   }
   if (d.rop !== undefined) {
     var ropBadge = document.getElementById('dashRopBadge');
     if (ropBadge) {
-      ropBadge.textContent = ROP_NAMES[d.rop] || (d.system || '--');
+      uiText(ropBadge, uiMessage('status.rop.' + d.rop, {}, d.system || '--'));
       ropBadge.className = 'badge ' + (d.rop === 1 ? 'badge-therapy' : d.system === 'ERROR' ? 'badge-error' : 'badge-idle');
     }
     var ropBtns = {1:'btnTherapy', 0:'btnStandby', 3:'btnPwrSave'};
@@ -1357,9 +1475,9 @@ function renderStatus(d) {
     });
   }
   el = document.getElementById('dashEspTime');
-  if (el && d.esp_time !== undefined) el.textContent = d.esp_time || '--';
+  if (el && d.esp_time !== undefined) uiText(el, uiClockMessage(d.esp_time));
   el = document.getElementById('dashResmedTime');
-  if (el && d.resmed_time !== undefined) el.textContent = d.resmed_time || '--';
+  if (el && d.resmed_time !== undefined) uiText(el, uiClockMessage(d.resmed_time));
 
 }
 
@@ -1371,7 +1489,7 @@ function loadStatus() {
   try {
     const r = await api('/api/status', undefined, 5000);
     if (!r) return;
-    if (!r.ok) throw new Error("Status read failed");
+    if (!r.ok) throw new Error("status_read_failed");
     const data = await r.json();
     const current = {...data, ...(serial === statusSerial ? {} : statusPush)};
     applyConfigRevision(current);
@@ -1397,8 +1515,8 @@ async function timeAction(action) {
     const r = await api('/api/time', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});
     if (!r) return;
     const d = await r.json();
-    showMsg(null, d.result, d.ok === 'true' ? 'ok' : 'err');
-  } catch(e) { showMsg(null, 'Error: ' + e.message, 'err'); }
+    showMsg(null, d.ok === 'true' ? uiMessage('time.action.' + action, {}, d.result) : uiError(d.result), d.ok === 'true' ? 'ok' : 'err');
+  } catch(e) { showMsg(null, uiMessage('common.error', {detail:uiError(e)}), 'err'); }
 }
 
 let reportGeneration = 0;
@@ -1609,7 +1727,7 @@ async function reportArtifactRanges(dataset, artifact, document, signal, request
     const missing = reportMissingRanges(ranges,parts);
     if (!missing.length) break;
     if (signal?.aborted) throw new DOMException('Aborted','AbortError');
-    if (lastStatus.report_available === false) throw new Error('This range is not cached; SD is unavailable');
+    if (lastStatus.report_available === false) throw new Error('report_range_not_cached');
     const prior = [...reportBinary.flights.values()].find(flight => flight.prefix === prefix && !flight.signal?.aborted
       && missing.some(gap => flight.ranges.some(part => part.first <= gap.last && part.last >= gap.first)));
     if (prior) {
@@ -1916,18 +2034,18 @@ function edfReportRequest(slot, query, generation, signal) {
       try {
         const requestSignal = AbortSignal.any([combined, AbortSignal.timeout(15000)]);
         const r = await api('/api/report?source=edf&' + (read.job ? 'job=' + encodeURIComponent(read.job) : query), {signal:requestSignal});
-        if (!r) throw new Error('Request cancelled');
+        if (!r) throw new Error('request_cancelled');
         const data = await r.json();
         if (combined.aborted || generation !== reportGeneration) {
           if (r.status === 202) cancelJob(data.job);
           return;
         }
         if (r.status !== 202) {
-          if (!r.ok) throw new Error(data.error || 'EDF report request failed');
+          if (!r.ok) throw new Error(data.error || 'edf_request_failed');
           finish(null, data);
           return;
         }
-        if ((!read.job && !data.job) || (read.job && data.job && data.job !== read.job)) throw new Error('Invalid EDF report job');
+        if ((!read.job && !data.job) || (read.job && data.job && data.job !== read.job)) throw new Error('edf_invalid_job');
         if (data.job) read.job = data.job;
         read.epoch = epoch;
       } catch(e) { finish(e); return; }
@@ -1957,12 +2075,13 @@ function renderReportAvailability() {
   const selected = document.getElementById('reportDay').value;
   document.getElementById('reportDayPrevious').disabled = navigationBlocked || !reportCalendar.days.some(d => reportDate(d.day) < selected);
   document.getElementById('reportDayNext').disabled = navigationBlocked || !reportCalendar.days.some(d => reportDate(d.day) > selected);
-  document.getElementById('reportAvailability').textContent = !source ? 'Waiting for report availability.'
-    : source === 'device' ? (blocked ? 'Available in standby.' : '')
-    : lastStatus.report_error === 'usb_storage' ? 'SD card is shared via USB.'
-    : (lastStatus.report_error || ({waiting_storage:'Waiting for SD storage.',
-        building:blocked && !reportPlot.summary ? 'Preparing report...' : '', blocked:'Local report unavailable.',
-        error:'Local report error.'}[lastStatus.report_state] || ''));
+  uiText(document.getElementById('reportAvailability'), !source ? uiMessage('report.waiting')
+    : source === 'device' ? (blocked ? uiMessage('report.standby') : '')
+    : lastStatus.report_error === 'usb_storage' ? uiMessage('report.usb')
+    : lastStatus.report_error ? uiError(lastStatus.report_error)
+    : lastStatus.report_state === 'building' ? (blocked && !reportPlot.summary ? uiMessage('report.preparing') : '')
+    : ({waiting_storage:uiMessage('report.waitingStorage'), blocked:uiMessage('report.unavailable'),
+        error:uiMessage('report.error')}[lastStatus.report_state] || ''));
   return blocked;
 }
 
@@ -2006,22 +2125,23 @@ function stepReportDay(delta) {
 function renderReportCalendar() {
   const grid = document.getElementById('reportCalendarGrid'); grid.replaceChildren();
   const date = new Date(reportCalendar.month), year = date.getUTCFullYear(), month = date.getUTCMonth();
-  document.getElementById('reportMonth').textContent = date.toLocaleString('en-US', {month:'long',year:'numeric',timeZone:'UTC'});
+  document.getElementById('reportMonth').textContent = uiDate(date, {month:'long',year:'numeric'});
   const from = Date.UTC(year,month,1)/86400000, to = Date.UTC(year,month+1,1)/86400000;
   document.getElementById('reportMonthPrevious').disabled = !reportCalendar.days.some(d => d.day < from);
   document.getElementById('reportMonthNext').disabled = !reportCalendar.days.some(d => d.day >= to);
   const days = new Map(reportCalendar.days.map(d => [d.day,d.session_count]));
   const selected = document.getElementById('reportDay').value;
-  for (const text of ['M','T','W','T','F','S','S']) {
-    const cell = document.createElement('span'); cell.textContent = text; grid.append(cell);
+  for (let weekday = 0; weekday < 7; weekday++) {
+    const cell = document.createElement('span'); cell.textContent = uiDate(Date.UTC(2024,0,1+weekday), {weekday:'narrow'}); grid.append(cell);
   }
   for (let i = 0; i < (date.getUTCDay()+6)%7; i++) grid.append(document.createElement('span'));
   for (let day = from; day < to; day++) {
     const button = document.createElement('button'), value = reportDate(day);
+    button.dataset.day = day;
     button.textContent = String(day-from+1); button.disabled = !days.has(day);
-    button.setAttribute('aria-label', value);
+    uiText(button, uiMessage('common.value', {value:{date:day*86400000,options:{dateStyle:'full'}}}), 'aria-label');
     button.setAttribute('aria-pressed', String(value === selected));
-    if (days.has(day)) button.title = days.get(day) + (days.get(day) === 1 ? ' session' : ' sessions');
+    if (days.has(day)) uiText(button, uiMessage('report.sessionCount', {count:days.get(day)}), 'title');
     button.addEventListener('click', () => {
       document.getElementById('reportDay').value = value;
       closeReportCalendar(); loadReport();
@@ -2048,9 +2168,9 @@ function renderReport(data) {
   if (data.source === 'edf') { renderEdfReport(data); return; }
   clearReportPlots();
   reportDisplayedSource = 'device';
-  document.getElementById('reportLoadState').textContent = '';
-  document.getElementById('reportSelection').textContent = '';
-  document.getElementById('reportIntervalTitle').textContent = 'Mask intervals';
+  uiText(document.getElementById('reportLoadState'), '');
+  uiText(document.getElementById('reportSelection'), '');
+  uiText(document.getElementById('reportIntervalTitle'), uiMessage('report.maskIntervals'));
   document.getElementById('reportGrid').hidden = false;
   document.getElementById('reportStatsCard').hidden = true;
   const day = data.view === 'day';
@@ -2058,22 +2178,24 @@ function renderReport(data) {
   date.min = reportDate(0x1000);
   date.max = reportDate(data.current_day);
   if (day && data.day) date.value = reportDate(data.day);
-  document.getElementById('reportTitle').textContent = day
-    ? (data.day ? 'Therapy day ' + reportDate(data.day) : 'Therapy day')
-    : 'Last ' + data.period + (data.period === 1 ? ' day' : ' days');
-  document.getElementById('reportNote').textContent = data.present ? ''
-    : day ? 'No saved data for this therapy day.' : 'No therapy recorded in this period.';
+  uiText(document.getElementById('reportTitle'), day
+    ? (data.day ? uiMessage('report.namedDay', {date:{date:data.day * 86400000, options:{dateStyle:'medium'}}}) : uiMessage('report.therapyDay'))
+    : uiMessage('report.lastDays', {count:data.period}));
+  uiText(document.getElementById('reportNote'), data.present ? '' : uiMessage(day ? 'report.noDay' : 'report.noPeriod'));
   const rows = document.createDocumentFragment();
   for (const value of data.fields) {
     const row = document.createElement('div'); row.className = 'stat';
-    const label = document.createElement('span'); label.className = 'k'; label.textContent = value.label;
+    const label = document.createElement('span'); label.className = 'k';
+    uiText(label, uiMessage('report.field.' + value.cmd, {}, value.label));
     const text = document.createElement('span'); text.className = 'v';
-    text.textContent = value.value + (value.raw >= 0 && value.unit ? ' ' + value.unit : '');
+    uiText(text, uiMessage('common.value', {value:{items:[value.value,
+      value.raw >= 0 ? value.unit : ''].filter(value => value !== '' && value != null),separator:' '}}));
     row.append(label, text); rows.append(row);
   }
   document.getElementById('reportGrid').replaceChildren(rows);
   const intervals = document.getElementById('reportIntervals');
   intervals.className = '';
+  uiText(intervals, '');
   intervals.replaceChildren();
   document.getElementById('reportMaskCard').hidden = !day || !data.present;
   for (const interval of data.intervals) {
@@ -2083,11 +2205,11 @@ function renderReport(data) {
     range.textContent = (interval.on < 0 ? '--' : on.slice(11)) + ' \u2013 ' + (interval.off < 0 ? '--' : off.slice(11));
     const minutes = interval.on >= 0 && interval.off >= interval.on ? interval.off - interval.on : -1;
     const duration = document.createElement('span'); duration.className = 'interval-duration';
-    duration.textContent = '\u00b7 ' + (minutes < 0 ? '--' : minutes < 60 ? minutes + ' min'
-      : Math.floor(minutes / 60) + ' h' + (minutes % 60 ? ' ' + (minutes % 60) + ' min' : ''));
+    uiText(duration, uiMessage('common.value', {value:{items:['\u00b7',
+      minutes < 0 ? '--' : reportDurationMessage(minutes * 60)],separator:' '}}));
     row.append(range, duration); intervals.append(row);
   }
-  if (!data.intervals.length) intervals.textContent = 'No recorded mask intervals';
+  if (!data.intervals.length) uiText(intervals, uiMessage('report.noIntervals'));
 }
 
 async function loadArtifactReport(view, selection, generation, signal) {
@@ -2101,7 +2223,7 @@ async function loadArtifactReport(view, selection, generation, signal) {
       await reportStoreBinary('current-index',days);
     }
   }
-  if (!days?.dataset) throw new Error('No cached report index; local storage is unavailable');
+  if (!days?.dataset) throw new Error('report_no_cached_index');
   if (signal.aborted || generation !== reportGeneration || epoch !== reportDataEpoch) throw new DOMException('Aborted','AbortError');
   reportCalendar.cache = days;
   const dates = (days.days || []).filter(d => Number.isInteger(d.day) && d.day > 0).sort((a,b) => a.day-b.day);
@@ -2114,7 +2236,7 @@ async function loadArtifactReport(view, selection, generation, signal) {
     const key = 'period:'+days.dataset+':'+selection;
     if (offline) {
       const saved = await reportCachedBinary(key);
-      if (!saved) throw new Error('This period is not cached');
+      if (!saved) throw new Error('report_period_not_cached');
       return {...saved,stale:true};
     }
     const period = [1,7,30,90,180,365][selection];
@@ -2147,7 +2269,7 @@ async function loadArtifactReport(view, selection, generation, signal) {
       reportCalendar.cache = null;
     } catch (error) { if (!manifest || error.name === 'AbortError') throw error; }
   }
-  if (!manifest || manifest.dataset !== days.dataset || !Array.isArray(manifest.artifacts)) throw new Error('Report publication unavailable');
+  if (!manifest || manifest.dataset !== days.dataset || !Array.isArray(manifest.artifacts)) throw new Error('report_publication_unavailable');
   if (signal.aborted || generation !== reportGeneration || epoch !== reportDataEpoch) throw new DOMException('Aborted','AbortError');
   await reportStoreBinary('day:'+manifest.dataset+':'+manifest.day,manifest);
   reportPlot.selection = 'view=day&day='+manifest.day;
@@ -2168,7 +2290,7 @@ async function loadReport(latest = false, refresh = false) {
   reportLoading = false; reportDirty = false;
   for (const id of ['reportMaskCard','reportChartsCard']) document.getElementById(id).inert = false;
   if (renderReportAvailability() && reportSource() !== 'edf') {
-    document.getElementById('reportLoadState').textContent = reportDisplayedSource ? 'Previous report' : '';
+    uiText(document.getElementById('reportLoadState'), reportDisplayedSource ? uiMessage('report.previous') : '');
     document.getElementById('reportSpinner').style.display = 'none';
     document.getElementById('reportResult').setAttribute('aria-busy', 'false');
     return;
@@ -2184,9 +2306,9 @@ async function loadReport(latest = false, refresh = false) {
   document.getElementById('reportDayRow').hidden = !day;
   document.getElementById('reportLatest').hidden = !day;
   const prior = reportDisplayedSource !== null;
-  document.getElementById('reportLoadState').textContent = prior ? 'Loading... (previous report)' : 'Loading...';
+  uiText(document.getElementById('reportLoadState'), uiMessage(prior ? 'report.loadingPrevious' : 'common.loading'));
   for (const id of ['reportMaskCard','reportChartsCard']) document.getElementById(id).inert = true;
-  if (!prior) document.getElementById('reportTitle').textContent = source === 'edf' ? 'Statistics' : day ? 'Therapy day' : 'Period';
+  if (!prior) uiText(document.getElementById('reportTitle'), uiMessage(source === 'edf' ? 'report.statistics' : day ? 'report.therapyDay' : 'report.period'));
   document.getElementById('reportMsg').style.display = 'none';
   document.getElementById('reportRefresh').disabled = true;
   document.getElementById('reportResult').setAttribute('aria-busy', 'true');
@@ -2194,7 +2316,7 @@ async function loadReport(latest = false, refresh = false) {
   try {
     const selection = day ? (date.value ? Date.parse(date.value + 'T00:00:00Z') / 86400000 : 0)
       : Number(selected);
-    if (!Number.isInteger(selection)) throw new Error('Choose a valid date');
+    if (!Number.isInteger(selection)) throw new Error('report_invalid_date');
     let data;
     if (source === 'edf') {
       data = await loadArtifactReport(view,selection,generation,reportController.signal);
@@ -2208,24 +2330,14 @@ async function loadReport(latest = false, refresh = false) {
     renderReport(data);
   } catch(e) {
     if (generation !== reportGeneration) return;
-    const errors = {
-      report_not_idle: 'Sleep Report is available in standby.',
-      report_restore_failed: 'Could not restore the previous report period. Check Sleep Report on the AirSense.',
-      report_period_changed: 'The report period changed on the device during this request. Refresh to read again.',
-      report_period_not_selected: 'The device has not selected the requested period. Refresh to read again.',
-      report_history_changed: 'The device saved new data during this read. Refresh to read again.',
-      report_history_unsupported: 'This firmware does not provide stored daily reports.',
-      report_read_failed: 'Could not read the report from the AirSense.',
-      report_day_unavailable: 'This therapy date is not available.',
-      report_deadline: 'The report request timed out.'
-    };
+
     if (e.name !== 'AbortError' && (e.message !== 'report_not_idle' || !renderReportAvailability()))
-      showMsg(document.getElementById('reportMsg'), errors[e.message] || e.message, 'err', source === 'edf' ? 0 : 5000);
+      showMsg(document.getElementById('reportMsg'), uiError(e), 'err', source === 'edf' ? 0 : 5000);
   } finally {
     if (generation === reportGeneration) {
       reportLoading = false;
       for (const id of ['reportMaskCard','reportChartsCard']) document.getElementById(id).inert = false;
-      if (document.getElementById('reportLoadState').textContent) document.getElementById('reportLoadState').textContent = prior ? 'Previous report' : '';
+      if (document.getElementById('reportLoadState').textContent) uiText(document.getElementById('reportLoadState'), prior ? uiMessage('report.previous') : '');
       document.getElementById('reportSpinner').style.display = 'none';
       document.getElementById('reportResult').setAttribute('aria-busy', 'false');
       renderReportAvailability();
@@ -2239,14 +2351,18 @@ function reportTime(ms) {
 }
 
 function reportNumber(value) {
-  return Number.isFinite(value) ? value.toLocaleString('en-US', {maximumFractionDigits:2}) : '--';
+  return Number.isFinite(value) ? uiNumber(value) : '--';
+}
+
+function reportDurationMessage(seconds, compact = false) {
+  if (!Number.isFinite(seconds)) return '--';
+  const hours = Math.floor(seconds/3600), minutes = Math.floor(seconds%3600/60);
+  const unit = hours ? (minutes ? 'HoursMinutes' : 'Hours') : 'Minutes';
+  return uiMessage('duration.' + (compact ? 'compact' + unit : unit[0].toLowerCase() + unit.slice(1)), {hours,minutes});
 }
 
 function reportDuration(seconds, compact = false) {
-  if (!Number.isFinite(seconds)) return '--';
-  const hours = Math.floor(seconds/3600), minutes = Math.floor(seconds%3600/60);
-  const text = (hours ? hours + ' h' : '') + (minutes || !hours ? (hours ? ' ' : '') + minutes + ' min' : '');
-  return compact ? text.replace(' min','m').replace(' h','h') : text;
+  return uiValue(reportDurationMessage(seconds, compact));
 }
 
 function reportSessions() {
@@ -2260,7 +2376,7 @@ function reportSessionRange() {
 }
 
 const reportMetrics = [
-  {id:'usage',label:'Therapy time',unit:'',field:'used_seconds',color:'#7dd3fc'},
+  {id:'usage',labelKey:'report.usage',unit:'',field:'used_seconds',color:'#7dd3fc'},
   {id:'ahi',label:'AHI',unit:'/h',field:'ahi',color:'#c084fc',digits:2},
   {id:'pressure',label:'Pressure',unit:'cmH2O',channel:'Press',color:'#34d399',digits:2},
   {id:'leak',label:'Leak',unit:'L/min',channel:'Leak',color:'#fb923c',digits:2},
@@ -2273,31 +2389,31 @@ function renderReportMetrics(data) {
   const fragment = document.createDocumentFragment();
   for (const metric of reportMetrics) {
     const format = value => !Number.isFinite(value) ? '--'
-      : metric.id === 'usage' ? (value < 0 ? '-' : '') + reportDuration(Math.round(Math.abs(value)/60)*60,true) : value.toFixed(metric.digits);
+      : metric.id === 'usage' ? (value < 0 ? '-' : '') + reportDuration(Math.round(Math.abs(value)/60)*60,true) : uiNumber(value, metric.digits, metric.digits);
     const value = metric.field ? data[metric.field] : data.channels?.find(c => c.id === metric.channel)?.mean;
     const tile = document.createElement(data.view === 'day' ? 'button' : 'div'); tile.className = 'report-metric';
     tile.dataset.metric = metric.id;
     tile.style.cssText = '--metric-color:'+metric.color;
-    tile.title = metric.name || metric.label;
+    tile.title = metric.name || (metric.labelKey ? t(metric.labelKey) : metric.label);
     if (data.view === 'day') {
       tile.type = 'button';
       tile.setAttribute('aria-expanded',String(reportPlot.historyMetric === metric.id));
       tile.setAttribute('aria-controls','reportHistory');
       tile.addEventListener('click',() => showReportHistory(metric.id));
     }
-    for (const [className,text] of [['label',metric.label + (metric.channel ? ' \u00b7 avg' : '')],['value',format(value)],['unit',metric.unit]]) {
+    for (const [className,text] of [['label',metric.channel ? t('report.average', {channel:metric.label}) : metric.labelKey ? t(metric.labelKey) : metric.label],['value',format(value)],['unit',metric.unit]]) {
       const item = document.createElement('span'); item.className = 'report-metric-' + className;
       item.textContent = text; tile.append(item);
     }
     const trend = reportPlot.history?.metrics.find(m => m.id === metric.id);
     if (data.view === 'day' && trend) {
-      tile.title += '; previous 7 days: '+format(trend.baseline)+' '+metric.unit+' ('+(trend.baseline_count || 0)+'/7 days)';
+      tile.title += '; ' + t('report.baseline', {value:format(trend.baseline), unit:metric.unit, count:trend.baseline_count || 0});
       if (trend.points.filter(Number.isFinite).length > 1) {
         const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
         svg.setAttribute('aria-hidden','true'); drawReportHistory(svg,metric,trend,false); tile.append(svg);
       }
       const delta = document.createElement('span'); delta.className = 'report-metric-delta';
-      delta.title = 'Change from the previous 7 days';
+      uiText(delta, uiMessage('report.delta'), 'title');
       delta.textContent = Number.isFinite(trend.delta)
         ? (trend.delta > 0 ? '+' : '') + format(trend.delta) : '--';
       tile.append(delta);
@@ -2334,13 +2450,13 @@ function drawReportHistory(svg, metric, trend, expanded) {
     if (!Number.isFinite(value)) return;
     const dot = node('circle',{cx:x(i),cy:y(value),r:expanded ? 3 : 1.4,fill:metric.color});
     const title = document.createElementNS('http://www.w3.org/2000/svg','title');
-    title.textContent = reportDate(reportPlot.history.first_day+i)+': '+(metric.id === 'usage' ? reportDuration(value) : reportNumber(value)+' '+metric.unit);
+    title.textContent = uiDate((reportPlot.history.first_day+i)*86400000,{dateStyle:'medium'})+': '+(metric.id === 'usage' ? reportDuration(value) : reportNumber(value)+' '+metric.unit);
     dot.append(title);
   });
   if (!expanded) return;
   if (Number.isFinite(trend.baseline)) node('line',{x1:left,x2:width-right,y1:y(trend.baseline),y2:y(trend.baseline),stroke:'currentColor','stroke-dasharray':'3 4'});
   for (const value of new Set([low,high])) node('text',{x:left-6,y:y(value)+4,'text-anchor':'end',fill:'currentColor','font-size':11},metric.id === 'usage' ? reportDuration(value) : reportNumber(value));
-  for (const i of [0,6,13]) node('text',{x:x(i),y:height-3,'text-anchor':i === 0 ? 'start' : i === 13 ? 'end' : 'middle',fill:'currentColor','font-size':11},reportDate(reportPlot.history.first_day+i).slice(5));
+  for (const i of [0,6,13]) node('text',{x:x(i),y:height-3,'text-anchor':i === 0 ? 'start' : i === 13 ? 'end' : 'middle',fill:'currentColor','font-size':11},uiDate((reportPlot.history.first_day+i)*86400000,{month:'2-digit',day:'2-digit'}));
 }
 
 function renderReportHistory() {
@@ -2348,10 +2464,9 @@ function renderReportHistory() {
   document.getElementById('reportHistory').hidden = !metric;
   if (!metric) return;
   const trend = reportPlot.history?.metrics.find(m => m.id === metric.id);
-  document.getElementById('reportHistoryTitle').textContent = metric.label + ' / 14 days';
-  document.getElementById('reportHistoryBaseline').textContent = 'Previous 7 days: '
-    + (metric.id === 'usage' ? reportDuration(trend?.baseline) : reportNumber(trend?.baseline) + ' ' + metric.unit)
-    + ' (' + (trend?.baseline_count || 0) + '/7 days)';
+  uiText(document.getElementById('reportHistoryTitle'), uiMessage('report.historyTitle', {metric:metric.labelKey ? uiMessage(metric.labelKey) : metric.label}));
+  uiText(document.getElementById('reportHistoryBaseline'), uiMessage('report.baseline',
+    {value:metric.id === 'usage' ? reportDurationMessage(trend?.baseline) : {number:trend?.baseline}, unit:metric.unit, count:trend?.baseline_count || 0}));
   drawReportHistory(document.getElementById('reportHistoryChart'),metric,trend,true);
 }
 
@@ -2366,27 +2481,29 @@ function renderEdfReport(data) {
   clearReportPlots();
   reportPlot.selection = selection;
   reportDisplayedSource = 'edf';
-  document.getElementById('reportLoadState').textContent = '';
+  uiText(document.getElementById('reportLoadState'), '');
   reportPlot.summary = data;
   reportPlot.history = data.history || null;
   const day = data.view === 'day';
   if (day && data.day) document.getElementById('reportDay').value = reportDate(data.day);
   const selectedDate = document.getElementById('reportDay').value;
-  document.getElementById('reportDateButton').textContent = selectedDate || (reportCalendar.days.length ? 'Last saved day' : 'No recordings');
-  document.getElementById('reportTitle').textContent = 'Statistics';
-  document.getElementById('reportSelection').textContent = day
-    ? data.day > 0 ? reportDate(data.day) : selectedDate
-    : data.first_day > 0 && data.last_day > 0 ? reportDate(data.first_day) + ' to ' + reportDate(data.last_day) : '';
-  document.getElementById('reportNote').textContent = !data.present ? 'No saved EDF data for this selection.'
-    : data.stale ? 'Last prepared report' : data.partial ? 'Incomplete report' : '';
+  uiText(document.getElementById('reportDateButton'), selectedDate ? uiMessage('common.value',
+    {value:{date:Date.parse(selectedDate + 'T00:00:00Z'), options:{dateStyle:'medium'}}}) : uiMessage(reportCalendar.days.length ? 'report.latest' : 'report.noRecordings'));
+  uiText(document.getElementById('reportTitle'), uiMessage('report.statistics'));
+  uiText(document.getElementById('reportSelection'), day
+    ? data.day > 0 ? uiMessage('common.value', {value:{date:data.day * 86400000, options:{dateStyle:'medium'}}}) : selectedDate
+    : data.first_day > 0 && data.last_day > 0 ? uiMessage('report.dateRange',
+      {from:{date:data.first_day * 86400000, options:{dateStyle:'medium'}}, to:{date:data.last_day * 86400000, options:{dateStyle:'medium'}}}) : '');
+  uiText(document.getElementById('reportNote'), !data.present ? uiMessage('report.noEdf')
+    : data.stale ? uiMessage('report.stale') : data.partial ? uiMessage('report.incomplete') : '');
   document.getElementById('reportGrid').hidden = true;
   renderReportMetrics(data);
   const totals = document.createDocumentFragment();
-  for (const [label, value] of [...Object.entries(data.counts || {}).map(([type,count]) => [type.toUpperCase(),reportNumber(count)]),
-      ['RDI',reportNumber(data.rdi)], ['CSR',reportDuration(data.csr_seconds)],
-      ['Leak > ' + reportNumber(data.leak_threshold) + ' L/min',reportDuration(data.leak_high_seconds)]]) {
+  for (const [label, value] of [...Object.entries(data.counts || {}).map(([type,count]) => [type.toUpperCase(),{number:count}]),
+      ['RDI',{number:data.rdi}], ['CSR',reportDurationMessage(data.csr_seconds)],
+      ['Leak > ' + data.leak_threshold + ' L/min',reportDurationMessage(data.leak_high_seconds)]]) {
     const item = document.createElement('span'); item.textContent = label;
-    const text = document.createElement('b'); text.textContent = value;
+    const text = document.createElement('b'); uiText(text, uiMessage('common.value', {value}));
     item.append(text); totals.append(item);
   }
   document.getElementById('reportTotals').replaceChildren(totals);
@@ -2394,8 +2511,8 @@ function renderEdfReport(data) {
   for (const channel of data.channels || []) {
     const row = document.createElement('tr');
     for (const value of [channel.label + (channel.unit ? ' (' + channel.unit + ')' : ''),
-        ...['min','mean','median','p95','max'].map(key => reportNumber(channel[key]))]) {
-      const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
+        ...['min','mean','median','p95','max'].map(key => uiMessage('common.value', {value:{number:channel[key]}}))]) {
+      const cell = document.createElement('td'); uiText(cell, value); row.append(cell);
     }
     if (channel.source === 'str') {
       const source = document.createElement('span'); source.className = 'report-stat-source'; source.textContent = 'STR';
@@ -2407,8 +2524,12 @@ function renderEdfReport(data) {
   const fields = document.createDocumentFragment();
   for (const field of data.settings?.fields || []) {
     const row = document.createElement('div'); row.className = 'stat';
-    const label = document.createElement('span'); label.className = 'k'; label.textContent = field.label;
-    const value = document.createElement('span'); value.className = 'v'; value.textContent = field.value + (field.unit ? ' '+field.unit : '');
+    const label = document.createElement('span'); label.className = 'k';
+    uiText(label, uiMessage('clinical.label.' + field.tag, {}, field.label));
+    const value = document.createElement('span'); value.className = 'v';
+    uiText(value, uiMessage('common.value', {value:{items:[Number.isInteger(field.option)
+      ? uiMessage('clinical.option.' + field.tag + '.' + field.option, {}, field.value) : field.value,
+      field.unit].filter(part => part !== '' && part != null),separator:' '}}));
     row.append(label,value); fields.append(row);
   }
   document.getElementById('reportSettingsFields').replaceChildren(fields);
@@ -2430,10 +2551,11 @@ function renderReportSessions(focusId = null) {
   const sessions = document.getElementById('reportSessions'); sessions.replaceChildren();
   for (const session of reportSessions()) {
     const button = document.createElement('button'); button.className = 'report-session';
-    button.textContent = reportTime(session.start_ms).slice(11,16) + '-' + reportTime(session.end_ms).slice(11,16)
-      + ' ' + reportDuration((session.end_ms-session.start_ms)/1000);
+    uiText(button, uiMessage('report.session', {start:reportTime(session.start_ms).slice(11,16),
+      end:reportTime(session.end_ms).slice(11,16), duration:reportDurationMessage((session.end_ms-session.start_ms)/1000)}));
     button.setAttribute('aria-pressed', String(!reportPlot.hiddenSessions.has(session.id)));
-    button.title = reportTime(session.start_ms) + ' - ' + reportTime(session.end_ms);
+    uiText(button, uiMessage('report.dateRange', {from:{date:session.start_ms,options:{dateStyle:'medium',timeStyle:'medium',hourCycle:'h23'}},
+      to:{date:session.end_ms,options:{dateStyle:'medium',timeStyle:'medium',hourCycle:'h23'}}}), 'title');
     button.disabled = !Number.isInteger(session.id) || session.id < 0 || session.id >= 8192;
     button.addEventListener('click', () => toggleReportSession(session.id));
     sessions.append(button);
@@ -2467,7 +2589,7 @@ function clearReportPlots() {
   reportPlot.serial++;
   reportPlot.history = reportPlot.historyMetric = null; reportPlot.historyPending = false;
   document.getElementById('reportHistory').hidden = true;
-  document.getElementById('reportHistoryNote').textContent = '';
+  uiText(document.getElementById('reportHistoryNote'), '');
   reportPlot.summary = reportPlot.selection = reportPlot.full = reportPlot.view = null;
   reportPlot.fullSeries = reportPlot.series = reportPlot.pending = reportPlot.cursor = reportPlot.gesture = null;
   reportPlot.axes = null;
@@ -2480,8 +2602,8 @@ function clearReportPlots() {
   reportPlot.request = false;
   document.getElementById('reportPlots').replaceChildren();
   document.getElementById('reportChartsCard').hidden = true;
-  document.getElementById('reportSeriesNote').textContent = '';
-  document.getElementById('reportCursor').textContent = '';
+  uiText(document.getElementById('reportSeriesNote'), '');
+  uiText(document.getElementById('reportCursor'), '');
 }
 
 function suspendReport() {
@@ -2551,7 +2673,7 @@ async function drainReportSeries() {
   const full = reportPlot.full;
   reportPlot.flight = request;
   const allHidden = reportSessions().every(s => reportPlot.hiddenSessions.has(s.id));
-  const note = document.getElementById('reportSeriesNote'); note.textContent = allHidden ? 'No sessions selected' : 'Loading chart data...';
+  const note = document.getElementById('reportSeriesNote'); uiText(note, uiMessage(allHidden ? 'report.noSessions' : 'report.chartLoading'));
   try {
     request.controller = new AbortController();
     const signal = AbortSignal.any([reportController.signal,request.controller.signal]);
@@ -2574,14 +2696,14 @@ async function drainReportSeries() {
     }
     if (request.serial !== reportPlot.serial) return;
     reportPlot.series = data;
-    note.textContent = allHidden ? 'No sessions selected'
-      : [data.partial ? 'Incomplete chart data.' : '', data.events_truncated ? 'Zoom for more events.' : ''].filter(Boolean).join(' ');
+    uiText(note, allHidden ? uiMessage('report.noSessions') : uiMessage('common.value', {value:{items:
+      [data.partial ? uiMessage('report.chartPartial') : null, data.events_truncated ? uiMessage('report.chartZoom') : null].filter(Boolean), separator:' '}}));
     presentReportChannels(data);
     prefetchReportPublications(request,signal).catch(() => {});
   } catch(e) {
     if (request.generation === reportGeneration && request.serial === reportPlot.serial && e.name !== 'AbortError') {
       reportPlot.pending = null;
-      note.textContent = 'EDF chart unavailable: ' + e.message + '. Refresh to retry.';
+      uiText(note, uiMessage('report.chartFailed', {detail:uiError(e)}));
     }
   } finally {
     if (reportPlot.flight === request) reportPlot.flight = null;
@@ -2627,7 +2749,8 @@ function presentReportChannels(data) {
           head.append(legend);
         }
         const canvas = document.createElement('canvas'); canvas.height = 220;
-        canvas.setAttribute('aria-label', group.map(c => c.label).join(', ') + ' EDF plot'); canvas.tabIndex = 0;
+        uiText(canvas, uiMessage('report.channelPlot', {channels:group.map(c => c.label).join(', ')}), 'aria-label');
+        canvas.tabIndex = 0;
         card.append(head,canvas); plots.append(card);
         bindReportPlot(canvas);
         reportPlot.rows.push({channel:channel.id,channels:members,card,canvas,title,value});
@@ -2904,8 +3027,8 @@ function reportTimeTicks(view, width) {
     const text = reportTime(time);
     const label = step < 1000 ? new Date(time).toISOString().slice(11,23)
       : step < 60000 ? text.slice(11,19)
-      : step >= day ? text.slice(5,10)
-      : span >= day ? text.slice(5,16) : text.slice(11,16);
+      : step >= day ? uiDate(time,{month:'2-digit',day:'2-digit'})
+      : span >= day ? uiDate(time,{month:'2-digit',day:'2-digit'})+' '+text.slice(11,16) : text.slice(11,16);
     ticks.push({time,label});
   }
   return ticks;
@@ -3033,7 +3156,7 @@ function bindReportPlot(canvas) {
   const selection = document.createElement('div'); selection.className = 'report-plot-selection'; selection.hidden = true;
   overlay.append(selection,cursor); surface.append(overlay);
   canvas.reportOverlay = {cursor,selection};
-  canvas.title = 'Drag to zoom; double-click to reset';
+  uiText(canvas, uiMessage('report.gesture'), 'title');
   canvas.addEventListener('dblclick', resetReportViewport);
   canvas.addEventListener('keydown', e => {
     if (!reportPlot.view) return;
@@ -3144,7 +3267,10 @@ function renderField(s) {
   const div = document.createElement('div');
   div.className = 'row';
   const label = document.createElement('label');
-  label.textContent = s.label + (s.units ? ' (' + s.units + ')' : '');
+  if (s.source === 'custom') label.textContent = s.label + (s.units ? ' (' + s.units + ')' : '');
+  else uiText(label, uiMessage('common.value', {value:{items:[
+    uiMessage('clinical.label.' + s.cmd, {}, s.label), s.units ? '(' + s.units + ')' : null
+  ].filter(Boolean),separator:' '}}));
   div.appendChild(label);
   if (s.type === 'enum') {
     const select = document.createElement('select');
@@ -3153,7 +3279,8 @@ function renderField(s) {
     options.forEach((o, i) => {
       const option = document.createElement('option');
       option.value = typeof o === 'object' ? o.value : i;
-      option.textContent = typeof o === 'object' ? o.label : o;
+      if (s.source === 'custom') option.textContent = typeof o === 'object' ? o.label : o;
+      else uiText(option, uiMessage('clinical.option.' + s.cmd + '.' + option.value, {}, typeof o === 'object' ? o.label : o));
       select.appendChild(option);
     });
     select.value = String(s.value);
@@ -3181,17 +3308,17 @@ async function settingsRequest(options, endpoint = '/api/settings', query = '') 
   const timer = setTimeout(() => controller.abort(), 35000);
   try {
   let r = await api(endpoint + query, {...options, signal:controller.signal});
-  if (!r) throw new Error('Request cancelled');
+  if (!r) throw new Error('request_cancelled');
   let data = await r.json();
   const job = data.job;
   while (r.status === 202 && job && Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 250));
     r = await api(endpoint + '?job=' + job, {signal:controller.signal});
-    if (!r) throw new Error('Request cancelled');
+    if (!r) throw new Error('request_cancelled');
     data = await r.json();
   }
-  if (r.status === 202) throw new Error('Settings timeout; writes are not automatically retried');
-  if (!r.ok) throw new Error(data.error || 'Settings request failed');
+  if (r.status === 202) throw new Error('settings_timeout');
+  if (!r.ok) throw new Error(data.error || 'settings_request_failed');
   return data;
   } finally { clearTimeout(timer); }
 }
@@ -3205,7 +3332,7 @@ function clinicalDirty(except) {
 function loadSettings(force = false) {
   if (clinicalRead) return clinicalRead;
   if (clinicalSaving && !force) return Promise.resolve(false);
-  if (!force && clinicalDirty() && !confirm('Discard unsaved Clinical changes and refresh?'))
+  if (!force && clinicalDirty() && !confirm(t('clinical.unsavedRefresh')))
     return Promise.resolve(false);
   const generation = ++clinicalGeneration;
   const fields = Array.from(document.querySelectorAll('#p-clinical [data-cmd]'));
@@ -3218,7 +3345,7 @@ function loadSettings(force = false) {
     const data = await settingsRequest();
     if (generation !== clinicalGeneration) return false;
     if (fields.some((inp, i) => inp.value !== values[i])) {
-      showMsg(msgEl, 'New readings not applied: unsaved changes kept', 'ok');
+      showMsg(msgEl, uiMessage('clinical.keptDrafts'), 'ok');
       return false;
     }
     settings = data;
@@ -3253,7 +3380,7 @@ function loadSettings(force = false) {
           if (select) select.addEventListener('change', async e => {
             const previous = select.dataset.orig;
             if (clinicalSaving || (clinicalDirty('MOP') &&
-                !confirm('Changing therapy mode discards other unsaved Clinical changes. Continue?'))) {
+                !confirm(t('clinical.unsavedMode')))) {
               select.value = previous;
               return;
             }
@@ -3262,7 +3389,7 @@ function loadSettings(force = false) {
               if (saved.errors) throw new Error(saved.errors.join(', '));
             } catch (error) {
               select.value = previous;
-              showMsg(msgEl, error.message, 'err');
+              showMsg(msgEl, uiError(error), 'err');
             }
           });
           curMode = parseInt(s.value) || 0;
@@ -3270,7 +3397,7 @@ function loadSettings(force = false) {
       }
     });
     return true;
-  } catch(e) { showMsg(msgEl, 'Error: ' + e.message, 'err'); return false; }
+  } catch(e) { showMsg(msgEl, uiMessage('common.error', {detail:uiError(e)}), 'err'); return false; }
   finally { if (spinner && generation === clinicalGeneration) spinner.style.display = 'none'; }
   })();
   const pending = clinicalRead;
@@ -3289,7 +3416,7 @@ async function writeClinical(changes) {
     const result = await settingsRequest({method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(changes)});
     if (!result.errors && !await loadSettings(true))
-      throw new Error('Settings saved, but refresh failed; read back before another write');
+      throw new Error('settings_readback_failed');
     return result;
   } finally {
     clinicalSaving = false;
@@ -3332,15 +3459,15 @@ async function saveSettings() {
   if (invalid) {
     invalid.focus();
     invalid.reportValidity();
-    showMsg(msgEl, 'Invalid value: ' + invalid.dataset.cmd, 'err');
+    showMsg(msgEl, uiMessage('clinical.invalid', {key:invalid.dataset.cmd}), 'err');
     return;
   }
-  if (!Object.keys(changes).length) { showMsg(msgEl, 'No changes', 'ok'); return; }
+  if (!Object.keys(changes).length) { showMsg(msgEl, uiMessage('common.noChanges'), 'ok'); return; }
   try {
     const d = await writeClinical(changes);
-    if (d.errors && d.errors.length) showMsg(msgEl, 'Errors: ' + d.errors.join(', '), 'err');
-    else showMsg(msgEl, 'Saved ' + Object.keys(changes).length + ' settings', 'ok');
-  } catch(e) { showMsg(msgEl, 'Error: ' + e.message, 'err'); }
+    if (d.errors && d.errors.length) showMsg(msgEl, uiMessage('common.errors', {detail:{items:d.errors.map(uiError),separator:', '}}), 'err');
+    else showMsg(msgEl, uiMessage('clinical.saved', {count:Object.keys(changes).length}), 'ok');
+  } catch(e) { showMsg(msgEl, uiMessage('common.error', {detail:uiError(e)}), 'err'); }
 }
 
 // TZ helper
@@ -3368,7 +3495,7 @@ function getPosixTz(tz){var yr=new Date().getFullYear(),jan=new Date(yr,0,1),jun
 
 var TZ_ZONES=['Pacific/Honolulu','America/Anchorage','America/Los_Angeles','America/Denver','America/Chicago','America/New_York','America/Toronto','America/Sao_Paulo','America/Argentina/Buenos_Aires','America/Mexico_City','Europe/London','Europe/Paris','Europe/Berlin','Europe/Warsaw','Europe/Helsinki','Europe/Moscow','Europe/Istanbul','Africa/Cairo','Africa/Lagos','Africa/Nairobi','Asia/Dubai','Asia/Karachi','Asia/Kolkata','Asia/Kathmandu','Asia/Dhaka','Asia/Bangkok','Asia/Shanghai','Asia/Hong_Kong','Asia/Singapore','Asia/Tokyo','Asia/Seoul','Asia/Jerusalem','Australia/Sydney','Pacific/Auckland','Pacific/Fiji'].sort();
 
-function attachTzHelper(inp){var wrap=document.createElement('div');wrap.style.cssText='display:flex;gap:6px;align-items:center;flex-wrap:wrap';inp.parentNode.insertBefore(wrap,inp);wrap.appendChild(inp);var btn=document.createElement('button');btn.className='btn';btn.style.cssText='padding:4px 10px;font-size:12px';btn.textContent='detect';wrap.appendChild(btn);var sel=document.createElement('select');sel.style.cssText='font-size:12px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px';var o0=document.createElement('option');o0.value='';o0.textContent='preset...';sel.appendChild(o0);TZ_ZONES.forEach(function(tz){var o=document.createElement('option');o.value=tz;o.textContent=tz;sel.appendChild(o)});wrap.appendChild(sel);btn.onclick=function(){try{var detected=Intl.DateTimeFormat().resolvedOptions().timeZone;inp.value=getPosixTz(detected);inp.title=detected}catch(e){inp.value='detection failed'}};sel.onchange=function(){if(sel.value){try{inp.value=getPosixTz(sel.value);inp.title=sel.value}catch(e){inp.value='error'}}}}
+function attachTzHelper(inp){var wrap=document.createElement('div');wrap.style.cssText='display:flex;gap:6px;align-items:center;flex-wrap:wrap';inp.parentNode.insertBefore(wrap,inp);wrap.appendChild(inp);var btn=document.createElement('button');btn.className='btn';btn.style.cssText='padding:4px 10px;font-size:12px';uiText(btn,uiMessage('config.detect'));wrap.appendChild(btn);var sel=document.createElement('select');sel.style.cssText='font-size:12px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px';var o0=document.createElement('option');o0.value='';uiText(o0,uiMessage('config.preset'));sel.appendChild(o0);TZ_ZONES.forEach(function(tz){var o=document.createElement('option');o.value=tz;o.textContent=tz;sel.appendChild(o)});wrap.appendChild(sel);btn.onclick=function(){try{var detected=Intl.DateTimeFormat().resolvedOptions().timeZone;inp.value=getPosixTz(detected);inp.title=detected}catch(e){showMsg(null,uiMessage('config.timezoneFailed'),'err')}};sel.onchange=function(){if(sel.value){try{inp.value=getPosixTz(sel.value);inp.title=sel.value}catch(e){showMsg(null,uiMessage('config.timezoneFailed'),'err')}}}}
 
 // WiFi network management
 let wifiRead = null, wifiSerial = 0, wifiRevision = null;
@@ -3389,19 +3516,22 @@ function loadWifiNets() {
         var connected = (i === d.net_idx && d.state === 'connected');
         var rssi_str = net.rssi ? ' (' + net.rssi + ' dBm)' : '';
         var status = connected
-          ? ' <span class="badge badge-streaming" style="margin-left:8px">Connected' + rssi_str + '</span>'
+          ? ' <span class="badge badge-streaming wifi-connected" style="margin-left:8px"></span>'
           : (net.rssi ? ' <span style="color:var(--text-dim);margin-left:8px;font-size:12px">' + net.rssi + ' dBm</span>' : '');
         row.innerHTML = '<label><strong></strong>' + status +
-          '</label><button class="btn btn-danger" style="padding:4px 12px;font-size:12px">Remove</button>';
+          '</label><button class="btn btn-danger" style="padding:4px 12px;font-size:12px" data-i18n="common.remove"></button>';
         row.querySelector('strong').textContent = net.ssid;
+        if (connected) uiText(row.querySelector('.wifi-connected'), uiMessage('wifi.connectedSignal', {signal:rssi_str}));
+        translateUi(row);
         row.querySelector('button').onclick = () => wifiRemove(i);
         el.appendChild(row);
       });
     } else {
-      el.innerHTML = '<div style="color:var(--text-dim);font-size:13px;padding:8px 0">No networks configured</div>';
+      el.innerHTML = '<div style="color:var(--text-dim);font-size:13px;padding:8px 0" data-i18n="wifi.noNetworks"></div>';
+      translateUi(el);
     }
     var ws = document.getElementById('wifiState');
-    if (ws) ws.textContent = 'State: ' + d.state + (d.roam === '1' ? ' | Roaming enabled' : '');
+    uiText(ws, uiMessage(d.roam === '1' ? 'wifi.roamingState' : 'wifi.state', {state:uiMessage('wifi.state.' + d.state, {}, d.state)}));
   } catch(e) { console.error(e); }
   })().finally(() => {
     wifiRead = null;
@@ -3411,9 +3541,9 @@ function loadWifiNets() {
 }
 
 function wifiAddPrompt() {
-  var ssid = prompt('SSID:');
+  var ssid = prompt(t('wifi.ssidPrompt'));
   if (!ssid) return;
-  var pass = prompt('Password (empty for open):') || '';
+  var pass = prompt(t('wifi.passwordPrompt')) || '';
   wifiAction('add', ssid, pass);
 }
 
@@ -3426,33 +3556,18 @@ async function wifiAction(action, ssid, pass, idx, messageId = 'wifiMsg') {
     var r = await api('/api/wifi', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if (!r) return;
     var d = await r.json();
-    showMsg(document.getElementById(messageId), d.result, d.ok === 'true' ? 'ok' : 'err');
+    showMsg(document.getElementById(messageId), d.ok === 'true' ? uiMessage('wifi.action.' + action, {}, d.result) : uiError(d.result), d.ok === 'true' ? 'ok' : 'err');
     if (messageId === 'wifiMsg') loadWifiNets();
     return r.ok && d.ok === 'true';
-  } catch(e) { showMsg(document.getElementById('wifiMsg'), 'Error: ' + e.message, 'err'); }
+  } catch(e) { showMsg(document.getElementById('wifiMsg'), uiMessage('common.error', {detail:uiError(e)}), 'err'); }
 }
 
 function wifiRemove(idx) {
-  if (!confirm('Remove this network?')) return;
+  if (!confirm(t('wifi.removeConfirm'))) return;
   wifiAction('remove', null, undefined, idx);
 }
 
 const CFG_SECTIONS = /* CONFIG_SECTIONS */ [];
-const CFG_META = {
-    hostname:['DHCP and mDNS hostname, and AP SSID prefix'],wifi_mode:['Operating mode'],wifi_roam:['Enable hysteresis-based roaming'],wifi_country:['ISO 3166 country code (01 = worldwide)'],
-    http_port:['Web server port'],http_user:['Web UI username'],http_pass:['Web UI password'],
-    auth_whitelist:['Skip web login for trusted IPv4 addresses, CIDR networks or IP ranges, separated by commas. Empty = none; * = all IPv4 clients. Max 160 characters.'],
-    update_url:['Release manifest URL (empty disables automatic checks)'],
-    ntp_server:['NTP server (empty = DHCP or pool.ntp.org)'],tz:['POSIX timezone string'],
-    resmed_time:['Automatically synchronize the ResMed clock from NTP'],
-    udp_oxi_port:['UDP oximetry port (0=disabled)'],
-    oxi_enabled:['Enable BLE oximeter support'],oxi_auto_start:['Auto-start feeding on connect'],oxi_feed_therapy_only:['Only inject during active therapy'],oxi_interval_ms:['Injection interval (ms)'],oxi_lframe_continuous:['Send L-frames even without valid reading'],
-    smb_enabled:['Enable SMB synchronization'],smb_auto_after_therapy:['Sync backlog at startup and after therapy'],smb_endpoint:['//host/share/optional/path'],smb_user:['SMB username'],smb_password:['SMB password'],
-    sleephq_enabled:['Enable SleepHQ synchronization'],sleephq_auto_after_therapy:['Sync backlog at startup and after therapy'],sleephq_client_id:['SleepHQ API client ID'],sleephq_client_secret:['SleepHQ API client secret'],sleephq_team_id:['Optional team ID (resolved automatically when empty)'],sleephq_device_id:['Optional SleepHQ device ID'],
-    uart_cmd_timeout_ms:['Command response timeout (ms)'],tcp_port:['TCP command port'],
-    allow_transparent_during_therapy:['Allow raw UART passthrough during therapy'],
-    syslog_en:['Forward logs to a UDP syslog server'],syslog_host:['Syslog server IPv4 address'],syslog_port:['Syslog UDP port (1-65535, default 514)'],debug_port:['Debug log stream port (read-only)']
-  };
 
 let configStorageSupported = false;
 let configSection = 'network';
@@ -3470,13 +3585,12 @@ function renderConfigFields(root, d) {
     if (root.id === 'setup-access' && !['http_user','http_pass'].includes(k)) continue;
     const categoryInfo = CFG_SECTIONS[category(k)];
     if (!configStorageSupported && ['smb','sleephq'].includes(categoryInfo?.id)) continue;
-    const group = categoryInfo?.label || 'Other';
-    var meta = CFG_META[k] || [''];
+    const group = categoryInfo?.id || 'other';
     if (group !== lastGroup) {
       lastGroup = group;
       const heading = document.createElement('h4');
       heading.className = 'config-section-title';
-      heading.textContent = lastGroup;
+      uiText(heading, uiMessage('config.section.' + group, {}, categoryInfo?.label));
       root.appendChild(heading);
     }
     var row = document.createElement('div'); row.className = 'row';
@@ -3484,9 +3598,9 @@ function renderConfigFields(root, d) {
     var opts = categoryInfo?.options[k];
     var label = document.createElement('label');
     label.textContent = k;
-    if (meta[0]) {
+    if (UI_CATALOGS.en['config.help.' + k]) {
       var help = document.createElement('small');
-      help.textContent = meta[0];
+      uiText(help, uiMessage('config.help.' + k));
       label.appendChild(help);
     }
     row.appendChild(label);
@@ -3497,24 +3611,26 @@ function renderConfigFields(root, d) {
     control.dataset.orig = isPass ? '' : v;
     if (opts) {
       // Preserve an older/newer saved value until the user chooses a replacement.
-      if (!opts.some(option => option[0] === String(v))) opts = [...opts, [String(v), v + ' (unknown)']];
+      if (!opts.some(option => option[0] === String(v))) opts = [...opts, [String(v), null]];
       opts.forEach(function(o) {
         var option = document.createElement('option');
         option.value = o[0];
-        option.textContent = o[1];
+        uiText(option, o[1] == null ? uiMessage('config.unknown', {value:o[0]}) :
+          k === 'ui_language' && o[0] !== 'auto' ? o[1] :
+          uiMessage('config.option.' + k + '.' + o[0], {}, o[1]));
         control.appendChild(option);
       });
     } else {
       control.type = isPass ? 'password' : 'text';
       if (isPass) {
-        control.placeholder = '(unchanged)';
+        uiText(control, uiMessage('config.unchanged'), 'placeholder');
         control.dataset.pass = '1';
       }
     }
     control.value = isPass ? '' : v;
     row.appendChild(control);
     root.appendChild(row);
-    if (isPass) row.querySelector('input').addEventListener('input', function() { this.setAttribute('data-dirty', '1'); this.placeholder = '(empty = remove)'; });
+    if (isPass) row.querySelector('input').addEventListener('input', function() { this.setAttribute('data-dirty', '1'); uiText(this, uiMessage('config.emptyRemove'), 'placeholder'); });
     if (k === 'tz') attachTzHelper(row.querySelector('input'));
   }
 }
@@ -3523,7 +3639,7 @@ function confirmAccessChange(root, changes) {
   if (!Object.hasOwn(changes, 'http_user') && !Object.hasOwn(changes, 'http_pass')) return true;
   const user = root.querySelector('[data-key="http_user"]');
   if (!user || user.value || changes.http_pass) return true;
-  return confirm('An empty username and password disable Web UI authentication. Save these access settings?');
+  return confirm(t('config.confirmAccess'));
 }
 
 function collectConfigChanges(root) {
@@ -3547,7 +3663,7 @@ async function loadConfigFields(root, section, messageId) {
     const r = await api('/api/config' + (section ? '?section=' + encodeURIComponent(section) : ''));
     if (!r) { root.dataset.stale = '1'; return; }
     const d = await r.json();
-    if (!r.ok) throw new Error(d.error || 'Config read failed');
+    if (!r.ok) throw new Error(d.error || 'config_read_failed');
     const drafts = collectConfigChanges(root);
     renderConfigFields(root, d);
     root.querySelectorAll('[data-key]').forEach(input => {
@@ -3555,7 +3671,7 @@ async function loadConfigFields(root, section, messageId) {
       input.value = drafts[input.dataset.key];
       if (input.dataset.pass) {
         input.setAttribute('data-dirty', '1');
-        input.placeholder = '(empty = remove)';
+        uiText(input, uiMessage('config.emptyRemove'), 'placeholder');
       }
     });
     root.dataset.loaded = '1';
@@ -3563,7 +3679,7 @@ async function loadConfigFields(root, section, messageId) {
     return true;
   } catch(e) {
     root.dataset.stale = '1';
-    showMsg(document.getElementById(messageId), 'Error: ' + e.message, 'err');
+    showMsg(document.getElementById(messageId), uiMessage('common.error', {detail:uiError(e)}), 'err');
   } finally {
     delete root.dataset.loading;
   }
@@ -3576,7 +3692,7 @@ async function loadConfig(selected = configSection) {
     for (const section of CFG_SECTIONS) {
       if (!configStorageSupported && ['smb','sleephq'].includes(section.id)) continue;
       const button = document.createElement('button');
-      button.textContent = section.label;
+      uiText(button, uiMessage('config.section.' + section.id, {}, section.label));
       button.dataset.section = section.id;
       button.onclick = () => loadConfig(section.id);
       categories.appendChild(button);
@@ -3600,12 +3716,12 @@ async function loadConfig(selected = configSection) {
       message.className = 'msg';
       const save = document.createElement('button');
       save.className = 'btn btn-accent';
-      save.textContent = 'Save & Persist';
+      uiText(save, uiMessage('config.save'));
       save.onclick = () => saveConfig(root.id, message.id);
       actions.appendChild(save);
       const refresh = document.createElement('button');
       refresh.className = 'btn';
-      refresh.textContent = 'Refresh';
+      uiText(refresh, uiMessage('common.refresh'));
       refresh.onclick = () => loadConfigFields(root, section.id, message.id);
       actions.appendChild(refresh);
       panel.appendChild(actions);
@@ -3632,16 +3748,16 @@ async function saveConfig(rootId, messageId) {
   const changes = collectConfigChanges(root);
   const fields = root.querySelectorAll('[data-key]');
   const msgEl = document.getElementById(messageId);
-  if (!Object.keys(changes).length) { showMsg(msgEl, 'No changes', 'ok'); return true; }
+  if (!Object.keys(changes).length) { showMsg(msgEl, uiMessage('common.noChanges'), 'ok'); return true; }
   if (!confirmAccessChange(root, changes)) return false;
   root.dataset.saving = '1';
   try {
     const r = await api('/api/config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
     if (!r) return;
     const d = await r.json();
-    if (!r.ok || d.ok !== true) throw new Error(d.error || 'Config save failed');
+    if (!r.ok || d.ok !== true) throw new Error(d.error || 'config_save_failed');
     if (d.saved !== Object.keys(changes).length)
-      throw new Error('Only ' + d.saved + ' settings saved; reload Config before retrying');
+      throw uiFailure('config.partialSave', {count:d.saved});
     fields.forEach(inp => {
       const key = inp.dataset.key;
       if (!Object.hasOwn(changes, key)) return;
@@ -3649,7 +3765,7 @@ async function saveConfig(rootId, messageId) {
         if (inp.value === changes[key]) {
           inp.value = '';
           inp.removeAttribute('data-dirty');
-          inp.placeholder = '(unchanged)';
+          uiText(inp, uiMessage('config.unchanged'), 'placeholder');
         }
       } else inp.dataset.orig = changes[key];
     });
@@ -3659,14 +3775,16 @@ async function saveConfig(rootId, messageId) {
       if (!section || section.keys.some(key => Object.hasOwn(changes, key)))
         other.dataset.stale = '1';
     });
-    showMsg(msgEl, 'Config saved', 'ok');
+    showMsg(msgEl, uiMessage('config.saved'), 'ok');
     return true;
-  } catch(e) { showMsg(msgEl, 'Error: ' + e.message, 'err'); }
+  } catch(e) { showMsg(msgEl, uiMessage('common.error', {detail:uiError(e)}), 'err'); }
   finally { delete root.dataset.saving; }
 }
 
 
 const SYNC_ENDPOINTS = {smb: 'SMB', sleephq: 'SleepHQ'};
+const SYNC_STORAGE_DATE_OPTIONS = {dateStyle:'short', timeStyle:'medium',
+  timeZone:Intl.DateTimeFormat().resolvedOptions().timeZone};
 let exportsSnapshot = null;
 let exportsFresh = false;
 const syncRequests = new Set();
@@ -3679,21 +3797,22 @@ function createSyncCards() {
     card.className = 'card';
     card.id = id + 'SyncCard';
     card.innerHTML = `<div class="card-header"><span class="label">${name}</span><span class="badge" data-sync="state">--</span></div>
-      <div class="time-row"><span class="label">Endpoint</span><span class="value sync-value" data-sync="endpoint">&mdash;</span></div>
-      <div class="time-row"><span class="label">Last successful sync</span><span class="value" data-sync="last">&mdash;</span></div>
-      <div class="time-row"><span class="label">Files</span><span class="value sync-value" data-sync="files">&mdash;</span></div>
-      <div class="time-row"><span class="label">Connection check</span><span class="value sync-value" data-sync="check-result">&mdash;</span></div>
+      <div class="time-row"><span class="label" data-i18n="sync.endpoint"></span><span class="value sync-value" data-sync="endpoint">&mdash;</span></div>
+      <div class="time-row"><span class="label" data-i18n="sync.lastSuccess"></span><span class="value" data-sync="last">&mdash;</span></div>
+      <div class="time-row"><span class="label" data-i18n="sync.files"></span><span class="value sync-value" data-sync="files">&mdash;</span></div>
+      <div class="time-row"><span class="label" data-i18n="sync.connectionCheck"></span><span class="value sync-value" data-sync="check-result">&mdash;</span></div>
       <div class="sync-note" data-sync="import"></div>
       <div class="sync-note" data-sync="availability"></div>
       <div class="sync-error" data-sync="error"></div>
-      <div class="btn-row"><button class="btn btn-accent" data-sync="start">Sync now</button><button class="btn" data-sync="check">${id === 'smb' ? 'Check share' : 'Check account'}</button><button class="btn" data-sync="edit">Edit</button></div>
+      <div class="btn-row"><button class="btn btn-accent" data-sync="start" data-i18n="sync.start"></button><button class="btn" data-sync="check" data-i18n="${id === 'smb' ? 'sync.checkShare' : 'sync.checkAccount'}"></button><button class="btn" data-sync="edit" data-i18n="common.edit"></button></div>
       <div class="msg" id="${id}SyncMsg"></div>
       <div id="${id}ConfigPanel" hidden>
         <div id="${id}ConfigFields" data-config-form="${id}"></div>
-        <div class="sync-note">Configuration changes apply to the next sync.</div>
-        <div class="btn-row"><button class="btn btn-accent" data-sync="save">Save</button><button class="btn" data-sync="cancel">Cancel</button></div>
+        <div class="sync-note" data-i18n="sync.configNextRun"></div>
+        <div class="btn-row"><button class="btn btn-accent" data-sync="save" data-i18n="common.save"></button><button class="btn" data-sync="cancel" data-i18n="common.cancel"></button></div>
         <div class="msg" id="${id}ConfigMsg"></div>
       </div>`;
+    translateUi(card);
     card.querySelector('[data-sync="start"]').onclick = () => startSync(id);
     card.querySelector('[data-sync="check"]').onclick = () => startSync(id, true);
     card.querySelector('[data-sync="edit"]').onclick = () => editSyncEndpoint(id);
@@ -3713,38 +3832,45 @@ function renderExports(changed = null) {
   if (!supported) return;
   if (!document.getElementById('p-sync').classList.contains('active')) return;
   createSyncCards();
-  const blockedText = {sd_unavailable:'SD card unavailable', not_configured:'Configure this endpoint first',
-    not_idle:'Waiting for AirSense standby', offline:'Waiting for WiFi', unavailable:'Sync unavailable'};
+  const blockedText = {sd_unavailable:uiMessage('error.sd_unavailable'),
+    not_configured:uiMessage('sync.configureFirst'), not_idle:uiMessage('sync.waitingStandby'),
+    offline:uiMessage('sync.waitingWifi'), unavailable:uiMessage('sync.unavailable')};
   for (const id of Object.keys(SYNC_ENDPOINTS)) {
     if (changed && !changed[id]) continue;
     const state = data[id];
     const card = document.getElementById(id + 'SyncCard');
-    const text = (key, value) => { card.querySelector('[data-sync="' + key + '"]').textContent = value; };
-    text('state', state.state);
-    text('endpoint', id === 'smb' ? state.endpoint || 'Not configured' :
-      'SleepHQ' + (state.team_id ? ' / Team ' + state.team_id : '') + (state.device_id ? ' / Device ' + state.device_id : ''));
-    text('last', state.last_sync_epoch ? new Date(state.last_sync_epoch * 1000).toLocaleString() : '\u2014');
+    const text = (key, value) => { uiText(card.querySelector('[data-sync="' + key + '"]'), value); };
+    text('state', uiMessage('sync.state.' + state.state, {}, state.state));
+    text('endpoint', id === 'smb' ? state.endpoint || uiMessage('sync.notConfigured') :
+      uiMessage('common.value', {value:{items:['SleepHQ',
+        ...(state.team_id ? [uiMessage('sync.team', {id:String(state.team_id)})] : []),
+        ...(state.device_id ? [uiMessage('sync.device', {id:String(state.device_id)})] : [])], separator:' / '}}));
+    text('last', state.last_sync_epoch ? uiMessage('common.value', {
+      value:{date:state.last_sync_epoch * 1000, options:SYNC_STORAGE_DATE_OPTIONS}}) : '\u2014');
     const files = [];
     if (state.has_files) {
-      files.push(state.files_uploaded + ' uploaded');
-      if (state.files_attached) files.push(state.files_attached + ' attached');
-      if (state.files_skipped) files.push(state.files_skipped + ' skipped');
+      files.push(uiMessage('sync.uploaded', {count:state.files_uploaded}));
+      if (state.files_attached) files.push(uiMessage('sync.attached', {count:state.files_attached}));
+      if (state.files_skipped) files.push(uiMessage('sync.skipped', {count:state.files_skipped}));
     }
     if (['ready', 'confirming'].includes(state.backlog_state)) {
-      files.push(state.backlog_files + ' pending');
-      if (state.backlog_waiting) files.push(state.backlog_waiting + ' sessions not ready');
-      if (state.backlog_state === 'confirming') files.push('awaiting confirmation');
+      files.push(uiMessage('sync.pendingFiles', {count:state.backlog_files}));
+      if (state.backlog_waiting) files.push(uiMessage('sync.sessionsNotReady', {count:state.backlog_waiting}));
+      if (state.backlog_state === 'confirming') files.push(uiMessage('sync.awaitingConfirmation'));
     } else {
-      files.push('pending unknown');
+      files.push(uiMessage('sync.pendingUnknown'));
     }
-    text('files', state.backlog_state === 'unconfigured' ? '\u2014' : files.join(' \u00b7 '));
-    text('import', state.import_id ? 'Import ' + state.import_id + (state.import_status ? ': ' + state.import_status : '') : '');
-    text('error', [state.error, state.backlog_state === 'error' ? state.backlog_error : '']
-      .filter((error, index, errors) => error && errors.indexOf(error) === index).join('; '));
-    text('check-result', state.check_state === 'passed' ? 'Passed' :
-      state.check_state === 'failed' ? state.check_error || 'Failed' :
-      ['pending','working'].includes(state.check_state) ? 'Checking...' : '\u2014');
-    const unavailable = !exportsFresh ? 'Status unavailable; reconnecting' :
+    text('files', state.backlog_state === 'unconfigured' ? '\u2014' :
+      uiMessage('common.value', {value:{items:files, separator:' \u00b7 '}}));
+    text('import', state.import_id ? uiMessage(state.import_status ? 'sync.importStatus' : 'sync.import', {
+      id:String(state.import_id), status:uiMessage('sync.importState.' + state.import_status, {}, state.import_status)}) : '');
+    text('error', uiMessage('common.value', {value:{items:
+      [state.error, state.backlog_state === 'error' ? state.backlog_error : '']
+        .filter((error, index, errors) => error && errors.indexOf(error) === index).map(uiError), separator:'; '}}));
+    text('check-result', state.check_state === 'passed' ? uiMessage('sync.checkPassed') :
+      state.check_state === 'failed' ? uiError(state.check_error) || uiMessage('sync.checkFailed') :
+      ['pending','working'].includes(state.check_state) ? uiMessage('sync.checking') : '\u2014');
+    const unavailable = !exportsFresh ? uiMessage('sync.reconnecting') :
       blockedText[state.sync_blocked] || '';
     text('availability', unavailable);
     card.querySelector('[data-sync="start"]').disabled = !exportsFresh || !!state.sync_blocked || syncRequests.size > 0;
@@ -3756,8 +3882,9 @@ let storagePath = '/', storageOffset = 0, storageMore = false, storageLoading = 
 let storageUsbRequest = false, storageListAbort = null, storageViewState = '';
 let storageReloadPending = false;
 const storageSelection = new Set();
-const STORAGE_STATES = {mounted:'Mounted', unavailable:'Card unavailable', unsupported:'Not supported',
-  usb_starting:'Preparing USB', usb:'Shared via USB', usb_stopping:'Returning to AirBridge'};
+const STORAGE_STATES = {mounted:'storage.state.mounted', unavailable:'storage.state.unavailable',
+  unsupported:'storage.state.unsupported', usb_starting:'storage.state.usbStarting',
+  usb:'storage.state.usb', usb_stopping:'storage.state.usbStopping'};
 
 function renderDashboardStorage(data) {
   const summary = document.getElementById('dashStorageSummary');
@@ -3769,42 +3896,43 @@ function renderDashboardStorage(data) {
     Number.isFinite(used) && used >= 0;
   meter.hidden = !mounted;
   if (!mounted) {
-    summary.textContent = STORAGE_STATES[data.sd] || 'Not supported';
+    uiText(summary, uiMessage(STORAGE_STATES[data.sd] || 'storage.state.unsupported'));
     fill.style.width = '0%';
     meter.removeAttribute('aria-valuenow');
     return;
   }
-  const format = mb => mb >= 1024 ? (mb / 1024).toFixed(1) + ' GiB' : Math.round(mb) + ' MiB';
+  const format = mb => uiMessage('common.unit', {value:{number:mb >= 1024 ? mb / 1024 : Math.round(mb),
+    max:mb >= 1024 ? 1 : 0, min:mb >= 1024 ? 1 : 0}, unit:mb >= 1024 ? 'GiB' : 'MiB'});
   const percent = Math.min(100, used / total * 100);
-  summary.textContent = format(used) + ' used / ' + format(Math.max(0, total - used)) + ' free';
+  uiText(summary, uiMessage('storage.usedFree', {used:format(used), free:format(Math.max(0, total - used))}));
   fill.style.width = percent.toFixed(1) + '%';
   meter.setAttribute('aria-valuenow', percent.toFixed(1));
-  meter.title = percent.toFixed(1) + '% used of ' + format(total);
+  uiText(meter, uiMessage('storage.percentUsed', {percent:{number:percent,max:1,min:1}, total:format(total)}), 'title');
 }
 
 function renderStorageStatus(data) {
   if (data.sd === undefined) return;
   const supported = data.sd !== 'unsupported';
   document.querySelectorAll('[data-tab="storage"]').forEach(link => { link.hidden = !supported; });
-  document.getElementById('storageState').textContent = STORAGE_STATES[data.sd] || 'Card unavailable';
-  document.getElementById('storageUsage').textContent = data.sd === 'mounted' ?
-    (data.sd_used_mb || 0) + ' MiB used / ' + (data.sd_total_mb || 0) + ' MiB total' : '';
+  uiText(document.getElementById('storageState'), uiMessage(STORAGE_STATES[data.sd] || 'storage.state.unavailable'));
+  uiText(document.getElementById('storageUsage'), data.sd === 'mounted' ?
+    uiMessage('storage.usedTotal', {used:data.sd_used_mb || 0, total:data.sd_total_mb || 0}) : '');
   const usb = document.getElementById('storageUsb');
   usb.hidden = !data.sd_usb_supported;
-  usb.textContent = data.sd === 'mounted' ? 'Share via USB' :
-    data.sd === 'usb_stopping' && data.sd_error ? 'Retry SD return' : 'Return to AirBridge';
+  uiText(usb, uiMessage(data.sd === 'mounted' ? 'storage.usbShare' :
+    data.sd === 'usb_stopping' && data.sd_error ? 'storage.usbRetry' : 'storage.usbReturn'));
   if (data.sd !== 'mounted') {
     if (storageListAbort) storageListAbort.abort();
     storageSelection.clear();
     document.getElementById('storageEntries').replaceChildren();
-    document.getElementById('storagePage').textContent = '';
-    document.getElementById('storageMessage').textContent = data.sd_error ||
-      ({usb_starting:'Closing local files...', usb:'Recording paused while the card is shared via USB.',
-        usb_stopping:'Remounting SD card...'}[data.sd] || '');
+    uiText(document.getElementById('storagePage'), '');
+    uiText(document.getElementById('storageMessage'), uiError(data.sd_error) ||
+      ({usb_starting:uiMessage('storage.closingFiles'), usb:uiMessage('storage.recordingPaused'),
+        usb_stopping:uiMessage('storage.remounting')}[data.sd] || ''));
   } else {
     if (storageViewState && storageViewState !== 'mounted') storageReloadPending = true;
     if (data.sd_error || storageReloadPending)
-      document.getElementById('storageMessage').textContent = data.sd_error || '';
+      uiText(document.getElementById('storageMessage'), uiError(data.sd_error) || '');
   }
   storageViewState = data.sd;
   storageControls();
@@ -3834,17 +3962,17 @@ function storageControls() {
 async function storageUsb() {
   if (storageUsbRequest) return;
   const enabled = lastStatus.sd === 'mounted';
-  if (enabled && !confirm('Share the SD card via USB? Recording and other SD operations will pause until the card is returned to AirBridge.')) return;
-  if (!enabled && lastStatus.sd === 'usb' && !confirm('Return the SD card to AirBridge? USB access will stop. Finish copying and safely eject the drive first to avoid losing unsaved changes.')) return;
+  if (enabled && !confirm(t('storage.confirmUsbShare'))) return;
+  if (!enabled && lastStatus.sd === 'usb' && !confirm(t('storage.confirmUsbReturn'))) return;
   storageUsbRequest = true;
   storageControls();
   try {
     const response = await api('/api/storage/usb', {method:'POST', body:new URLSearchParams({enabled:enabled ? '1' : '0'})});
     if (!response) return;
     const data = await response.json();
-    if (!response.ok) throw new Error(data.error || 'USB handoff failed');
+    if (!response.ok) throw data.error ? new Error(data.error) : uiFailure('storage.usbFailed');
   } catch (error) {
-    document.getElementById('storageMessage').textContent = error.message;
+    uiText(document.getElementById('storageMessage'), uiError(error));
   } finally {
     storageUsbRequest = false;
     storageControls();
@@ -3862,13 +3990,13 @@ async function loadStorage(path = storagePath, offset = storageOffset) {
   storageLoading = true;
   storageControls();
   const message = document.getElementById('storageMessage');
-  message.textContent = 'Reading directory...';
+  uiText(message, uiMessage('storage.readingDirectory'));
   try {
     const response = await api('/api/storage/list?path=' + encodeURIComponent(path) + '&offset=' + offset, {signal:controller.signal});
     if (!response) return;
     const data = await response.json();
     if (controller.signal.aborted) return;
-    if (!response.ok || !data.ok) throw new Error(data.error || 'Directory unavailable');
+    if (!response.ok || !data.ok) throw data.error ? new Error(data.error) : uiFailure('storage.directoryUnavailable');
     storagePath = data.path;
     storageOffset = offset;
     storageMore = data.more;
@@ -3879,7 +4007,7 @@ async function loadStorage(path = storagePath, offset = storageOffset) {
     for (const entry of data.entries) {
       const row = document.createElement('div'); row.className = 'storage-row';
       const check = document.createElement('input'); check.type = 'checkbox';
-      check.setAttribute('aria-label', 'Select ' + entry.name);
+      uiText(check, uiMessage('storage.selectEntry', {name:entry.name}), 'aria-label');
       check.onchange = () => { if (check.checked) storageSelection.add(entry.name); else storageSelection.delete(entry.name); storageControls(); };
       const content = document.createElement('div');
       const link = document.createElement('a'); link.textContent = entry.name + (entry.directory ? '/' : '');
@@ -3888,26 +4016,29 @@ async function loadStorage(path = storagePath, offset = storageOffset) {
       else link.download = entry.name;
       const detail = document.createElement('small');
       const unit = entry.size >= 1048576 ? 2 : entry.size >= 1024 ? 1 : 0;
-      detail.textContent = (entry.directory ? 'Folder' :
-        (entry.size / 1024 ** unit).toFixed(unit ? 1 : 0) + ' ' + ['B', 'KiB', 'MiB'][unit]) +
-        (entry.modified ? ' | ' + new Date(entry.modified * 1000).toLocaleString() : '');
+      uiText(detail, uiMessage('common.value', {value:{items:[entry.directory ? uiMessage('storage.directory') :
+        uiMessage('common.unit', {value:{number:entry.size / 1024 ** unit, max:unit ? 1 : 0, min:unit ? 1 : 0},
+          unit:['B', 'KiB', 'MiB'][unit]}),
+        ...(entry.modified ? [{date:entry.modified * 1000, options:SYNC_STORAGE_DATE_OPTIONS}] : [])], separator:' | '}}));
       content.append(link, detail);
       const action = document.createElement('button'); action.className = 'btn btn-accent storage-download';
       action.textContent = '\u2193';
-      action.title = (entry.directory ? 'Download folder ZIP: ' : 'Download: ') + entry.name;
-      action.setAttribute('aria-label', action.title);
+      const downloadLabel = uiMessage(entry.directory ? 'storage.downloadFolder' : 'storage.downloadFile', {name:entry.name});
+      uiText(action, downloadLabel, 'title');
+      uiText(action, downloadLabel, 'aria-label');
       action.onclick = () => storageDownload(entry.directory ? 'archive' : 'download', entry.name);
       const rename = document.createElement('button'); rename.className = 'btn';
-      rename.textContent = 'Rename'; rename.setAttribute('aria-label', 'Rename ' + entry.name);
+      uiText(rename, uiMessage('storage.rename'));
+      uiText(rename, uiMessage('storage.renameEntry', {name:entry.name}), 'aria-label');
       rename.onclick = () => storageRename(entry.name);
       const actions = document.createElement('div'); actions.className = 'storage-entry-actions';
       actions.append(rename, action);
       row.append(check, content, actions); entries.append(row);
     }
-    document.getElementById('storagePage').textContent = 'Page ' + (offset / 32 + 1);
-    message.textContent = data.entries.length ? '' : 'This directory is empty.';
+    uiText(document.getElementById('storagePage'), uiMessage('storage.page', {number:offset / 32 + 1}));
+    uiText(message, data.entries.length ? '' : uiMessage('storage.emptyDirectory'));
   } catch (error) {
-    if (!controller.signal.aborted) message.textContent = error.message;
+    if (!controller.signal.aborted) uiText(message, uiError(error));
   } finally {
     storageListAbort = null;
     storageLoading = false;
@@ -3928,7 +4059,7 @@ function storageDownload(kind, name = null, selected = false) {
     if (!storageSelection.size) return;
     const names = [...storageSelection];
     if (new TextEncoder().encode(names.join('\n')).length >= 2048) {
-      document.getElementById('storageMessage').textContent = 'Select fewer entries or download the whole folder.';
+      uiText(document.getElementById('storageMessage'), uiMessage('storage.selectFewer'));
       return;
     }
     for (const item of names) url += '&item=' + encodeURIComponent(item);
@@ -3943,34 +4074,35 @@ async function storageMutate(kind, body) {
   storageLoading = true;
   storageControls();
   const message = document.getElementById('storageMessage');
-  message.textContent = kind === 'delete' ? 'Deleting...' : 'Renaming...';
+  uiText(message, uiMessage(kind === 'delete' ? 'storage.deleting' : 'storage.renaming'));
   let result;
   try {
     const response = await api('/api/storage/' + kind, {method:'POST', body});
     if (!response) return;
     const data = await response.json();
     if (!response.ok || !data.ok) {
-      throw new Error((data.error || 'Operation failed') +
-        (data.changed ? ' (' + data.changed + ' entries changed)' : ''));
+      const detail = data.error ? uiError(data.error) : uiMessage('storage.operationFailed');
+      throw uiFailure('common.value', {value:data.changed ?
+        uiMessage('storage.entriesChanged', {detail, count:data.changed}) : detail});
     }
-    result = kind === 'delete' ? 'Deleted.' : 'Renamed.';
+    result = uiMessage(kind === 'delete' ? 'storage.deleted' : 'storage.renamed');
   } catch (error) {
-    result = error.message;
+    result = uiError(error);
   } finally {
     storageLoading = false;
     storageControls();
   }
   // A failed or interrupted recursive delete may already have removed files.
   await loadStorage(storagePath, 0);
-  if (lastStatus.sd === 'mounted') message.textContent = result;
+  if (lastStatus.sd === 'mounted') uiText(message, result);
 }
 
 async function storageRename(name) {
   if (storageLoading) return;
-  const replacement = prompt('New name for ' + name + ':', name);
+  const replacement = prompt(t('storage.newName', {name}), name);
   if (replacement === null || replacement === name) return;
   if (!replacement || /[\/\\\r\n]/.test(replacement) || replacement === '.' || replacement === '..') {
-    document.getElementById('storageMessage').textContent = 'Enter a name, not a path.';
+    uiText(document.getElementById('storageMessage'), uiMessage('storage.nameNotPath'));
     return;
   }
   await storageMutate('rename', new URLSearchParams({path:storageChild(name), name:replacement}));
@@ -3979,7 +4111,7 @@ async function storageRename(name) {
 async function storageDelete() {
   if (storageLoading || !storageSelection.size) return;
   const names = [...storageSelection];
-  if (!confirm('Permanently delete these entries and all folder contents?\n\n' + names.join('\n'))) return;
+  if (!confirm(t('storage.confirmDelete', {names:{items:names, separator:'\n'}}))) return;
   const body = new URLSearchParams({path:storagePath});
   for (const name of names) body.append('item', name);
   await storageMutate('delete', body);
@@ -4005,10 +4137,10 @@ async function startSync(id, check = false) {
     const response = await api('/api/export/' + id + (check ? '?action=check' : ''), {method: 'POST'});
     if (!response) return;
     const data = await response.json();
-    if (!response.ok || !data.ok) throw new Error(data.error || 'Sync request failed');
-    showMsg(message, check ? 'Check queued' : 'Sync queued', 'ok');
+    if (!response.ok || !data.ok) throw data.error ? new Error(data.error) : uiFailure('sync.requestFailed');
+    showMsg(message, uiMessage(check ? 'sync.checkQueued' : 'sync.queued'), 'ok');
   } catch(e) {
-    showMsg(message, e.message, 'err');
+    showMsg(message, uiError(e), 'err');
   } finally {
     syncRequests.delete(id);
     renderExports();
@@ -4031,14 +4163,13 @@ function cancelSyncEndpoint(id) {
 
 
 function showMsg(el, text, type, timeout) {
-  text = text == null ? '' : String(text);
-  const empty = !text.trim();
+  const empty = !uiValue(text).trim();
   // Inline msg element
   if (el) {
     if (el._msgTimer) clearTimeout(el._msgTimer);
     el._msgTimer = null;
     el.style.removeProperty('display');
-    el.textContent = empty ? '' : text;
+    uiText(el, empty ? '' : text);
     el.className = empty ? 'msg' : 'msg ' + type;
     if (empty) return;
     if (timeout !== 0) el._msgTimer = setTimeout(() => { el.className = 'msg'; }, timeout || 5000);
@@ -4050,7 +4181,7 @@ function showMsg(el, text, type, timeout) {
   if (tc) {
     var toast = document.createElement('div');
     toast.className = 'toast ' + type;
-    toast.textContent = text;
+    uiText(toast, text);
     tc.appendChild(toast);
     var dur = timeout || 5000;
     if (dur > 0) setTimeout(function() { toast.style.opacity = '0'; toast.style.transition = 'opacity 0.3s'; setTimeout(function() { toast.remove(); }, 300); }, dur);
@@ -4066,7 +4197,7 @@ function updateBleConnections() {
   document.querySelectorAll('#bleDevices [data-addr], #bleBonds [data-addr]').forEach(row => {
     const active = state === 'STREAMING' && row.dataset.addr === address;
     const button = row.querySelector('.ble-connect');
-    button.textContent = active ? 'Connected' : 'Connect';
+    uiText(button, uiMessage(active ? 'common.connected' : 'common.connect'));
     button.disabled = active || ['DISABLED', 'CONNECTING', 'BONDING'].includes(state);
   });
 }
@@ -4077,7 +4208,7 @@ function renderBleDevices(id, devices, known) {
   if (!devices.length) {
     const empty = document.createElement('div');
     empty.className = 'ble-empty';
-    empty.textContent = known ? 'No known devices' : 'No devices found. Click Scan to search.';
+    uiText(empty, uiMessage(known ? 'ble.noKnown' : 'ble.noDevices'));
     list.appendChild(empty);
     return;
   }
@@ -4096,7 +4227,7 @@ function renderBleDevices(id, devices, known) {
     if (known) {
       const auto = document.createElement('button');
       auto.className = 'btn ble-auto' + (device.autoconnect ? ' btn-accent' : '');
-      auto.textContent = device.autoconnect ? 'Auto-connect On' : 'Auto-connect Off';
+      uiText(auto, uiMessage(device.autoconnect ? 'ble.autoOn' : 'ble.autoOff'));
       auto.setAttribute('aria-pressed', String(device.autoconnect));
       auto.onclick = async () => {
         auto.disabled = true;
@@ -4107,15 +4238,15 @@ function renderBleDevices(id, devices, known) {
     }
     const connect = document.createElement('button');
     connect.className = 'btn btn-accent ble-connect';
-    connect.textContent = 'Connect';
+    uiText(connect, uiMessage('common.connect'));
     connect.onclick = () => bleConnect(device.addr, message);
     actions.appendChild(connect);
     if (known) {
       const forget = document.createElement('button');
       forget.className = 'btn btn-danger';
-      forget.textContent = 'Forget';
+      uiText(forget, uiMessage('ble.forget'));
       forget.onclick = () => {
-        if (confirm('Forget ' + name + '?')) bleAction('delete_bond', device.addr, {}, message);
+        if (confirm(t('ble.forgetConfirm', {name}))) bleAction('delete_bond', device.addr, {}, message);
       };
       actions.appendChild(forget);
     }
@@ -4135,7 +4266,7 @@ function loadBle() {
   bleRead = (async () => {
   try {
     const r = await api('/api/ble', undefined, 5000); if (!r) return null;
-    if (!r.ok) throw new Error('Oximetry status read failed');
+    if (!r.ok) throw new Error('oxi_status_failed');
     const d = await r.json();
     if (revision !== bleRevision || configRevision !== lastStatus.config_revision) return;
     Object.assign(d, {state:lastStatus.oxi, feeding:lastStatus.feeding,
@@ -4145,17 +4276,18 @@ function loadBle() {
     for (const [k,v] of Object.entries(fields)) {
       const stat = document.createElement('div'); stat.className = 'stat';
       stat.innerHTML = '<span class="k"></span> <span class="v"></span>';
-      stat.querySelector('.k').textContent = k + ':';
+      uiText(stat.querySelector('.k'), uiMessage('ble.field.' + k, {}, k));
       const value = stat.querySelector('.v');
       value.dataset.field = k;
-      value.textContent = v;
+      uiText(value, k === 'state' ? uiMessage('state.' + v, {}, v)
+        : ['feeding','auto_start'].includes(k) ? uiMessage('common.' + v, {}, v) : v);
       g.appendChild(stat);
     }
     const fb = document.getElementById('btnFeed');
-    if (d.feeding === 'yes') { fb.textContent = 'Stop Feed'; fb.onclick = () => bleAction('stop_feed'); }
-    else { fb.textContent = 'Start Feed'; fb.onclick = () => bleAction('start_feed'); }
+    if (d.feeding === 'yes') { uiText(fb, uiMessage('ble.stopFeed')); fb.onclick = () => bleAction('stop_feed'); }
+    else { uiText(fb, uiMessage('ble.startFeed')); fb.onclick = () => bleAction('start_feed'); }
     var ot = document.getElementById('btnOxiToggle');
-    if (ot) ot.textContent = d.state === 'DISABLED' ? 'Enable' : 'Disable';
+    if (ot) uiText(ot, uiMessage(d.state === 'DISABLED' ? 'common.enable' : 'common.disable'));
     const sp = document.getElementById('bleScanSpinner');
     sp.style.display = d.state === 'SCANNING' ? 'inline-block' : 'none';
     renderBleDevices('bleDevices', d.devices || [], false);
@@ -4188,11 +4320,11 @@ async function bleAction(action, addr, settings = {}, message = 'bleMsg') {
     const r = await api('/api/ble', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if (!r) return;
     const d = await r.json();
-    if (!r.ok || !d.ok) throw new Error(d.error || d.result || 'Oximetry action failed');
-    if (action !== 'scan') showMsg(document.getElementById(message), d.result, 'ok');
+    if (!r.ok || !d.ok) throw new Error(d.error || d.result || 'oxi_action_failed');
+    if (action !== 'scan') showMsg(document.getElementById(message), uiMessage('ble.action.' + action, {}, d.result), 'ok');
     await loadBle();
     return true;
-  } catch(e) { showMsg(document.getElementById(message), 'Error: ' + e.message, 'err'); return false; }
+  } catch(e) { showMsg(document.getElementById(message), uiMessage('common.error', {detail:uiError(e)}), 'err'); return false; }
 }
 
 // Console
@@ -4231,23 +4363,25 @@ let otaStatus = null, otaWatch = null, otaSerial = 0;
 
 function renderOtaStatus(d) {
   var version = document.getElementById('espFwVer');
-  if (version && lastStatus.version) version.textContent = lastStatus.version;
+  if (version && lastStatus.version) uiText(version, lastStatus.version);
 
   var latest = d.update_version || '--';
-  if (d.state === 'disabled') latest = 'Checks disabled';
-  else if (d.state === 'checking') latest = 'Checking...';
-  else if (d.state === 'current') latest += ' (current)';
-  else if (d.state === 'available') latest += ' available';
-  document.getElementById('espFwLatest').textContent = latest;
+  if (d.state === 'disabled') latest = uiMessage('ota.checksDisabled');
+  else if (d.state === 'checking') latest = uiMessage('ota.checking');
+  else if (d.state === 'current') latest = uiMessage('ota.currentVersion', {version:latest});
+  else if (d.state === 'available') latest = uiMessage('ota.availableVersion', {version:latest});
+  uiText(document.getElementById('espFwLatest'), latest);
 
   var active = ['checking', 'installing', 'rebooting', 'busy'].includes(d.state);
   var check = document.getElementById('btnOtaCheck');
   check.disabled = d.state === 'disabled' || active || !!d.blocked;
   var install = document.getElementById('btnOtaInstall');
   install.style.display = d.state === 'available' ? '' : 'none';
-  install.textContent = d.update_version ? 'Install ' + d.update_version : 'Install update';
+  uiText(install, d.update_version ? uiMessage('ota.installVersion', {version:d.update_version}) : uiMessage('ota.install'));
   install.disabled = d.state !== 'available' || !!d.blocked;
-  check.title = install.title = d.blocked || '';
+  const blocked = d.blocked ? uiMessage('ota.blockedReason', {reason:uiError(d.blocked)}) : '';
+  uiText(check, blocked, 'title');
+  uiText(install, blocked, 'title');
 
   var progress = document.getElementById('otaReleaseProgress');
   var bar = document.getElementById('otaReleaseBar');
@@ -4255,12 +4389,12 @@ function renderOtaStatus(d) {
   bar.style.width = (d.state === 'rebooting' ? 100 : (d.progress || 0)) + '%';
 
   var msgEl = document.getElementById('otaReleaseMsg');
-  var text = d.state === 'rebooting' ? 'Update complete. Restarting...' :
-    d.state === 'installing' ? 'Installing update: ' + (d.progress || 0) + '%' :
-    d.state === 'checking' ? 'Checking for updates...' :
-    d.state === 'busy' ? 'Another firmware operation is in progress.' :
-    d.state === 'error' ? d.error : '';
-  msgEl.textContent = text;
+  var text = d.state === 'rebooting' ? uiMessage('ota.updateRestarting') :
+    d.state === 'installing' ? uiMessage('ota.installingProgress', {progress:d.progress || 0}) :
+    d.state === 'checking' ? uiMessage('ota.checkingUpdates') :
+    d.state === 'busy' ? uiMessage('ota.operationBusy') :
+    d.state === 'error' && d.error ? uiMessage('ota.error', {error:uiError(d.error)}) : '';
+  uiText(msgEl, text);
   msgEl.className = text ? 'msg ' + (d.state === 'error' ? 'err' : 'ok') : 'msg';
 }
 
@@ -4278,11 +4412,11 @@ function finishOtaObservation() {
   const restarted = (otaWatch.version && lastStatus.version && lastStatus.version !== otaWatch.version) ||
     (Number.isFinite(otaWatch.uptime) && Number.isFinite(lastStatus.uptime) && lastStatus.uptime < otaWatch.uptime);
   if (otaWatch.restarting && restarted) {
-    message = 'Device is back online with firmware ' + (lastStatus.version || '--') + '.';
-  } else if (d.state === 'error') { message = d.error; type = 'err'; }
+    message = uiMessage('ota.backOnline', {version:lastStatus.version || '--'});
+  } else if (d.state === 'error') { message = d.error ? uiMessage('ota.error', {error:uiError(d.error)}) : ''; type = 'err'; }
   else if (otaWatch.restarting) return;
   else if (d.state === 'current' || d.state === 'available') {
-    message = d.state === 'available' ? 'Version ' + d.update_version + ' is available.' : 'This device is up to date.';
+    message = d.state === 'available' ? uiMessage('ota.versionAvailable', {version:d.update_version}) : uiMessage('ota.upToDate');
   } else return;
   clearTimeout(otaStatusTimer); otaStatusTimer = null; otaWatch = null;
   showMsg(document.getElementById('otaReleaseMsg'), message, type, 0);
@@ -4294,7 +4428,7 @@ function watchOta(restarting, baseline) {
   otaStatusTimer = setTimeout(() => {
     otaStatusTimer = null;
     otaWatch = null;
-    showMsg(document.getElementById('otaReleaseMsg'), 'Timed out waiting for update status. Refresh to check the device.', 'err', 0);
+    showMsg(document.getElementById('otaReleaseMsg'), uiMessage('ota.observationTimeout'), 'err', 0);
   }, 120000);
 }
 
@@ -4303,17 +4437,17 @@ async function otaAction(action) {
   const baseline = {...lastStatus};
   const serial = otaSerial;
   var msgEl = document.getElementById('otaReleaseMsg');
-  showMsg(msgEl, restarting ? 'Starting release update...' : 'Checking for updates...', 'ok', 0);
+  showMsg(msgEl, uiMessage(restarting ? 'ota.startingUpdate' : 'ota.checkingUpdates'), 'ok', 0);
   try {
     var r = await api('/api/ota/' + action, {method:'POST'});
     if (!r) return;
     var d = await r.json();
-    if (!r.ok) throw new Error(d.error || 'Update request rejected');
+    if (!r.ok) throw d.error ? new Error(d.error) : uiFailure('ota.requestRejected');
     watchOta(restarting, {version:baseline.version || d.version, uptime:baseline.uptime ?? d.uptime});
     const newerPush = serial !== otaSerial && otaStatus &&
       (otaStatus.revision > d.revision || lastStatus.version !== baseline.version || lastStatus.uptime < baseline.uptime);
     applyOtaStatus(newerPush ? otaStatus : d);
-  } catch(e) { showMsg(msgEl, e.message, 'err', 0); }
+  } catch(e) { showMsg(msgEl, uiMessage('ota.error', {error:uiError(e)}), 'err', 0); }
 }
 
 function otaCheckRelease() { return otaAction('check'); }
@@ -4338,15 +4472,17 @@ efi.addEventListener('change', e => { if (e.target.files[0]) espUploadFile(e.tar
 function uploadResponse(xhr) {
   let data;
   try { data = JSON.parse(xhr.responseText); }
-  catch(e) { throw new Error('Bad server response (HTTP ' + xhr.status + ')'); }
-  if (xhr.status !== 200 || !data || (data.ok !== true && data.ok !== 'true'))
-    throw new Error((data && data.error) || xhr.statusText || 'Upload rejected');
+  catch(e) { throw uiFailure('ota.badUploadResponse', {status:String(xhr.status)}); }
+  if (xhr.status !== 200 || !data || (data.ok !== true && data.ok !== 'true')) {
+    const error = (data && data.error) || xhr.statusText;
+    throw error ? new Error(error) : uiFailure('ota.uploadRejected');
+  }
   return data;
 }
 
 async function espUploadFile(file) {
   var msgEl = document.getElementById('espUploadMsg');
-  document.getElementById('espFileInfo').textContent = file.name + ' (' + (file.size/1024).toFixed(1) + ' KB)';
+  uiText(document.getElementById('espFileInfo'), uiMessage('ota.fileInfo', {name:file.name, size:{number:file.size/1024, max:1, min:1}}));
   document.getElementById('btnEspReboot').style.display = 'none';
   var prog = document.getElementById('espUploadProgress'), bar = document.getElementById('espUploadBar');
   prog.style.display = 'block'; bar.style.width = '0%';
@@ -4356,39 +4492,39 @@ async function espUploadFile(file) {
     xhr.onload = function() {
       try {
         const d = uploadResponse(xhr);
-        showMsg(msgEl, 'Upload OK: ' + d.size + ' bytes to ' + (d.partition||'OTA') + '. Ready to reboot.', 'ok', 0);
+        showMsg(msgEl, uiMessage('ota.espUploadReady', {count:d.size, partition:d.partition || 'OTA'}), 'ok', 0);
         document.getElementById('btnEspReboot').style.display = '';
-      } catch(e) { showMsg(msgEl, 'Upload failed: ' + e.message, 'err'); }
+      } catch(e) { showMsg(msgEl, uiMessage('ota.uploadFailed', {error:uiError(e)}), 'err'); }
     };
-    xhr.onerror = function() { showMsg(msgEl, 'Upload error', 'err'); };
+    xhr.onerror = function() { showMsg(msgEl, uiMessage('ota.uploadError'), 'err'); };
     var fd = new FormData(); fd.append('firmware', file);
     xhr.open('POST', '/api/esp32/upload'); xhr.send(fd);
-  } catch(e) { showMsg(msgEl, 'Error: ' + e.message, 'err'); }
+  } catch(e) { showMsg(msgEl, uiMessage('ota.error', {error:uiError(e)}), 'err'); }
 }
 
 async function espReboot() {
-  showMsg(document.getElementById('espUploadMsg'), 'Rebooting...', 'ok', 0);
+  showMsg(document.getElementById('espUploadMsg'), uiMessage('ota.rebooting'), 'ok', 0);
   document.getElementById('btnEspReboot').style.display = 'none';
   try { await api('/api/reboot', {method:'POST'}); } catch(e) {}
 }
 
 function showFwWarnings(d) {
   const el = document.getElementById('fwWarnings'); el.innerHTML = '';
-  const warn = (msg, cls) => { const div = document.createElement('div'); div.className = 'msg ' + cls; div.style.display = 'block'; div.textContent = msg; el.appendChild(div); };
+  const warn = (msg, cls) => { const div = document.createElement('div'); div.className = 'msg ' + cls; div.style.display = 'block'; uiText(div, msg); el.appendChild(div); };
   let allOk = true;
-  if (d.bid !== undefined && d.bid_ok === 'false') { warn('Unknown bootloader version: ' + d.bid + '. Expected SX577-0200.', 'err'); allOk = false; }
-  if (d.blx_crc === 'fail') { warn('BLX (bootloader) CRC mismatch.', 'err'); allOk = false; }
-  if (d.ccx_crc === 'fail') { warn('CCX (config) CRC mismatch.', 'err'); allOk = false; }
-  if (d.cdx_crc === 'fail') { warn('CDX (firmware) CRC mismatch.', 'err'); allOk = false; }
-  if (d.blx_patch === 'method_a') { warn('DANGER: This bootloader permanently disables serial flashing!', 'err'); allOk = false; }
-  else if (d.blx_patch === 'method_b') { warn('Bootloader integrity check disabled (safe method).', 'ok'); }
-  else if (d.blx_patch === 'none' && d.bid !== undefined) { warn('Stock bootloader - firmware integrity checks enabled.', 'ok'); }
-  if (allOk && d.bid !== undefined) warn('All verification checks passed. BID: ' + d.bid, 'ok');
+  if (d.bid !== undefined && d.bid_ok === 'false') { warn(uiMessage('ota.unknownBootloader', {bid:d.bid, expected:'SX577-0200'}), 'err'); allOk = false; }
+  if (d.blx_crc === 'fail') { warn(uiMessage('ota.blxCrcMismatch'), 'err'); allOk = false; }
+  if (d.ccx_crc === 'fail') { warn(uiMessage('ota.ccxCrcMismatch'), 'err'); allOk = false; }
+  if (d.cdx_crc === 'fail') { warn(uiMessage('ota.cdxCrcMismatch'), 'err'); allOk = false; }
+  if (d.blx_patch === 'method_a') { warn(uiMessage('ota.dangerousBootloader'), 'err'); allOk = false; }
+  else if (d.blx_patch === 'method_b') { warn(uiMessage('ota.safeBootloaderPatch'), 'ok'); }
+  else if (d.blx_patch === 'none' && d.bid !== undefined) { warn(uiMessage('ota.stockBootloader'), 'ok'); }
+  if (allOk && d.bid !== undefined) warn(uiMessage('ota.verificationPassed', {bid:d.bid}), 'ok');
 }
 
 async function uploadFile(file) {
   const msgEl = document.getElementById('uploadMsg');
-  document.getElementById('fileInfo').textContent = file.name + ' (' + (file.size/1024).toFixed(1) + ' KB)';
+  uiText(document.getElementById('fileInfo'), uiMessage('ota.fileInfo', {name:file.name, size:{number:file.size/1024, max:1, min:1}}));
   document.getElementById('fwWarnings').innerHTML = '';
   const prog = document.getElementById('uploadProgress'), bar = document.getElementById('uploadBar');
   prog.style.display = 'block'; bar.style.width = '0%';
@@ -4399,14 +4535,14 @@ async function uploadFile(file) {
     xhr.onload = () => {
       try {
         const d = uploadResponse(xhr);
-        showMsg(msgEl, 'Upload OK: '+d.size+' bytes, CRC: '+(d.crc||'n/a'), 'ok', 0);
+        showMsg(msgEl, uiMessage('ota.resmedUploadReady', {count:d.size, crc:d.crc || uiMessage('ota.notAvailable')}), 'ok', 0);
         showFwWarnings(d);
         showFlashCard();
-      } catch(e) { showMsg(msgEl, 'Upload failed: ' + e.message, 'err'); }
+      } catch(e) { showMsg(msgEl, uiMessage('ota.uploadFailed', {error:uiError(e)}), 'err'); }
     };
-    xhr.onerror = () => showMsg(msgEl, 'Upload error', 'err');
+    xhr.onerror = () => showMsg(msgEl, uiMessage('ota.uploadError'), 'err');
     xhr.open('POST', '/api/upload'); xhr.send(fd);
-  } catch(e) { showMsg(msgEl, 'Error: ' + e.message, 'err'); }
+  } catch(e) { showMsg(msgEl, uiMessage('ota.error', {error:uiError(e)}), 'err'); }
 }
 
 async function checkFlashReady() {
@@ -4417,7 +4553,7 @@ async function showFlashCard() {
   const card = document.getElementById('flashCard'); card.style.display = 'block';
   try {
     const r = await api('/api/flash'); if (!r) return; const d = await r.json();
-    document.getElementById('flashDetected').textContent = 'Detected: ' + d.detected_block + ' (' + Math.round(d.fw_size/1024) + ' KB)';
+    uiText(document.getElementById('flashDetected'), uiMessage('ota.flashDetected', {block:d.detected_block, size:Math.round(d.fw_size/1024)}));
     const sel = document.getElementById('flashBlock');
     if (d.detected_block && d.detected_block !== 'unknown') { for (let i = 0; i < sel.options.length; i++) { if (sel.options[i].value === d.detected_block) sel.selectedIndex = i; } }
     updateBlxVisibility();
@@ -4445,13 +4581,13 @@ async function startFlash() {
   try {
     const r = await api('/api/flash', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({block:block||undefined,flash_blx:flashBlx,force_blx:forceBlx})});
     if (!r) return; const d = await r.json();
-    if (d.ok === 'false' || d.error) { showMsg(msgEl, d.error || 'Flash failed', 'err'); return; }
-    showMsg(msgEl, 'Flash started: ' + d.block, 'ok');
+    if (d.ok === 'false' || d.error) { showMsg(msgEl, d.error ? uiMessage('ota.error', {error:uiError(d.error)}) : uiMessage('ota.flashFailed'), 'err'); return; }
+    showMsg(msgEl, uiMessage('ota.flashStarted', {block:d.block}), 'ok');
     document.getElementById('btnFlash').disabled = true;
     document.getElementById('btnFlashCancel').style.display = '';
     document.getElementById('flashProgress').style.display = 'block';
     pollFlash();
-  } catch(e) { showMsg(msgEl, 'Error: ' + e.message, 'err'); }
+  } catch(e) { showMsg(msgEl, uiMessage('ota.error', {error:uiError(e)}), 'err'); }
 }
 
 function pollFlash() {
@@ -4462,26 +4598,26 @@ function pollFlash() {
     try {
       const r = await api('/api/flash', undefined, 5000);
       if (!r) { flashPolling = false; flashPollTimer = null; return; }
-      if (!r.ok) throw new Error('Flash status read failed');
+      if (!r.ok) throw uiFailure('ota.flashStatusReadFailed');
       const d = await r.json();
       failedAt = null;
       const bar = document.getElementById('flashBar'), phase = document.getElementById('flashPhase'), msgEl = document.getElementById('flashMsg');
       if (d.total > 0) bar.style.width = (d.sent/d.total*100)+'%';
-      phase.textContent = d.phase + (d.total > 0 ? ' - ' + Math.round(d.sent/1024) + '/' + Math.round(d.total/1024) + ' KB' : '');
+      uiText(phase, d.total > 0 ? uiMessage('ota.flashPhaseProgress', {phase:d.phase, sent:Math.round(d.sent/1024), total:Math.round(d.total/1024)}) : uiMessage('ota.flashPhase', {phase:d.phase}));
       if (d.active !== 'true') {
         flashPolling = false; flashPollTimer = null;
         document.getElementById('btnFlash').disabled = false;
         document.getElementById('btnFlashCancel').style.display = 'none';
-        if (d.error) showMsg(msgEl, d.error, 'err');
-        else if (d.phase === 'Complete') showMsg(msgEl, 'Flash completed successfully!', 'ok');
-        else showMsg(msgEl, 'Flash finished: ' + d.phase, 'ok');
+        if (d.error) showMsg(msgEl, uiMessage('ota.error', {error:uiError(d.error)}), 'err');
+        else if (d.phase === 'Complete') showMsg(msgEl, uiMessage('ota.flashComplete'), 'ok');
+        else showMsg(msgEl, uiMessage('ota.flashFinished', {phase:d.phase}), 'ok');
         return;
       }
     } catch(e) {
       if (failedAt === null) failedAt = Date.now();
       if (Date.now() - failedAt >= 30000) {
         flashPolling = false; flashPollTimer = null;
-        showMsg(document.getElementById('flashMsg'), 'Flash status unavailable. The operation may still be running; refresh to check.', 'err', 0);
+        showMsg(document.getElementById('flashMsg'), uiMessage('ota.flashStatusUnavailable'), 'err', 0);
         return;
       }
     }
@@ -4553,11 +4689,12 @@ function drawChart(canvasId, data, label, color, minY, maxY, unit, scale, signed
   ctx.textAlign = 'right';
   for (let i = 0; i <= 4; i++) {
     const v = maxY-(maxY-minY)*(i/4);
-    ctx.fillText((v/scale).toFixed(Math.abs(v/scale)>=10?0:1)+unit, pad.l-4, pad.t+gh*(i/4)+3);
+    const digits = Math.abs(v/scale)>=10 ? 0 : 1;
+    ctx.fillText(uiNumber(v/scale,digits,digits)+unit, pad.l-4, pad.t+gh*(i/4)+3);
   }
   // Current value
   const cur = data.length ? data[data.length-1] : -32768;
-  const curStr = (cur > -32000) ? (cur/scale).toFixed(1)+unit : '--';
+  const curStr = (cur > -32000) ? uiNumber(cur/scale,1,1)+unit : '--';
   ctx.fillStyle = color;
   ctx.font = 'bold 11px sans-serif';
   ctx.textAlign = 'left';
@@ -4604,16 +4741,16 @@ function updateCharts(slowChanged = true) {
   var p = waveData.press, f = waveData.flow, lk = waveData.leak,
       s = slowData.spo2, hr = slowData.pulse;
   var el;
-  function lastValid(arr, scale) {
-    for (var i = arr.length - 1; i >= 0; i--) { if (arr[i] > -32000) return (arr[i]/scale).toFixed(1); }
+  function lastValid(arr, scale, digits = 1) {
+    for (var i = arr.length - 1; i >= 0; i--) { if (arr[i] > -32000) return uiNumber(arr[i]/scale,digits,digits); }
     return '--';
   }
   el = document.getElementById('chartPressVal'); if (el) el.textContent = lastValid(p, 50);
   el = document.getElementById('chartFlowVal'); if (el) el.textContent = lastValid(f, 8.33);
   el = document.getElementById('chartLeakVal'); if (el) el.textContent = lastValid(lk, 0.833);
   if (slowChanged) {
-    el = document.getElementById('chartSpo2Val'); if (el) { var v = lastValid(s, 1); el.textContent = v !== '--' ? parseInt(v) : '--'; }
-    el = document.getElementById('chartPulseVal'); if (el) { var v = lastValid(hr, 1); el.textContent = v !== '--' ? parseInt(v) : '--'; }
+    el = document.getElementById('chartSpo2Val'); if (el) el.textContent = lastValid(s, 1, 0);
+    el = document.getElementById('chartPulseVal'); if (el) el.textContent = lastValid(hr, 1, 0);
   }
 }
 
@@ -4646,6 +4783,8 @@ async function startUI() {
   else showTab(tabNames.includes(ht) ? ht : 'status');
   if (ht === 'storage' && !setupActive()) loadStorage();
 }
+window.addEventListener('languagechange', () => applyUiLanguage(lastStatus.ui_language));
+applyUiLanguage('auto');
 initSSE();
 </script>
 </body>

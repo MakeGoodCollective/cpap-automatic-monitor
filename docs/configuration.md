@@ -67,6 +67,7 @@ log warning and the previous setting stays in effect.
 | `http_user` | admin | Web UI username |
 | `http_pass` | airbridge | Web UI password |
 | `auth_whitelist` | *(empty)* | Trusted IPv4 addresses that bypass web login. Comma-separated addresses, CIDR networks, start-end ranges or `*`; maximum 160 characters |
+| `ui_language` | auto | Web UI language: `auto` follows browser preferences; `en` selects English; `pl` selects Polish |
 
 ### OTA
 
