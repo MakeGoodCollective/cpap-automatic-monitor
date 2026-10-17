@@ -36,6 +36,7 @@ static uint32_t clock_sync_attempt_ms = 0;
 static bool clock_sync_attempted = false;
 static uint8_t clock_sync_window_retries = 0;
 static uart_transaction_t *clock_sync_ticket = nullptr;
+static bool clock_sync_verifying = false;
 static time_t clock_sync_target = 0;
 static int64_t clock_sync_edge_us = 0;
 static char clock_sync_tic[16];
@@ -69,7 +70,7 @@ static uint32_t phase_attempt_ms = 0;
 static bool phase_attempted = false;
 static uart_transaction_t *phase_ticket = nullptr;
 
-// One main-loop calendar read serves the display and the phase baseline.
+// One main-loop calendar read serves status, phase and managed clock writes.
 static bool status_read_requested = false, calendar_for_phase = false;
 static uart_transaction_t *calendar_ticket = nullptr;
 static uint8_t calendar_step = 0, calendar_attempt = 0;
@@ -184,6 +185,15 @@ static void stop_calendar_read() {
     calendar_step = 0;
 }
 
+static void start_calendar_read() {
+    stop_calendar_read();
+    calendar_attempt = 0;
+    calendar_step = 1;
+    portENTER_CRITICAL(&device_time_mux);
+    calendar_generation = phase_generation;
+    portEXIT_CRITICAL(&device_time_mux);
+}
+
 static bool start_phase_from_observation() {
     portENTER_CRITICAL(&device_time_mux);
     const bool fresh = last_clock_read.date[0] &&
@@ -196,6 +206,58 @@ static bool start_phase_from_observation() {
     portEXIT_CRITICAL(&device_time_mux);
     phase_measuring = fresh;
     return fresh;
+}
+
+// calendar_step remains nonzero while pending; true means a complete calendar.
+static bool advance_calendar_read(Air10Clock::Calendar &value, bool idle_only) {
+    portENTER_CRITICAL(&device_time_mux);
+    const bool unchanged = calendar_generation == phase_generation;
+    portEXIT_CRITICAL(&device_time_mux);
+    if (!unchanged) {
+        stop_calendar_read();
+        return false;
+    }
+    if (!calendar_ticket) {
+        const uart_send_window_t window = {0, 0, idle_only, true};
+        calendar_ticket = Arbiter::begin_var(calendar_step == 2 ? "TIC" : "DAC",
+            CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, 9, CLOCK_TIMEOUT_MS, window);
+        if (calendar_ticket) return false;
+    } else if (!Arbiter::transaction_done(calendar_ticket)) {
+        if (!Arbiter::transaction_expired(calendar_ticket)) return false;
+        stop_calendar_read();
+    } else {
+        char response[9] = {};
+        Arbiter::VarReadTrace trace;
+        const auto result = Arbiter::finish_var(calendar_ticket, response, sizeof(response), &trace);
+        calendar_ticket = nullptr;
+        if (result == Arbiter::VarResult::Ok) {
+            if (calendar_step == 1) {
+                memcpy(calendar_date, response, sizeof(calendar_date));
+                calendar_step = 2;
+                return false;
+            }
+            if (calendar_step == 2 && strlen(response) < sizeof(calendar_tic)) {
+                strcpy(calendar_tic, response);
+                calendar_trace = trace;
+                calendar_step = 3;
+                return false;
+            }
+            if (calendar_step == 3) {
+                if (strcmp(calendar_date, response) && calendar_attempt++ == 0) {
+                    calendar_step = 1;
+                    return false;
+                }
+                if (!strcmp(calendar_date, response) &&
+                    Air10Clock::parse_calendar(calendar_date, calendar_tic, value)) {
+                    observe_clock_read(value, calendar_trace);
+                    calendar_step = 0;
+                    return true;
+                }
+            }
+        }
+    }
+    calendar_step = 0;
+    return false;
 }
 
 static void handle_calendar_read() {
@@ -225,60 +287,19 @@ static void handle_calendar_read() {
             (!phase_attempted || millis() - phase_attempt_ms >= PHASE_RETRY_INTERVAL_MS);
         if (!status_read_requested && !calendar_for_phase) return;
         status_read_requested = false;
-        calendar_generation = generation;
-        calendar_attempt = 0;
-        calendar_step = 1;
         if (calendar_for_phase) {
             phase_attempted = true;
             phase_started_ms = phase_attempt_ms = millis();
-            if (start_phase_from_observation()) {
-                calendar_step = 0;
-                return;
-            }
+            if (start_phase_from_observation()) return;
         }
+        start_calendar_read();
     }
-    if (!calendar_ticket) {
-        const uart_send_window_t window = {0, 0, calendar_for_phase, true};
-        calendar_ticket = Arbiter::begin_var(calendar_step == 2 ? "TIC" : "DAC",
-            CMD_SRC_INTERNAL, CMD_PRIO_NORMAL, 9, CLOCK_TIMEOUT_MS, window);
-        if (calendar_ticket) return;
-    } else if (!Arbiter::transaction_done(calendar_ticket)) {
-        if (!Arbiter::transaction_expired(calendar_ticket)) return;
-        stop_calendar_read();
-    } else {
-        char response[9] = {};
-        Arbiter::VarReadTrace trace;
-        const auto result = Arbiter::finish_var(calendar_ticket, response, sizeof(response), &trace);
-        calendar_ticket = nullptr;
-        if (result == Arbiter::VarResult::Ok) {
-            if (calendar_step == 1) {
-                memcpy(calendar_date, response, sizeof(calendar_date));
-                calendar_step = 2;
-                return;
-            }
-            if (calendar_step == 2 && strlen(response) < sizeof(calendar_tic)) {
-                strcpy(calendar_tic, response);
-                calendar_trace = trace;
-                calendar_step = 3;
-                return;
-            }
-            if (calendar_step == 3) {
-                Air10Clock::Calendar value;
-                if (strcmp(calendar_date, response) && calendar_attempt++ == 0) {
-                    calendar_step = 1;
-                    return;
-                }
-                if (!strcmp(calendar_date, response) &&
-                    Air10Clock::parse_calendar(calendar_date, calendar_tic, value)) {
-                    observe_clock_read(value, calendar_trace);
-                    if (calendar_for_phase) start_phase_from_observation();
-                    calendar_step = 0;
-                    return;
-                }
-            }
-        }
+    Air10Clock::Calendar value;
+    if (advance_calendar_read(value, calendar_for_phase)) {
+        if (calendar_for_phase) start_phase_from_observation();
+        return;
     }
-    calendar_step = 0;
+    if (calendar_step) return;
     publish_device_time("--");
     if (calendar_for_phase)
         Log::logf(CAT_TIME, LOG_DEBUG, "RTC phase failed: calendar read\n");
@@ -439,7 +460,7 @@ static void push_time_to_resmed() {
         CMD_PRIO_NORMAL, 64, CLOCK_TIMEOUT_MS, window);
 }
 
-static bool finish_clock_sync() {
+static bool finish_clock_write() {
     char response[64] = {};
     uint16_t length = sizeof(response);
     uart_transaction_result_t result = {};
@@ -458,14 +479,10 @@ static bool finish_clock_sync() {
               clock_sync_tic + 9, (long long)clock_sync_edge_us,
               unsigned(trace.sent), (long)result.send_lateness_us,
               (unsigned long)trace.sent_ms, (unsigned long)trace.received_ms, trace.outcome);
-    if (!clock_write_applied(clock_sync_tic, ok, response)) return false;
+    return clock_write_applied(clock_sync_tic, ok, response);
+}
 
-    Air10Clock::Calendar observed;
-    if (!Air10Clock::read(observed, CLOCK_TIMEOUT_MS)) {
-        Log::logf(CAT_TIME, LOG_WARN, "ResMed clock verification read failed\n");
-        return false;
-    }
-
+static bool verify_clock_sync(const Air10Clock::Calendar &observed) {
     struct tm t;
     localtime_r(&clock_sync_target, &t);
     const Air10Clock::Calendar requested = {
@@ -510,6 +527,8 @@ static void release_clock_sync() {
 static void end_clock_attempt() {
     if (clock_sync_ticket) Arbiter::cancel_transaction(clock_sync_ticket);
     clock_sync_ticket = nullptr;
+    stop_calendar_read();
+    clock_sync_verifying = false;
     if (clock_calibration == ClockCalibration::None ||
         clock_calibration == ClockCalibration::CheckStandby) {
         release_clock_sync();
@@ -627,14 +646,7 @@ static void handle_clock_calibration() {
     }
 }
 
-static void start_clock_sync() {
-    stop_phase_measurement("clock write");
-    stop_calendar_read();
-    Air10Clock::Calendar observed;
-    if (!Air10Clock::read(observed, CLOCK_TIMEOUT_MS)) {
-        Log::logf(CAT_TIME, LOG_WARN, "ResMed clock read before sync failed\n");
-        return;
-    }
+static void start_clock_write(const Air10Clock::Calendar &observed) {
     if (!AirSenseState::device_standby()) return;
     const time_t now = time(nullptr);
     struct tm target;
@@ -702,10 +714,28 @@ static void handle_clock_sync() {
         handle_clock_calibration();
         return;
     }
+    if (clock_sync_reserved && calendar_step) {
+        Air10Clock::Calendar observed;
+        const bool ok = advance_calendar_read(observed, true);
+        if (calendar_step) return;
+        if (!ok) {
+            Log::logf(CAT_TIME, LOG_WARN, "ResMed clock %s read failed\n",
+                      clock_sync_verifying ? "verification" : "before sync");
+        } else if (clock_sync_verifying) {
+            if (verify_clock_sync(observed)) clock_sync_pending = false;
+        } else {
+            start_clock_write(observed);
+            if (clock_sync_ticket || clock_calibration != ClockCalibration::None) return;
+        }
+        end_clock_attempt();
+        return;
+    }
     if (clock_sync_ticket) {
         if (Arbiter::transaction_done(clock_sync_ticket)) {
-            if (finish_clock_sync()) clock_sync_pending = false;
-            end_clock_attempt();
+            if (finish_clock_write()) {
+                clock_sync_verifying = true;
+                start_calendar_read();
+            } else end_clock_attempt();
         }
         return;
     }
@@ -728,8 +758,8 @@ static void handle_clock_sync() {
     clock_sync_reserved = true;
     clock_sync_attempt_ms = millis();
     clock_sync_attempted = true;
-    start_clock_sync();
-    if (!clock_sync_ticket && clock_calibration == ClockCalibration::None) end_clock_attempt();
+    stop_phase_measurement("clock write");
+    start_calendar_read();
 }
 
 void Air10Clock::handle() {
