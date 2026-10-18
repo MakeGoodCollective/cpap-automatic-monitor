@@ -12,6 +12,29 @@ html:not([data-theme-ready]) .app,html:not([data-theme-ready]) .bottom-nav{visib
 .sync-value{overflow-wrap:anywhere;min-width:0;text-align:right}
 .sync-note,.sync-error{font-size:12px;margin:10px 0;color:var(--text-dim)}
 .sync-error{color:var(--red)}
+#syncCards{grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));align-items:start}
+.sync-card{min-width:0}
+.sync-status{block-size:4em;font-size:14px;line-height:1.5;overflow:auto;scrollbar-gutter:stable;margin-bottom:8px}
+.sync-status [data-sync="state"]{font-size:16px;font-weight:600;line-height:1.4}
+.sync-status [data-sync="file"]{font-size:12px;color:var(--text-dim);overflow-wrap:anywhere}
+.sync-status .sync-error{margin:8px 0 0;overflow-wrap:anywhere}
+.sync-card[data-sync-tone="good"] [data-sync="state"]{color:var(--green)}
+.sync-card[data-sync-tone="active"] [data-sync="state"]{color:var(--cyan)}
+.sync-card[data-sync-tone="error"] [data-sync="state"]{color:var(--red)}
+.sync-card .time-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.25fr);gap:12px;align-items:start;font-size:12px;min-block-size:3em}
+.sync-card .time-row .value{font-size:12px;text-align:right;min-width:0;overflow-wrap:anywhere}
+.sync-card>.time-row{block-size:3.75em;overflow:auto;scrollbar-gutter:stable;line-height:1.5}
+.sync-card .btn-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:6px}
+.sync-card>.btn-row .btn{flex:none;white-space:nowrap}
+.sync-actions [data-sync="check-result"]{flex-basis:100%;block-size:1.5em;min-width:0;font-size:12px;line-height:1.5;text-align:right;overflow:auto;overflow-wrap:anywhere;scrollbar-gutter:stable;color:var(--text-dim)}
+.sync-actions [data-error="true"]{color:var(--red)}
+.sync-details{margin-top:8px;border-top:1px solid var(--border);padding-top:12px;font-size:12px}
+.sync-details summary{cursor:pointer;color:var(--text-dim);width:fit-content}
+.sync-details h4{font-size:12px;margin-top:16px;color:var(--text-dim)}
+.sync-run-heading{display:flex;align-items:center;gap:8px;block-size:1.5em;line-height:1.5;min-width:0}
+.sync-run-heading>[data-i18n]{flex:none}
+.sync-run-heading [data-sync="run-result"]{flex:1;min-width:0;block-size:1.5em;line-height:1.5;white-space:nowrap;overflow-x:auto;overflow-y:hidden;scrollbar-width:none;text-align:right;font-weight:400}
+.sync-run-heading [data-error="true"]{color:var(--red)}
 #p-setup .btn-row{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px}
 #p-setup input,#p-setup select{max-width:100%}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg,Canvas);color:var(--text,CanvasText);min-height:100vh;overflow:hidden}
@@ -3982,29 +4005,95 @@ async function saveConfig(rootId, messageId) {
 
 
 const SYNC_ENDPOINTS = {smb: 'SMB', sleephq: 'SleepHQ'};
-const SYNC_STORAGE_DATE_OPTIONS = {dateStyle:'short', timeStyle:'medium',
-  timeZone:Intl.DateTimeFormat().resolvedOptions().timeZone};
+
+function syncStorageTimestamp(epochSeconds) {
+  const date = new Date(epochSeconds * 1000);
+  const pad = value => String(value).padStart(2, '0');
+  return String(date.getFullYear()).padStart(4, '0') + '-' +
+    [date.getMonth() + 1, date.getDate()].map(pad).join('-') + ' ' +
+    [date.getHours(), date.getMinutes(), date.getSeconds()].map(pad).join(':');
+}
+
 let exportsSnapshot = null;
 let exportsFresh = false;
 const syncRequests = new Set();
+const syncRequestErrors = new Map();
+
+function syncCardStatus(id, state, fresh, requestError) {
+  const syncError = requestError?.check ? null : requestError?.error ?? requestError;
+  const errors = [syncError, state.error,
+    state.backlog_state === 'error' ? state.backlog_error : '']
+    .filter((error, index, all) => error && all.indexOf(error) === index).map(uiError);
+  const reason = uiMessage('common.value', {value:{items:errors, separator:'; '}});
+  const result = (key, tone = '', params = {}, file = '') => ({message:uiMessage(key, params), tone, reason, file});
+  if (!fresh) return result('sync.reconnecting');
+  if (syncError) return result('sync.requestFailed', 'error');
+  if (state.state === 'disabled' || state.sync_blocked === 'disabled') return result('sync.state.disabled');
+  if (state.backlog_state === 'unconfigured' || state.sync_blocked === 'not_configured')
+    return result('sync.configureFirst');
+  if (state.state === 'unsupported') return result('sync.state.unsupported');
+  if (state.state === 'error' || state.error || state.backlog_state === 'error')
+    return result('sync.failed', 'error');
+  const waits = {offline:'sync.waitingWifi', not_idle:'sync.waitingStandby',
+    usb_storage_active:'sync.waitingUsb', sd_unavailable:'error.sd_unavailable', unavailable:'sync.unavailable'};
+  if (waits[state.sync_blocked]) return result(waits[state.sync_blocked]);
+  if (['working','pending'].includes(state.state)) {
+    const activity = state.activity || {};
+    const waiting = {queued:'sync.state.pending', export_queue:'sync.waitingExport',
+      storage_busy:'sync.waitingStorage', sd_write_wait:'sync.waitingStorage',
+      sd_io_wait:'sync.waitingStorage', sd_reader_wait:'sync.waitingDownload',
+      network:'sync.waitingWifi', standby:'sync.waitingStandby', usb:'sync.waitingUsb',
+      retry_backoff:'sync.waitingRetry'};
+    if (waiting[activity.wait]) return result(waiting[activity.wait], '', {}, activity.file || '');
+    if (state.state === 'working') {
+      const phase = 'sync.phase.' + activity.phase;
+      return result(Object.hasOwn(UI_CATALOGS.en, phase) ? phase : 'sync.state.working',
+        'active', {}, activity.file || '');
+    }
+  }
+  if (state.retry_pending) return result('sync.waitingRetry');
+  if (state.state === 'pending') return result('sync.state.pending');
+  if (state.backlog_state === 'confirming') return result('sync.awaitingConfirmation');
+  if (state.backlog_state === 'ready') {
+    if (state.backlog_sessions > 0)
+      return result('sync.sessionsToSync', '', {count:state.backlog_sessions});
+    if (state.backlog_files > 0) return result('sync.dataWaiting');
+    if (state.backlog_waiting > 0) return result('sync.waitingRecordings');
+    if (state.backlog_sessions === 0 && state.backlog_files === 0 && state.backlog_waiting === 0)
+      return result('sync.upToDate', 'good');
+  }
+  return result('sync.statusUnknown');
+}
 
 function createSyncCards() {
   const cards = document.getElementById('syncCards');
   if (cards.children.length) return;
   for (const [id, name] of Object.entries(SYNC_ENDPOINTS)) {
     const card = document.createElement('div');
-    card.className = 'card';
+    card.className = 'card sync-card';
     card.id = id + 'SyncCard';
-    card.innerHTML = `<div class="card-header"><span class="label">${name}</span><span class="badge" data-sync="state">--</span></div>
+    card.innerHTML = `<div class="card-header"><span class="label">${name}</span></div>
+      <div class="sync-status" role="status" aria-live="polite" aria-atomic="true" tabindex="0">
+        <div data-sync="state"></div><div data-sync="file"></div><div class="sync-error" data-sync="error"></div>
+      </div>
       <div class="time-row"><span class="label" data-i18n="sync.endpoint"></span><span class="value sync-value" data-sync="endpoint">&mdash;</span></div>
       <div class="time-row"><span class="label" data-i18n="sync.lastSuccess"></span><span class="value" data-sync="last">&mdash;</span></div>
-      <div class="time-row"><span class="label" data-i18n="sync.files"></span><span class="value sync-value" data-sync="files">&mdash;</span></div>
-      <div class="time-row"><span class="label" data-i18n="sync.connectionCheck"></span><span class="value sync-value" data-sync="check-result">&mdash;</span></div>
-      <div class="sync-note" data-sync="import"></div>
-      <div class="sync-note" data-sync="availability"></div>
-      <div class="sync-error" data-sync="error"></div>
-      <div class="btn-row"><button class="btn btn-accent" data-sync="start" data-i18n="sync.start"></button><button class="btn" data-sync="check" data-i18n="${id === 'smb' ? 'sync.checkShare' : 'sync.checkAccount'}"></button><button class="btn" data-sync="edit" data-i18n="common.edit"></button></div>
-      <div class="msg" id="${id}SyncMsg"></div>
+      <div class="btn-row sync-actions">
+        <button class="btn btn-accent" data-sync="start" data-i18n="sync.start"></button>
+        <button class="btn" data-sync="edit" data-i18n="common.edit"></button>
+        <button class="btn" data-sync="check" data-i18n="${id === 'smb' ? 'sync.checkShare' : 'sync.checkAccount'}" aria-describedby="${id}CheckResult"></button>
+        <span id="${id}CheckResult" data-sync="check-result" role="status" aria-live="polite" aria-atomic="true" tabindex="0"></span>
+      </div>
+      <details class="sync-details" data-sync="details"><summary data-i18n="sync.details"></summary>
+        <h4 class="sync-run-heading"><span data-i18n="sync.lastRun"></span><span data-sync="run-result" tabindex="0"></span></h4>
+        <div class="time-row"><span class="label" data-i18n="sync.uploadedFiles"></span><span class="value" data-sync="uploaded"></span></div>
+        <div class="time-row"><span class="label" data-i18n="sync.skippedFiles"></span><span class="value" data-sync="skipped"></span></div>
+        ${id === 'sleephq' ? '<div class="time-row"><span class="label" data-i18n="sync.attachedFiles"></span><span class="value" data-sync="attached"></span></div>' : ''}
+        <h4 data-i18n="sync.waitingToSync"></h4>
+        <div class="time-row"><span class="label" data-i18n="sync.sessionCount"></span><span class="value" data-sync="pending-sessions"></span></div>
+        <div class="time-row"><span class="label" data-i18n="sync.fileCount"></span><span class="value" data-sync="pending-files"></span></div>
+        <div class="time-row"><span class="label" data-i18n="sync.unfinishedSessions"></span><span class="value" data-sync="waiting-sessions"></span></div>
+      </details>
       <div id="${id}ConfigPanel" hidden>
         <div id="${id}ConfigFields" data-config-form="${id}"></div>
         <div class="sync-note" data-i18n="sync.configNextRun"></div>
@@ -4031,47 +4120,47 @@ function renderExports(changed = null) {
   if (!supported) return;
   if (!document.getElementById('p-sync').classList.contains('active')) return;
   createSyncCards();
-  const blockedText = {sd_unavailable:uiMessage('error.sd_unavailable'),
-    not_configured:uiMessage('sync.configureFirst'), not_idle:uiMessage('sync.waitingStandby'),
-    offline:uiMessage('sync.waitingWifi'), unavailable:uiMessage('sync.unavailable')};
   for (const id of Object.keys(SYNC_ENDPOINTS)) {
     if (changed && !changed[id]) continue;
     const state = data[id];
+    if (!state) continue;
     const card = document.getElementById(id + 'SyncCard');
     const text = (key, value) => { uiText(card.querySelector('[data-sync="' + key + '"]'), value); };
-    text('state', uiMessage('sync.state.' + state.state, {}, state.state));
+    const status = syncCardStatus(id, state, exportsFresh, syncRequestErrors.get(id));
+    text('state', status.message);
+    text('file', status.file);
+    text('error', status.reason);
+    card.dataset.syncTone = status.tone;
     text('endpoint', id === 'smb' ? state.endpoint || uiMessage('sync.notConfigured') :
       uiMessage('common.value', {value:{items:['SleepHQ',
         ...(state.team_id ? [uiMessage('sync.team', {id:String(state.team_id)})] : []),
         ...(state.device_id ? [uiMessage('sync.device', {id:String(state.device_id)})] : [])], separator:' / '}}));
-    text('last', state.last_sync_epoch ? uiMessage('common.value', {
-      value:{date:state.last_sync_epoch * 1000, options:SYNC_STORAGE_DATE_OPTIONS}}) : '\u2014');
-    const files = [];
-    if (state.has_files) {
-      files.push(uiMessage('sync.uploaded', {count:state.files_uploaded}));
-      if (state.files_attached) files.push(uiMessage('sync.attached', {count:state.files_attached}));
-      if (state.files_skipped) files.push(uiMessage('sync.skipped', {count:state.files_skipped}));
-    }
-    if (['ready', 'confirming'].includes(state.backlog_state)) {
-      files.push(uiMessage('sync.pendingFiles', {count:state.backlog_files}));
-      if (state.backlog_waiting) files.push(uiMessage('sync.sessionsNotReady', {count:state.backlog_waiting}));
-      if (state.backlog_state === 'confirming') files.push(uiMessage('sync.awaitingConfirmation'));
-    } else {
-      files.push(uiMessage('sync.pendingUnknown'));
-    }
-    text('files', state.backlog_state === 'unconfigured' ? '\u2014' :
-      uiMessage('common.value', {value:{items:files, separator:' \u00b7 '}}));
-    text('import', state.import_id ? uiMessage(state.import_status ? 'sync.importStatus' : 'sync.import', {
-      id:String(state.import_id), status:uiMessage('sync.importState.' + state.import_status, {}, state.import_status)}) : '');
-    text('error', uiMessage('common.value', {value:{items:
-      [state.error, state.backlog_state === 'error' ? state.backlog_error : '']
-        .filter((error, index, errors) => error && errors.indexOf(error) === index).map(uiError), separator:'; '}}));
-    text('check-result', state.check_state === 'passed' ? uiMessage('sync.checkPassed') :
-      state.check_state === 'failed' ? uiError(state.check_error) || uiMessage('sync.checkFailed') :
-      ['pending','working'].includes(state.check_state) ? uiMessage('sync.checking') : '\u2014');
-    const unavailable = !exportsFresh ? uiMessage('sync.reconnecting') :
-      blockedText[state.sync_blocked] || '';
-    text('availability', unavailable);
+    text('last', state.last_sync_epoch ? syncStorageTimestamp(state.last_sync_epoch) : '\u2014');
+    const count = (key, value, known) => text(key, known && Number.isFinite(value)
+      ? uiMessage('common.value', {value}) : '\u2014');
+    const run = state.last_run;
+    count('uploaded', run?.files_uploaded, run?.available);
+    count('skipped', run?.files_skipped, run?.available);
+    count('attached', run?.files_attached, run?.available);
+    const backlogKnown = ['ready','confirming'].includes(state.backlog_state);
+    count('pending-files', state.backlog_files, backlogKnown);
+    count('pending-sessions', state.backlog_sessions, backlogKnown);
+    count('waiting-sessions', state.backlog_waiting, backlogKnown);
+    text('run-result', run?.available ? uiMessage('common.value', {value:{items:[
+      uiMessage(run.success ? 'sync.runSucceeded' : 'sync.runFailed'),
+      ...(run.finished_epoch ? [syncStorageTimestamp(run.finished_epoch)] : []),
+      ...(id === 'sleephq' && run.import_id ? [uiMessage(run.import_status ? 'sync.importStatus' : 'sync.import', {
+        id:String(run.import_id), status:uiMessage('sync.importState.' + run.import_status, {}, run.import_status)})] : []),
+      ...(run.error ? [uiError(run.error)] : [])], separator:' / '}}) : '\u2014');
+    card.querySelector('[data-sync="run-result"]').dataset.error = String(!!run?.available && !run.success);
+    const requestError = syncRequestErrors.get(id);
+    const checkError = requestError?.check ? requestError.error :
+      state.check_state === 'failed' ? state.check_error : null;
+    text('check-result', checkError ? uiMessage('sync.checkFailedReason', {reason:uiError(checkError)}) :
+      state.check_state === 'passed' ? uiMessage('sync.checkPassed') :
+      state.check_state === 'failed' ? uiMessage('sync.checkFailed') :
+      ['pending','working'].includes(state.check_state) ? uiMessage('sync.checking') : '');
+    card.querySelector('[data-sync="check-result"]').dataset.error = String(!!checkError || state.check_state === 'failed');
     card.querySelector('[data-sync="start"]').disabled = !exportsFresh || !!state.sync_blocked || syncRequests.size > 0;
     card.querySelector('[data-sync="check"]').disabled = !exportsFresh || !!state.check_blocked || syncRequests.size > 0;
   }
@@ -4218,7 +4307,7 @@ async function loadStorage(path = storagePath, offset = storageOffset) {
       uiText(detail, uiMessage('common.value', {value:{items:[entry.directory ? uiMessage('storage.directory') :
         uiMessage('common.unit', {value:{number:entry.size / 1024 ** unit, max:unit ? 1 : 0, min:unit ? 1 : 0},
           unit:['B', 'KiB', 'MiB'][unit]}),
-        ...(entry.modified ? [{date:entry.modified * 1000, options:SYNC_STORAGE_DATE_OPTIONS}] : [])], separator:' | '}}));
+        ...(entry.modified ? [syncStorageTimestamp(entry.modified)] : [])], separator:' | '}}));
       content.append(link, detail);
       const action = document.createElement('button'); action.className = 'btn btn-accent storage-download';
       action.textContent = '\u2193';
@@ -4317,29 +4406,41 @@ async function storageDelete() {
 }
 
 function applyExports(data) {
+  const wasFresh = exportsFresh;
   if (!exportsSnapshot) exportsSnapshot = {};
   for (const [key, value] of Object.entries(data)) {
-    if (key === 'smb' || key === 'sleephq')
-      exportsSnapshot[key] = {...exportsSnapshot[key], ...value};
-    else exportsSnapshot[key] = value;
+    if (key === 'smb' || key === 'sleephq') {
+      const previous = exportsSnapshot[key] || {};
+      const failed = syncRequestErrors.get(key);
+      const progressed = failed?.check
+        ? value.check_state !== undefined && value.check_state !== previous.check_state &&
+          ['pending','working','passed'].includes(value.check_state)
+        : (value.state !== previous.state && ['pending','working'].includes(value.state)) ||
+          (value.last_sync_epoch > 0 && value.last_sync_epoch !== previous.last_sync_epoch);
+      if (progressed) syncRequestErrors.delete(key);
+      exportsSnapshot[key] = {...previous, ...value};
+      for (const group of ['activity', 'last_run']) {
+        if (value[group] && typeof value[group] === 'object')
+          exportsSnapshot[key][group] = {...previous[group], ...value[group]};
+      }
+    } else exportsSnapshot[key] = value;
   }
   exportsFresh = true;
-  renderExports(data);
+  renderExports(wasFresh ? data : null);
 }
 
 async function startSync(id, check = false) {
   if (syncRequests.size) return;
   syncRequests.add(id);
+  syncRequestErrors.delete(id);
   renderExports();
-  const message = document.getElementById(id + 'SyncMsg');
   try {
     const response = await api('/api/export/' + id + (check ? '?action=check' : ''), {method: 'POST'});
     if (!response) return;
     const data = await response.json();
     if (!response.ok || !data.ok) throw data.error ? new Error(data.error) : uiFailure('sync.requestFailed');
-    showMsg(message, uiMessage(check ? 'sync.checkQueued' : 'sync.queued'), 'ok');
   } catch(e) {
-    showMsg(message, uiError(e), 'err');
+    syncRequestErrors.set(id, {error:e, check});
   } finally {
     syncRequests.delete(id);
     renderExports();

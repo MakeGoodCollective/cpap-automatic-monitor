@@ -1093,7 +1093,8 @@ static void handlePostConfig(AsyncWebServerRequest *request) {
 
 enum ExportFields : uint8_t {
     EXPORT_RUN = 1, EXPORT_CHECK = 2, EXPORT_BACKLOG = 4,
-    EXPORT_META = 8, EXPORT_ACTIONS = 16, EXPORT_ALL = 31,
+    EXPORT_META = 8, EXPORT_ACTIONS = 16, EXPORT_ACTIVITY = 32,
+    EXPORT_LAST_RUN = 64, EXPORT_ALL = 127,
 };
 
 #if AB_STORAGE_HAS_SDCARD
@@ -1110,7 +1111,6 @@ static void appendExportStatus(String &json, const T &status, bool enabled,
         jsonAddUInt32(json, "files_seen", status.files_seen);
         jsonAddString(json, "current_day", status.current_day);
         jsonAddBool(json, "backlog_known", status.backlog.known);
-        jsonAddUInt32(json, "backlog_sessions", status.backlog.sessions);
         char bytes[48];
         snprintf(bytes, sizeof(bytes), ",\"bytes_uploaded\":%llu",
                  static_cast<unsigned long long>(status.bytes_uploaded));
@@ -1129,6 +1129,31 @@ static void appendExportStatus(String &json, const T &status, bool enabled,
         jsonAddUInt32(json, "last_sync_epoch", status.last_sync_epoch);
         jsonAddString(json, "error", status.last_error);
     }
+    if (fields & EXPORT_ACTIVITY) {
+        json += ",\"activity\":{";
+        jsonAddString(json, "phase", status.activity.phase, false);
+        jsonAddString(json, "wait", status.activity.wait);
+        jsonAddString(json, "file", status.activity.file);
+        json += '}';
+    }
+    if (fields & EXPORT_LAST_RUN) {
+        const auto &last = status.last_run;
+        json += ",\"last_run\":{";
+        jsonAddBool(json, "available", last.available, false);
+        jsonAddBool(json, "success", last.success);
+        jsonAddUInt32(json, "finished_epoch", last.finished_epoch);
+        jsonAddUInt32(json, "files_uploaded", last.files_uploaded);
+        jsonAddUInt32(json, "files_skipped", last.files_skipped);
+        jsonAddUInt32(json, "files_attached", last.files_attached);
+        char bytes[48];
+        snprintf(bytes, sizeof(bytes), ",\"bytes_uploaded\":%llu",
+                 static_cast<unsigned long long>(last.bytes_uploaded));
+        json += bytes;
+        jsonAddUInt32(json, "import_id", last.import_id);
+        jsonAddString(json, "import_status", last.import_status);
+        jsonAddString(json, "error", last.error);
+        json += '}';
+    }
     if (fields & EXPORT_CHECK) {
         jsonAddString(json, "check_state", ExportSync::check_state_name(status.check.state));
         jsonAddString(json, "check_error", status.check.error);
@@ -1136,6 +1161,7 @@ static void appendExportStatus(String &json, const T &status, bool enabled,
     if (fields & EXPORT_BACKLOG) {
         jsonAddString(json, "backlog_state", ExportSync::backlog_state(status.backlog, smb));
         jsonAddUInt32(json, "backlog_files", status.backlog.files);
+        jsonAddUInt32(json, "backlog_sessions", status.backlog.sessions);
         jsonAddUInt32(json, "backlog_waiting", status.backlog.waiting_sessions);
         jsonAddString(json, "backlog_error", status.backlog.error);
     }
@@ -1160,9 +1186,21 @@ static uint8_t exportChanges(const T &a, const T &b) {
         a.files_uploaded != b.files_uploaded || a.files_skipped != b.files_skipped ||
         a.last_sync_epoch != b.last_sync_epoch ||
         strcmp(a.last_error, b.last_error)) fields |= EXPORT_RUN;
+    if (strcmp(a.activity.phase, b.activity.phase) ||
+        strcmp(a.activity.wait, b.activity.wait) || strcmp(a.activity.file, b.activity.file))
+        fields |= EXPORT_ACTIVITY;
+    const auto &x = a.last_run;
+    const auto &y = b.last_run;
+    if (x.available != y.available || x.success != y.success ||
+        x.finished_epoch != y.finished_epoch || x.files_uploaded != y.files_uploaded ||
+        x.files_skipped != y.files_skipped || x.files_attached != y.files_attached ||
+        x.bytes_uploaded != y.bytes_uploaded || x.import_id != y.import_id ||
+        strcmp(x.import_status, y.import_status) || strcmp(x.error, y.error))
+        fields |= EXPORT_LAST_RUN;
     if (a.check.state != b.check.state || strcmp(a.check.error, b.check.error))
         fields |= EXPORT_CHECK;
     if (a.backlog.files != b.backlog.files ||
+        a.backlog.sessions != b.backlog.sessions ||
         a.backlog.waiting_sessions != b.backlog.waiting_sessions ||
         strcmp(a.backlog.error, b.backlog.error)) fields |= EXPORT_BACKLOG;
     return fields;

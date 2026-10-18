@@ -701,6 +701,7 @@ static bool hash_file(SdStorage::Session &storage, const char *day, DayFile &fil
                       char *error, size_t error_size, HashCursor *saved = nullptr) {
     char path[128];
     file_path(day, file, path, sizeof(path));
+    copy_cstr(progress.file, sizeof(progress.file), path);
     SdStorage::Reader reader;
     if (!reader.open(storage, path)) {
         snprintf(error, error_size, "local_missing:%s", path);
@@ -1224,6 +1225,17 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
                   char *error, size_t error_size, BacklogChanges *changes) {
     refresh_pending_ = false;
     if (changes) *changes = {};
+    // Keep same-day resume context, but never attribute preparation to the previous day.
+    if (!day_ || !day || strcmp(day_->day, day)) {
+        progress.import_id = 0;
+        progress.import_status[0] = 0;
+        progress.file[0] = 0;
+        copy_cstr(progress.current_day, sizeof(progress.current_day), day ? day : "");
+        progress.checkpoint_step = 0;
+        progress.checkpoint_units = 0;
+        progress.phase = "day_inventory";
+        publish(progress, callback, context);
+    }
     if (!operation_allows(operation, error, error_size)) return false;
     StatePaths paths, legacy_paths;
     if (!configured(config_) || !day_paths(config_, day, paths) ||
@@ -1446,6 +1458,7 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
             const bool counted = f.counted;
             if (!f.seen) ++progress.files_seen;
             f.seen = true;
+            file_path(day, f, progress.file, sizeof(progress.file));
             checkpoint(progress, WorkStage::Files, "attach", (i + 1) * 4);
             if (f.present) {
                 if (!counted) ++progress.files_skipped;
@@ -1456,7 +1469,6 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
             }
             char remote_path[32];
             snprintf(remote_path, sizeof(remote_path), f.root ? "./" : "./DATALOG/%s/", day);
-            file_path(day, f, progress.file, sizeof(progress.file));
             progress.phase = "attach";
             publish(progress, callback, context);
             aircannect::SleepHqAttachRequest attach;

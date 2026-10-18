@@ -147,6 +147,7 @@ static bool backlog_files_changed = false;
 static uint32_t backlog_smb_revision = UINT32_MAX;
 static uint32_t backlog_shq_revision = UINT32_MAX;
 static uint32_t backlog_catalog_generation = UINT32_MAX;
+static uint32_t backlog_files_revision = UINT32_MAX;
 enum : uint8_t { SMB_VALID = 1, SHQ_VALID = 2, WAITING = 4, SHQ_PENDING = 8 };
 struct BacklogEntry {
     uint8_t smb_files;
@@ -176,12 +177,17 @@ static SleepHqRetry sleephq_retry = {};
 // Worker-owned diagnostics survive cooperative retries without retaining I/O.
 static ExportProgress export_progress[size_t(Engine::Count)];
 
+static void publish_activity(Engine engine, const char *phase, const char *wait,
+                             const char *file = nullptr);
+
 static void note_export_progress(ExportProgress &progress, const char *phase,
                                  const char *reason, bool paused = false,
-                                 const aircannect::JobProgressPoint *point = nullptr) {
+                                 const aircannect::JobProgressPoint *point = nullptr,
+                                 const char *file = nullptr) {
     if (!progress.active) return;
     progress.phase = phase;
     progress.reason = reason;
+    publish_activity(progress.engine, phase, reason, file);
     auto event = point ? progress.watch.observe(millis(), *point, paused)
                        : progress.watch.check(millis(), paused);
     using Event = aircannect::JobProgressWatch::Event;
@@ -276,13 +282,15 @@ static void check_export_progress(RunContext &run, const char *wait_reason = nul
     note_export_progress(*run.progress, source && source->phase ? source->phase : run.progress->phase,
         !standby ? "standby" : !local ? "usb" : wait_reason ? wait_reason :
         !network ? "network" : readers ? "sd_reader_wait" : run.storage_yielded ? "storage_busy" : "working",
-        !standby || !local || readers || (!network && !actual_sd_wait), source ? &point : nullptr);
+        !standby || !local || readers || (!network && !actual_sd_wait), source ? &point : nullptr,
+        source ? source->file : nullptr);
 }
 
-static void advance_export(RunContext &run, uint64_t units, const char *phase) {
+static void advance_export(RunContext &run, uint64_t units, const char *phase,
+                            const char *file = nullptr) {
     if (!run.progress) return;
     const aircannect::JobProgressPoint point{run.progress_step, units};
-    note_export_progress(*run.progress, phase, "working", false, &point);
+    note_export_progress(*run.progress, phase, "working", false, &point, file);
 }
 
 static void publish_change() {
@@ -338,9 +346,26 @@ static void copy_text(char *dst, size_t capacity, const char *src) {
     dst[capacity - 1] = 0;
 }
 
+static void publish_activity(Engine engine, const char *phase, const char *wait,
+                             const char *file) {
+    auto &activity = engine == Engine::Smb ? status.activity : sleephq_status.activity;
+    auto *mux = engine == Engine::Smb ? &status_mux : &sleephq_status_mux;
+    const bool file_phase = !strcmp(phase, "upload") || !strcmp(phase, "attach") ||
+        !strcmp(phase, "hash") || !strcmp(phase, "root_inventory") ||
+        !strcmp(phase, "file_inventory") || !strcmp(phase, "file_complete");
+    portENTER_CRITICAL(mux);
+    copy_text(activity.phase, sizeof(activity.phase), phase);
+    copy_text(activity.wait, sizeof(activity.wait), wait);
+    if (!file_phase) activity.file[0] = 0;
+    else if (file) copy_text(activity.file, sizeof(activity.file), file);
+    portEXIT_CRITICAL(mux);
+    publish_change();
+}
+
 static void set_state(State state, const char *error = nullptr) {
     portENTER_CRITICAL(&status_mux);
     __atomic_store_n(&status.state, state, __ATOMIC_RELEASE);
+    if (state == State::Pending) status.activity = {};
     if (error) copy_text(status.last_error, sizeof(status.last_error), error);
     else if (state != State::Error) status.last_error[0] = 0;
     portEXIT_CRITICAL(&status_mux);
@@ -350,6 +375,7 @@ static void set_state(State state, const char *error = nullptr) {
 static void set_sleephq_state(State state, const char *error = nullptr) {
     portENTER_CRITICAL(&sleephq_status_mux);
     __atomic_store_n(&sleephq_status.state, state, __ATOMIC_RELEASE);
+    if (state == State::Pending) sleephq_status.activity = {};
     if (error) {
         copy_text(sleephq_status.last_error,
                   sizeof(sleephq_status.last_error), error);
@@ -495,6 +521,7 @@ struct SmbSource {
 
 static bool wait_resolve(StorageSmbClient &client, RunContext &run,
                          char *error, size_t error_size) {
+    advance_export(run, 0, "resolve");
     SmbRequestScope request_scope(run);
     const uint32_t started = millis();
     while (true) {
@@ -517,6 +544,7 @@ static bool wait_resolve(StorageSmbClient &client, RunContext &run,
 
 static bool wait_connect(StorageSmbClient &client, RunContext &run,
                          char *error, size_t error_size) {
+    advance_export(run, 0, "connect");
     SmbRequestScope request_scope(run);
     while (true) {
         const StorageSmbOperationResult result =
@@ -727,6 +755,7 @@ static bool read_root_state(const SmbConfig &config, const char *path,
                              uint8_t *buffer, size_t buffer_size,
                              RootFileState &out, char *error, size_t error_size,
                              RunContext &run) {
+    advance_export(run, 0, "root_inventory", path);
     for (;;) {
         SmbSource source{path, true};
         out.confirmed = false;
@@ -756,7 +785,7 @@ static bool read_root_state(const SmbConfig &config, const char *path,
             crc = crc32_ieee_update(crc, buffer, wanted);
             remaining -= wanted;
             source.offset += wanted;
-            advance_export(run, size - remaining, "root_inventory");
+            advance_export(run, size - remaining, "root_inventory", path);
         }
         input.close();
         if (changed) continue;
@@ -801,7 +830,7 @@ static bool sync_smb_file(StorageSmbClient &client, const char *local_path,
             if (!root->exists) return true;
         }
         source = SmbSource{local_path, root != nullptr};
-        advance_export(run, 0, "file_inventory");
+        advance_export(run, 0, "file_inventory", local_path);
         SdStorage::Reader input;
         if (!input.open(storage, local_path)) {
             snprintf(error, error_size, "local_open:%s", local_path);
@@ -847,6 +876,7 @@ static bool sync_smb_file(StorageSmbClient &client, const char *local_path,
             copy_text(error, error_size, "state_marker_remove");
             return false;
         }
+        advance_export(run, 0, "upload", local_path);
         if (!wait_open(client, remote, run, error, error_size)) {
             input.close();
             return false;
@@ -872,7 +902,7 @@ static bool sync_smb_file(StorageSmbClient &client, const char *local_path,
             sent += read;
             source.offset = sent;
             run.operation.note_progress(millis());
-            advance_export(run, sent, "upload");
+            advance_export(run, sent, "upload", local_path);
             taskYIELD();
         }
         input.close();
@@ -968,15 +998,45 @@ static bool snapshot_smb_config(SmbConfig &out,
     return true;
 }
 
-static bool run_smb(const Request &request, RunContext &run) {
-    char error[64] = {};
-    SmbConfig config = {};
-    if (!snapshot_smb_config(config, error, sizeof(error))) {
-        set_state(error[0] ? State::Error : State::Disabled,
-                  error[0] ? error : nullptr);
-        return !error[0];
+template <typename T>
+static void capture_run_outcome(RunOutcome &finished, const T &result,
+                                bool success, uint32_t epoch) {
+    finished = {};
+    finished.available = true;
+    finished.success = success;
+    finished.finished_epoch = epoch;
+    finished.files_uploaded = result.files_uploaded;
+    finished.files_skipped = result.files_skipped;
+    finished.bytes_uploaded = result.bytes_uploaded;
+    if (!success) copy_text(finished.error, sizeof(finished.error), result.last_error);
+    if constexpr (std::is_same<T, SleepHqStatus>::value) {
+        finished.files_attached = result.files_attached;
+        finished.import_id = result.import_id;
+        copy_text(finished.import_status, sizeof(finished.import_status), result.import_status);
     }
-    set_state(State::Working);
+}
+
+static Backlog completed_backlog(const RunContext &run, const EdfCatalog::Status &catalog,
+                                 uint32_t files_revision, uint32_t waiting_sessions) {
+    EdfCatalog::Status current;
+    EdfCatalog::get_status(current);
+    if (!current.ready || current.generation != catalog.generation ||
+        SdStorage::files_revision() != files_revision || run_interrupted(run)) return {};
+
+    Backlog completed = {};
+    completed.known = true;
+    completed.waiting_sessions = waiting_sessions;
+    completed.config_revision = run.config_revision;
+    completed.catalog_generation = catalog.generation;
+    completed.files_revision = files_revision;
+    // The next refresh must read the completed markers, not prior queue counts.
+    const uint8_t mask = run.section == Config::Section::Smb ? SMB_VALID : SHQ_VALID;
+    for (uint32_t i = 0; i < backlog_entry_count; ++i)
+        backlog_entries[i].flags &= ~mask;
+    return completed;
+}
+
+static bool run_smb(const Request &request, RunContext &run) {
     portENTER_CRITICAL(&status_mux);
     status.files_seen = 0;
     status.files_uploaded = 0;
@@ -988,6 +1048,17 @@ static bool run_smb(const Request &request, RunContext &run) {
     portEXIT_CRITICAL(&status_mux);
     publish_change();
 
+    char error[64] = {};
+    SmbConfig config = {};
+    if (!snapshot_smb_config(config, error, sizeof(error))) {
+        set_state(error[0] ? State::Error : State::Disabled,
+                  error[0] ? error : nullptr);
+        return !error[0];
+    }
+    set_state(State::Working);
+    advance_export(run, 0, "catalog");
+
+    const uint32_t files_revision = SdStorage::files_revision();
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
     if (!catalog.ready) {
@@ -1020,6 +1091,7 @@ static bool run_smb(const Request &request, RunContext &run) {
                    wait_connect(client, run, error, sizeof(error));
     if (success) run.operation.note_progress(millis());
 
+    uint32_t waiting_sessions = 0;
     if (success) {
         for (uint32_t i = catalog.entries; success && i > 0; i--) {
             SmbSource checkpoint{nullptr, false};
@@ -1036,7 +1108,11 @@ static bool run_smb(const Request &request, RunContext &run) {
                 break;
             }
             advance_export(run, 0, "catalog");
-            if (!entry.recording_ready() || state_marker_exists(config, entry)) continue;
+            if (!entry.recording_ready()) {
+                ++waiting_sessions;
+                continue;
+            }
+            if (state_marker_exists(config, entry)) continue;
             invalidate_backlog_entry(i - 1, SMB_VALID);
             portENTER_CRITICAL(&status_mux);
             copy_text(status.current_day, sizeof(status.current_day),
@@ -1067,16 +1143,21 @@ static bool run_smb(const Request &request, RunContext &run) {
         return false;
     }
 
+    const Backlog completed = completed_backlog(run, catalog, files_revision, waiting_sessions);
+    const uint32_t epoch = static_cast<uint32_t>(time(nullptr));
     portENTER_CRITICAL(&status_mux);
-    status.last_sync_epoch = static_cast<uint32_t>(time(nullptr));
+    status.last_sync_epoch = epoch;
     status.current_day[0] = 0;
+    status.backlog = completed;
+    capture_run_outcome(status.last_run, status, true, epoch);
+    __atomic_store_n(&status.state, State::Idle, __ATOMIC_RELEASE);
+    status.last_error[0] = 0;
     portEXIT_CRITICAL(&status_mux);
     roots_pending = 0;
-    roots_cached = true;
+    roots_cached = completed.known;
     roots_endpoint = endpoint_hash(config);
     roots_catalog_generation = catalog.generation;
     publish_change();
-    set_state(State::Idle);
     return true;
 }
 
@@ -1176,6 +1257,21 @@ static void sleephq_failed(const char *error, const SleepHqSync::Progress &progr
 }
 
 static bool run_sleephq(const Request &request, RunContext &run) {
+    portENTER_CRITICAL(&sleephq_status_mux);
+    sleephq_status.files_seen = 0;
+    sleephq_status.files_uploaded = 0;
+    sleephq_status.files_skipped = 0;
+    sleephq_status.files_attached = 0;
+    sleephq_status.bytes_uploaded = 0;
+    sleephq_status.import_id = 0;
+    sleephq_status.import_status[0] = 0;
+    copy_text(sleephq_status.current_day,
+              sizeof(sleephq_status.current_day),
+              request.kind == RequestKind::PostTherapy
+                  ? request.entry.therapy_day : "");
+    portEXIT_CRITICAL(&sleephq_status_mux);
+    publish_change();
+
     const uint32_t config_revision = run.config_revision;
     if (request.kind == RequestKind::Manual ||
         sleephq_retry.config_revision != config_revision)
@@ -1198,21 +1294,9 @@ static bool run_sleephq(const Request &request, RunContext &run) {
     }
 
     set_sleephq_state(State::Working);
-    portENTER_CRITICAL(&sleephq_status_mux);
-    sleephq_status.files_seen = 0;
-    sleephq_status.files_uploaded = 0;
-    sleephq_status.files_skipped = 0;
-    sleephq_status.files_attached = 0;
-    sleephq_status.bytes_uploaded = 0;
-    sleephq_status.import_id = 0;
-    sleephq_status.import_status[0] = 0;
-    copy_text(sleephq_status.current_day,
-              sizeof(sleephq_status.current_day),
-              request.kind == RequestKind::PostTherapy
-                  ? request.entry.therapy_day : "");
-    portEXIT_CRITICAL(&sleephq_status_mux);
-    publish_change();
+    advance_export(run, 0, "catalog");
 
+    const uint32_t files_revision = SdStorage::files_revision();
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
     if (!catalog.ready) {
@@ -1250,7 +1334,7 @@ static bool run_sleephq(const Request &request, RunContext &run) {
     });
     bool backlog_changed = changes.other_entries;
     aircannect::LargeTextBuffer visited(65536, 4096);
-    uint32_t selected_days = 0;
+    uint32_t selected_days = 0, waiting_sessions = 0;
     for (uint32_t i = catalog.entries; success && i > 0; i--) {
         if (!step([&] { return !run_aborted(&run); })) {
             success = false;
@@ -1262,7 +1346,10 @@ static bool run_sleephq(const Request &request, RunContext &run) {
             success = false;
             break;
         }
-        if (!entry.recording_ready()) continue;
+        if (!entry.recording_ready()) {
+            ++waiting_sessions;
+            continue;
+        }
         if (request.from_day[0] && (strcmp(entry.therapy_day, request.from_day) < 0 ||
                                    strcmp(entry.therapy_day, request.to_day) > 0)) continue;
         bool seen = false;
@@ -1292,7 +1379,11 @@ static bool run_sleephq(const Request &request, RunContext &run) {
     if (backlog_changed) {
         for (uint32_t n = 0; n < backlog_entry_count; ++n)
             backlog_entries[n].flags &= ~SHQ_VALID;
+        portENTER_CRITICAL(&sleephq_status_mux);
+        sleephq_status.backlog = {};
+        portEXIT_CRITICAL(&sleephq_status_mux);
         request_backlog_refresh();
+        publish_change();
     }
 
     if (success && request.action == Action::Repair && !selected_days) {
@@ -1308,13 +1399,20 @@ static bool run_sleephq(const Request &request, RunContext &run) {
         return false;
     }
 
+    // A range repair proves only its selected days, never the global queue.
+    const Backlog completed = request.from_day[0] ? Backlog{} :
+        completed_backlog(run, catalog, files_revision, waiting_sessions);
+    const uint32_t epoch = static_cast<uint32_t>(time(nullptr));
     portENTER_CRITICAL(&sleephq_status_mux);
-    sleephq_status.last_sync_epoch = static_cast<uint32_t>(time(nullptr));
+    sleephq_status.last_sync_epoch = epoch;
     sleephq_status.current_day[0] = 0;
+    if (!request.from_day[0]) sleephq_status.backlog = completed;
+    capture_run_outcome(sleephq_status.last_run, sleephq_status, true, epoch);
+    __atomic_store_n(&sleephq_status.state, State::Idle, __ATOMIC_RELEASE);
+    sleephq_status.last_error[0] = 0;
     portEXIT_CRITICAL(&sleephq_status_mux);
     publish_change();
     reset_sleephq_retry(config_revision);
-    set_sleephq_state(State::Idle);
     run.sleephq_progress = nullptr;
     return true;
 }
@@ -1391,18 +1489,33 @@ static void run_check(const Request &request) {
 static void log_backlog_result(const char *destination, const Backlog &previous,
                                const Backlog &current) {
     const auto failed = [](const Backlog &value) {
-        return !value.known && value.error[0] &&
+        return value.error[0] &&
             strcmp(value.error, "endpoint_missing") && strcmp(value.error, "credentials_missing");
     };
     if (failed(current) && (!failed(previous) || strcmp(previous.error, current.error)))
         Log::logf(CAT_EXPORT, LOG_WARN, "[%s] Backlog failed generation=%lu: %s\n",
             destination, (unsigned long)current.catalog_generation, current.error);
-    else if (current.known && failed(previous))
+    else if (current.known && !failed(current) && failed(previous))
         Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Backlog recovered files=%lu\n",
             destination, (unsigned long)current.files);
 }
 
+static void retain_backlog_counts(Backlog &current, const Backlog &previous) {
+    if (current.known || !previous.known ||
+        current.files_revision != previous.files_revision ||
+        current.catalog_generation != previous.catalog_generation ||
+        current.config_revision != previous.config_revision) return;
+
+    // A failed redundant scan does not refute the owner's same-source proof.
+    // Keep the scan error independent of the still-known queue counts.
+    current.known = true;
+    current.files = previous.files;
+    current.sessions = previous.sessions;
+    current.waiting_sessions = previous.waiting_sessions;
+}
+
 static void refresh_backlog() {
+    const uint32_t files_revision = SdStorage::files_revision();
     EdfCatalog::Changes changes;
     const bool incremental = EdfCatalog::changes_since(backlog_catalog_generation, changes);
     const auto &catalog = changes.catalog;
@@ -1410,6 +1523,7 @@ static void refresh_backlog() {
     const uint32_t shq_revision = Config::revision(Config::Section::SleepHq);
     if (!__atomic_load_n(&backlog_refresh, __ATOMIC_ACQUIRE) &&
         catalog.generation == backlog_catalog_generation &&
+        files_revision == backlog_files_revision &&
         smb_revision == backlog_smb_revision && shq_revision == backlog_shq_revision) return;
     if (uxQueueMessagesWaiting(request_queue) || !catalog.ready ||
         !AirSenseState::device_standby() || !storage.begin()) return;
@@ -1418,13 +1532,15 @@ static void refresh_backlog() {
     run.section = Config::Section::Smb;
     run.config_revision = smb_revision;
     __atomic_store_n(&backlog_refresh, false, __ATOMIC_RELEASE);
-    const bool files_changed = __atomic_exchange_n(&backlog_files_changed, false, __ATOMIC_ACQ_REL);
+    const bool files_changed = __atomic_exchange_n(&backlog_files_changed, false, __ATOMIC_ACQ_REL) ||
+        files_revision != backlog_files_revision;
     if (files_changed) roots_cached = false;
 
     Backlog smb = {}, shq = {};
     smb.config_revision = smb_revision;
     shq.config_revision = shq_revision;
     smb.catalog_generation = shq.catalog_generation = catalog.generation;
+    smb.files_revision = shq.files_revision = files_revision;
     SmbConfig smb_config = {};
     SleepHqSync::Config shq_config = {};
     smb.known = snapshot_smb_config(smb_config, smb.error, sizeof(smb.error), false);
@@ -1455,6 +1571,7 @@ static void refresh_backlog() {
     }
     if (cache_ready) {
         backlog_catalog_generation = catalog.generation;
+        backlog_files_revision = files_revision;
         backlog_smb_revision = smb_revision;
         backlog_shq_revision = shq_revision;
     } else {
@@ -1540,16 +1657,21 @@ static void refresh_backlog() {
         }
     }
     if (smb.known) smb.files += roots_pending;
-    if (storage.valid() && run.storage_yielded) {
-        storage.end();
-        __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
-        return;
-    }
-    if (!storage.valid() || Config::revision(Config::Section::Smb) != smb_revision ||
+    EdfCatalog::Status current;
+    EdfCatalog::get_status(current);
+    if (!storage.valid() || !current.ready || current.generation != catalog.generation ||
+        SdStorage::files_revision() != files_revision ||
+        Config::revision(Config::Section::Smb) != smb_revision ||
         Config::revision(Config::Section::SleepHq) != shq_revision) {
         // An interrupted marker read is not evidence that the marker is absent.
         for (uint32_t i = 0; i < backlog_entry_count; ++i)
             backlog_entries[i].flags = 0;
+        roots_cached = false;
+        storage.end();
+        __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
+        return;
+    }
+    if (run.storage_yielded) {
         storage.end();
         __atomic_store_n(&backlog_refresh, true, __ATOMIC_RELEASE);
         return;
@@ -1558,14 +1680,28 @@ static void refresh_backlog() {
     Backlog previous_smb, previous_shq;
     portENTER_CRITICAL(&status_mux);
     previous_smb = status.backlog;
+    retain_backlog_counts(smb, previous_smb);
     status.backlog = smb;
     portEXIT_CRITICAL(&status_mux);
     portENTER_CRITICAL(&sleephq_status_mux);
     previous_shq = sleephq_status.backlog;
+    retain_backlog_counts(shq, previous_shq);
     sleephq_status.backlog = shq;
     portEXIT_CRITICAL(&sleephq_status_mux);
     log_backlog_result("SMB", previous_smb, smb);
     log_backlog_result("SleepHQ", previous_shq, shq);
+    publish_change();
+}
+
+template <typename T>
+static void publish_run_outcome(const T &result, bool success) {
+    constexpr bool shq = std::is_same<T, SleepHqStatus>::value;
+    auto *mux = shq ? &sleephq_status_mux : &status_mux;
+    auto &finished = shq ? sleephq_status.last_run : status.last_run;
+    const uint32_t epoch = static_cast<uint32_t>(time(nullptr));
+    portENTER_CRITICAL(mux);
+    capture_run_outcome(finished, result, success, epoch);
+    portEXIT_CRITICAL(mux);
     publish_change();
 }
 
@@ -1599,6 +1735,8 @@ static RunResult run_logged(const Request &request,
     check_export_progress(context);
     T result;
     snapshot(result);
+    if (!success && !run_interrupted(context) && result.state == State::Error)
+        publish_run_outcome(result, false);
     if (success && result.state != State::Disabled) {
         context.progress_step = UINT64_MAX;
         advance_export(context, 0, "complete");
@@ -1920,7 +2058,7 @@ static void validate_backlog(Backlog &out, Config::Section section) {
     if (!catalog.ready || !SdStorage::mounted() ||
         out.config_revision != Config::revision(section) ||
         out.catalog_generation != catalog.generation ||
-        __atomic_load_n(&backlog_refresh, __ATOMIC_ACQUIRE)) out = {};
+        out.files_revision != SdStorage::files_revision()) out = {};
 }
 
 uint32_t revision() {
@@ -1929,9 +2067,10 @@ uint32_t revision() {
 
 PublicationStamp publication_stamp() {
     return {revision(), Config::revision(Config::Section::Smb),
-        Config::revision(Config::Section::SleepHq), EdfCatalog::revision(),
+        Config::revision(Config::Section::SleepHq), EdfCatalog::revision(), SdStorage::files_revision(),
         WiFiSetup::revision(), Arbiter::get_state(), AirSenseState::rop(),
-        SdStorage::mounted(), __atomic_load_n(&backlog_refresh, __ATOMIC_ACQUIRE),
+        SdStorage::mounted(), SdStorage::local_access_allowed(),
+        __atomic_load_n(&backlog_refresh, __ATOMIC_ACQUIRE),
         __atomic_load_n(&check_pending, __ATOMIC_ACQUIRE)};
 }
 
@@ -1977,6 +2116,7 @@ const char *action_blocked(Engine id, Action action) {
     if (!engine->supports(action)) return "unsupported_action";
     const auto &cfg = Config::get();
     if (action != Action::Check && !(cfg.*engine->enabled)) return "disabled";
+    if (!SdStorage::local_access_allowed()) return "usb_storage_active";
     if (!SdStorage::mounted()) return "sd_unavailable";
     if (!engine->configured()) return "not_configured";
     if (!AirSenseState::device_standby()) return "not_idle";
