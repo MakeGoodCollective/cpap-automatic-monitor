@@ -2873,6 +2873,7 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
     if (success && SdStorage::try_acquire(true)) {
         uint32_t revision = 0;
         bool catalog_changed = false;
+        bool pending_resolved = false;
         if (summary_ready && record) {
             summary_ready = update_str_file(record, latest, identity, &file_changed);
             if (!summary_ready) trace.result = "publish_failed";
@@ -2921,6 +2922,7 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
             if (storage->exists(path)) {
                 success = storage->remove(path);
                 if (success) {
+                    pending_resolved = true;
                     portENTER_CRITICAL(&status_mux);
                     if (status.pending_str) status.pending_str--;
                     portEXIT_CRITICAL(&status_mux);
@@ -2934,7 +2936,7 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
             SdStorage::notify_files_changed();
             ExportSync::request_backlog_refresh(true);
         }
-        if (summary_ready && record && (catalog_changed || file_changed)) {
+        if (success && summary_ready && (catalog_changed || file_changed || pending_resolved)) {
             summary_export_entry = latest;
             summary_export_pending = true;
         }

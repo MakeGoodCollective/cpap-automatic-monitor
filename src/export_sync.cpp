@@ -198,12 +198,6 @@ static bool request_aborted(const Request &request) {
     return !engine || Config::revision(engine->section) != request.config_revision;
 }
 
-static bool export_ready(const EdfCatalog::Entry &entry) {
-    constexpr uint8_t required = EdfCatalog::ENTRY_LIVE_COMPLETE |
-        EdfCatalog::ENTRY_IDENTIFICATION_READY | EdfCatalog::ENTRY_STR_READY;
-    return (entry.flags & required) == required;
-}
-
 static void invalidate_backlog_entry(uint32_t index, uint8_t mask) {
     if (index < backlog_entry_count) backlog_entries[index].flags &= ~mask;
     request_backlog_refresh();
@@ -762,7 +756,7 @@ static bool run_smb(const Request &request, RunContext &run) {
                 success = false;
                 break;
             }
-            if (!export_ready(entry) || state_marker_exists(config, entry)) continue;
+            if (!entry.recording_ready() || state_marker_exists(config, entry)) continue;
             invalidate_backlog_entry(i - 1, SMB_VALID);
             portENTER_CRITICAL(&status_mux);
             copy_text(status.current_day, sizeof(status.current_day),
@@ -966,7 +960,7 @@ static bool run_sleephq(const Request &request, RunContext &run) {
             success = false;
             break;
         }
-        if (!export_ready(entry)) continue;
+        if (!entry.recording_ready()) continue;
         if (request.from_day[0] && (strcmp(entry.therapy_day, request.from_day) < 0 ||
                                    strcmp(entry.therapy_day, request.to_day) > 0)) continue;
         bool seen = false;
@@ -1174,7 +1168,7 @@ static void refresh_backlog() {
             break;
         }
         if (read_smb || read_shq) {
-            if (export_ready(entry)) cached.flags &= ~WAITING;
+            if (entry.recording_ready()) cached.flags &= ~WAITING;
             else cached.flags |= WAITING;
         }
         if (cached.flags & WAITING) {

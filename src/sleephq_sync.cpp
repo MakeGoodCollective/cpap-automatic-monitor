@@ -690,9 +690,7 @@ static bool snapshot_day(SdStorage::Session &storage, const char *day,
         });
     for (uint32_t i = 0; i < snapshot.count; ++i) {
         const auto &entry = snapshot.entries[i];
-        const uint8_t ready = EdfCatalog::ENTRY_LIVE_COMPLETE |
-            EdfCatalog::ENTRY_IDENTIFICATION_READY | EdfCatalog::ENTRY_STR_READY;
-        if ((entry.flags & ready) != ready) {
+        if (!entry.recording_ready()) {
             set_error(error, error_size, "day_not_ready");
             return false;
         }

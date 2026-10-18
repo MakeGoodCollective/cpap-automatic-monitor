@@ -17,6 +17,12 @@ struct Entry {
     uint8_t flags;
     uint32_t finalized_epoch;
     uint32_t str_revision;
+
+    bool recording_ready() const {
+        constexpr uint8_t required = ENTRY_LIVE_COMPLETE |
+            ENTRY_IDENTIFICATION_READY;
+        return (flags & required) == required;
+    }
 };
 
 struct Status {
