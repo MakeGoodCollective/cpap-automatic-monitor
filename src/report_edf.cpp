@@ -98,17 +98,34 @@ Sample decode_sample(const Signal &signal, const uint8_t *bytes,
 }
 
 bool record_has_valid(const Reader &reader, const Header &header, size_t signal,
-                      uint32_t record, bool &valid) {
-    Sample samples[32];
-    const uint32_t count = header.signals[signal].samples_per_record;
+                      RecordScanPosition &position, bool &valid) {
+    const auto &spec = header.signals[signal];
+    const Signal *pressure = paired_pressure(header, spec);
+    uint8_t bytes[64];
     valid = false;
-    for (uint32_t slot = 0; slot < count;) {
-        const size_t take = count - slot > 32 ? 32 : count - slot;
-        if (!read_samples(reader, header, signal, uint64_t(record) * count + slot,
-                          take, samples)) return false;
-        for (size_t i = 0; i < take; i++)
-            if (samples[i].valid) { valid = true; return true; }
-        slot += take;
+    while (position.slot < spec.samples_per_record) {
+        const size_t remaining = spec.samples_per_record - position.slot;
+        const size_t take = remaining > 32 ? 32 : remaining;
+        const uint64_t base = header.header_bytes + uint64_t(position.record) * header.record_bytes +
+            uint64_t(position.slot) * 2;
+        if (!position.paired_pending) {
+            if (!read_at(reader, base + spec.record_offset, bytes, take * 2)) return false;
+            position.valid_mask = 0;
+            for (size_t i = 0; i < take; ++i)
+                if (decode_sample(spec, bytes + i * 2, nullptr, nullptr).valid)
+                    position.valid_mask |= uint32_t(1) << i;
+            position.paired_pending = pressure != nullptr;
+        }
+        // Keep the accepted channel validity if its paired read must resume.
+        if (pressure) {
+            if (!read_at(reader, base + pressure->record_offset, bytes, take * 2)) return false;
+            for (size_t i = 0; i < take; ++i)
+                if (!decode_sample(*pressure, bytes + i * 2, nullptr, nullptr).valid)
+                    position.valid_mask &= ~(uint32_t(1) << i);
+        }
+        position.paired_pending = false;
+        position.slot += take;
+        if (position.valid_mask) { valid = true; return true; }
     }
     return true;
 }
@@ -318,29 +335,38 @@ bool visit_valid_intervals(const Reader &reader, const Header &header,
 }
 
 bool recorded_bounds(const Reader &reader, const Header &header,
-                     size_t signal, RecordedBounds &out) {
+                     size_t signal, RecordedBounds &out, RecordScanPosition *position) {
     out = RecordedBounds{};
     if (header.signal_count > MAX_SIGNALS || signal >= header.signal_count ||
         header.signals[signal].crc || header.signals[signal].annotation ||
         !header.signals[signal].samples_per_record || header.record_seconds <= 0)
         return false;
-    uint32_t first = 0, end = header.records;
-    bool valid = false;
-    while (first < end) {
-        if (!record_has_valid(reader, header, signal, first, valid)) return false;
-        if (valid) break;
-        first++;
+    RecordScanPosition local;
+    auto &scan = position ? *position : local;
+    using Phase = RecordScanPosition::Phase;
+    while (scan.phase == Phase::Leading || scan.phase == Phase::Trailing) {
+        if (scan.phase == Phase::Leading && scan.record == header.records) {
+            scan.phase = Phase::Empty;
+            break;
+        }
+        bool valid = false;
+        if (!record_has_valid(reader, header, signal, scan, valid)) return false;
+        ++scan.ordinal;
+        scan.slot = 0;
+        if (scan.phase == Phase::Leading) {
+            if (!valid) { ++scan.record; continue; }
+            scan.first = scan.record;
+            scan.phase = scan.record == header.records - 1 ? Phase::Done : Phase::Trailing;
+            scan.record = header.records - 1;
+        } else if (valid || --scan.record == scan.first) {
+            scan.phase = Phase::Done;
+        }
     }
-    if (first == end) return true;
-    while (end > first + 1) {
-        if (!record_has_valid(reader, header, signal, end - 1, valid)) return false;
-        if (valid) break;
-        end--;
-    }
-    out.first_record = first;
-    out.record_count = end - first;
-    out.begin_seconds = header.start_seconds + first * header.record_seconds;
-    out.end_seconds = header.start_seconds + end * header.record_seconds;
+    if (scan.phase == Phase::Empty) return true;
+    out.first_record = scan.first;
+    out.record_count = scan.record - scan.first + 1;
+    out.begin_seconds = header.start_seconds + scan.first * header.record_seconds;
+    out.end_seconds = header.start_seconds + (scan.record + 1) * header.record_seconds;
     out.present = true;
     return true;
 }

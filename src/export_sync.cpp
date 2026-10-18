@@ -22,6 +22,7 @@
 #include "background_operation_control.h"
 #include "crc.h"
 #include "debug_log.h"
+#include "job_progress_watch.h"
 #include "memory_manager.h"
 #include "sd_storage.h"
 #include "sleephq_sync.h"
@@ -70,6 +71,18 @@ struct Request {
     char to_day[9];
 };
 
+struct ExportProgress {
+    aircannect::JobProgressWatch watch;
+    uint32_t generation = 0, config_revision = 0, queued_ms = 0;
+    Engine engine = Engine::Smb;
+    Action action = Action::Sync;
+    char from_day[9] = {}, to_day[9] = {};
+    const char *phase = "admission";
+    const char *reason = "queued";
+    bool active = false;
+    bool queued = false;
+};
+
 struct RunContext {
     uint32_t generation;
     BackgroundOperationControl operation;
@@ -78,6 +91,11 @@ struct RunContext {
     Config::Section section;
     // Reservation expiry cannot undo cancellation already observed by I/O.
     bool storage_yielded;
+    ExportProgress *progress;
+    uint64_t progress_step;
+    const SleepHqSync::Progress *sleephq_progress;
+    const Request *request;
+    bool defer_storage_yield;
 };
 
 enum class RunResult : uint8_t { Finished, Yielded };
@@ -121,7 +139,6 @@ static portMUX_TYPE sleephq_status_mux = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t request_queue = nullptr;
 static TaskHandle_t export_task_handle = nullptr;
 static SdStorage::Session storage;
-static bool storage_demand = false;
 static volatile uint32_t abort_generation = 1;
 static uint32_t status_revision = 0;
 static bool check_pending = false;
@@ -156,6 +173,117 @@ struct SleepHqRetry {
     char to_day[9];
 };
 static SleepHqRetry sleephq_retry = {};
+// Worker-owned diagnostics survive cooperative retries without retaining I/O.
+static ExportProgress export_progress[size_t(Engine::Count)];
+
+static void note_export_progress(ExportProgress &progress, const char *phase,
+                                 const char *reason, bool paused = false,
+                                 const aircannect::JobProgressPoint *point = nullptr) {
+    if (!progress.active) return;
+    progress.phase = phase;
+    progress.reason = reason;
+    auto event = point ? progress.watch.observe(millis(), *point, paused)
+                       : progress.watch.check(millis(), paused);
+    using Event = aircannect::JobProgressWatch::Event;
+    if (event == Event::None) return;
+    Log::logf(CAT_EXPORT, event == Event::Resumed ? LOG_INFO : LOG_WARN,
+        "[%s] Sync %s task=%lu phase=%.20s wait=%.16s idle=%lus tries=%lu\n",
+        engine_name(progress.engine), event == Event::Resumed ? "resumed" : "stalled",
+        (unsigned long)progress.queued_ms,
+        phase, reason, (unsigned long)(progress.watch.notice_ms() / 1000),
+        (unsigned long)progress.watch.attempts());
+}
+
+static ExportProgress &begin_export_progress(const Request &request) {
+    auto &progress = export_progress[size_t(request.engine)];
+    const bool same = progress.active && progress.config_revision == request.config_revision &&
+        progress.action == request.action && !strcmp(progress.from_day, request.from_day) &&
+        !strcmp(progress.to_day, request.to_day) &&
+        (request.kind == RequestKind::Retry ||
+         (progress.generation == request.generation && progress.queued_ms == request.queued_ms));
+    if (!same) {
+        progress = {};
+        progress.active = true;
+        progress.engine = request.engine;
+        progress.generation = request.generation;
+        progress.config_revision = request.config_revision;
+        progress.queued_ms = request.queued_ms;
+        progress.action = request.action;
+        memcpy(progress.from_day, request.from_day, sizeof(progress.from_day));
+        memcpy(progress.to_day, request.to_day, sizeof(progress.to_day));
+        progress.watch.check(millis(), true);
+    }
+    return progress;
+}
+
+static bool select_export_request(const Request &request, const EngineAdapter &engine,
+                                   Request &selected) {
+    if (request.kind == RequestKind::PostTherapy) {
+        if (!(Config::get().*engine.enabled && Config::get().*engine.automatic)) return false;
+    } else if (request.engine != engine.id) return false;
+    selected = request;
+    selected.engine = engine.id;
+    if (request.kind == RequestKind::PostTherapy)
+        selected.config_revision = Config::revision(engine.section);
+    // An automatic trigger cannot replace a retained SleepHQ retry.
+    return engine.id != Engine::SleepHq || selected.kind == RequestKind::Manual ||
+        selected.kind == RequestKind::Retry ||
+        sleephq_retry.config_revision != selected.config_revision ||
+        (!sleephq_retry.pending && !sleephq_retry.blocked);
+}
+
+static void check_waiting_exports() {
+    const bool standby = AirSenseState::device_standby();
+    const bool local = SdStorage::local_access_allowed();
+    const bool network = WiFi.status() == WL_CONNECTED;
+    const bool readers = SdStorage::waiting_for_readers();
+    for (auto &progress : export_progress) {
+        if (!progress.active || !progress.queued) continue;
+        if (progress.config_revision != Config::revision(engine_adapter(progress.engine)->section)) {
+            progress.active = false;
+            continue;
+        }
+        note_export_progress(progress, "admission",
+            !standby ? "standby" : !local ? "usb" : !network ? "network" : readers ? "sd_reader_wait" : "export_queue",
+            !standby || !local || !network || readers);
+    }
+}
+
+static void initialize_export_progress(const Request &request) {
+    for (size_t i = 0; i < size_t(Engine::Count); ++i) {
+        const auto &engine = engines[i];
+        Request selected;
+        if (!select_export_request(request, engine, selected)) continue;
+        begin_export_progress(selected).queued = true;
+    }
+    check_waiting_exports();
+}
+
+static void check_export_progress(RunContext &run, const char *wait_reason = nullptr,
+                                  const SdStorage::IoEvent *io_event = nullptr) {
+    check_waiting_exports();
+    if (!run.progress) return;
+    const bool standby = AirSenseState::device_standby();
+    const bool local = SdStorage::local_access_allowed();
+    const bool network = WiFi.status() == WL_CONNECTED;
+    const bool actual_sd_wait = io_event && *io_event == SdStorage::IoEvent::Waiting;
+    // A queued request's cause is more precise than another reader's wait or
+    // the network state observed while this local SD operation is blocked.
+    const bool readers = io_event ? *io_event == SdStorage::IoEvent::WaitingForReader : SdStorage::waiting_for_readers();
+    aircannect::JobProgressPoint point;
+    const auto *source = run.sleephq_progress;
+    if (source) point = {run.progress_step + source->checkpoint_step, source->checkpoint_units};
+    note_export_progress(*run.progress, source && source->phase ? source->phase : run.progress->phase,
+        !standby ? "standby" : !local ? "usb" : wait_reason ? wait_reason :
+        !network ? "network" : readers ? "sd_reader_wait" : run.storage_yielded ? "storage_busy" : "working",
+        !standby || !local || readers || (!network && !actual_sd_wait), source ? &point : nullptr);
+}
+
+static void advance_export(RunContext &run, uint64_t units, const char *phase) {
+    if (!run.progress) return;
+    const aircannect::JobProgressPoint point{run.progress_step, units};
+    note_export_progress(*run.progress, phase, "working", false, &point);
+}
 
 static void publish_change() {
     __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
@@ -236,6 +364,12 @@ static void settle_request(const Request &request) {
     for (size_t i = 0; i < size_t(Engine::Count); ++i) {
         const auto &engine = engines[i];
         if (request.kind != RequestKind::PostTherapy && request.engine != engine.id) continue;
+        auto &progress = export_progress[i];
+        if (progress.queued && progress.queued_ms == request.queued_ms &&
+            progress.generation == request.generation) {
+            progress.queued = false;
+            progress.active = false;
+        }
         portENTER_CRITICAL(engine.mux);
         if (*engine.state == State::Pending) *engine.state = State::Idle;
         portEXIT_CRITICAL(engine.mux);
@@ -244,7 +378,7 @@ static void settle_request(const Request &request) {
 }
 
 static void publish_sleephq_progress(
-    void *, const SleepHqSync::Progress &progress) {
+    void *context, const SleepHqSync::Progress &progress) {
     portENTER_CRITICAL(&sleephq_status_mux);
     sleephq_status.files_seen = progress.files_seen;
     sleephq_status.files_uploaded = progress.files_uploaded;
@@ -258,6 +392,11 @@ static void publish_sleephq_progress(
               sizeof(sleephq_status.import_status), progress.import_status);
     portEXIT_CRITICAL(&sleephq_status_mux);
     publish_change();
+    auto *run = static_cast<RunContext *>(context);
+    if (run && run->progress) {
+        run->progress->phase = progress.phase ? progress.phase : "inventory";
+        check_export_progress(*run);
+    }
 }
 
 static bool run_interrupted(const RunContext &run) {
@@ -269,12 +408,94 @@ static bool run_interrupted(const RunContext &run) {
 static bool run_aborted(void *context) {
     RunContext *run = static_cast<RunContext *>(context);
     if (!run) return true;
-    if (!run->network_only && storage.yield_requested()) run->storage_yielded = true;
+    const bool network_request = run->sleephq_progress && run->sleephq_progress->network_request;
+    if (!run->network_only && !run->defer_storage_yield && !network_request && storage.yield_requested())
+        run->storage_yielded = true;
+    check_export_progress(*run);
     return run_interrupted(*run);
 }
 
+static void export_storage_wait(void *context, SdStorage::IoEvent event, const char *path) {
+    if (event == SdStorage::IoEvent::Complete) return;
+    auto &run = *static_cast<RunContext *>(context);
+    check_export_progress(run, event == SdStorage::IoEvent::WaitingForReader ? "sd_reader_wait" :
+        path ? "sd_write_wait" : "sd_io_wait", &event);
+}
+
+static bool resume_export_storage(const Request &request, RunContext &run) {
+    if (!run.storage_yielded || !storage.valid() || request_aborted(request)) return false;
+    storage.end();
+    Log::logf(CAT_EXPORT, LOG_DEBUG, "[%s] Sync paused for storage\n", engine_name(request.engine));
+    while (!request_aborted(request) && SdStorage::local_access_allowed()) {
+        const bool ready = WiFi.status() == WL_CONNECTED && AirSenseState::device_standby();
+        if (!ready) storage.end();
+        check_export_progress(run);
+        if (ready && storage.begin()) {
+            run.storage_yielded = false;
+            // Admission waiting is not a network operation's idle timeout.
+            run.operation.note_progress(millis());
+            check_export_progress(run);
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return false;
+}
+
+static bool yield_sleephq_storage(void *context) {
+    auto &run = *static_cast<RunContext *>(context);
+    run.storage_yielded = true;
+    return run.request && resume_export_storage(*run.request, run);
+}
+
+struct SmbRequestScope {
+    RunContext &run;
+    bool previous;
+    explicit SmbRequestScope(RunContext &context) : run(context), previous(run.defer_storage_yield) {
+        run.defer_storage_yield = true;
+    }
+    ~SmbRequestScope() { run.defer_storage_yield = previous; }
+};
+
+struct SmbSource {
+    const char *path;
+    bool root;
+    uint64_t size = 0, offset = 0;
+    uint32_t files = SdStorage::files_revision(), catalog = EdfCatalog::revision();
+    SdStorage::Session token = storage;
+
+    bool checkpoint(RunContext &run, SdStorage::Reader *input, bool &changed,
+                    char *error, size_t error_size) {
+        changed = false;
+        if (!token.valid()) {
+            copy_text(error, error_size, "source_changed");
+            return false;
+        }
+        if (!run_aborted(&run)) return true;
+        if (!run.storage_yielded || !storage.valid() || !run.request) {
+            copy_text(error, error_size, "preempted");
+            return false;
+        }
+        if (input) input->close();
+        if (!resume_export_storage(*run.request, run)) {
+            copy_text(error, error_size, "preempted");
+            return false;
+        }
+        changed = files != SdStorage::files_revision() ||
+            (root && catalog != EdfCatalog::revision());
+        token = storage;
+        if (!changed && input && (!input->open(storage, path) ||
+            input->size() != size || !input->seek(offset))) {
+            copy_text(error, error_size, "source_changed");
+            return false;
+        }
+        return true;
+    }
+};
+
 static bool wait_resolve(StorageSmbClient &client, RunContext &run,
                          char *error, size_t error_size) {
+    SmbRequestScope request_scope(run);
     const uint32_t started = millis();
     while (true) {
         const auto stop = run.operation.stop_reason(millis());
@@ -296,6 +517,7 @@ static bool wait_resolve(StorageSmbClient &client, RunContext &run,
 
 static bool wait_connect(StorageSmbClient &client, RunContext &run,
                          char *error, size_t error_size) {
+    SmbRequestScope request_scope(run);
     while (true) {
         const StorageSmbOperationResult result =
             client.step_connect(error, error_size, &run.operation);
@@ -308,6 +530,7 @@ static bool wait_connect(StorageSmbClient &client, RunContext &run,
 static bool wait_ensure_directory(StorageSmbClient &client,
                                   const char *path, RunContext &run,
                                   char *error, size_t error_size) {
+    SmbRequestScope request_scope(run);
     if (!path || !path[0]) return true;
     while (true) {
         const StorageSmbOperationResult result = client.step_ensure_directory(
@@ -321,6 +544,7 @@ static bool wait_ensure_directory(StorageSmbClient &client,
 static bool wait_stat(StorageSmbClient &client, const char *path,
                       StorageSmbRemoteStat &stat, RunContext &run,
                       char *error, size_t error_size) {
+    SmbRequestScope request_scope(run);
     while (true) {
         const StorageSmbOperationResult result =
             client.step_stat(path, stat, error, error_size, &run.operation);
@@ -332,6 +556,7 @@ static bool wait_stat(StorageSmbClient &client, const char *path,
 
 static bool wait_open(StorageSmbClient &client, const char *path,
                       RunContext &run, char *error, size_t error_size) {
+    SmbRequestScope request_scope(run);
     while (true) {
         const StorageSmbOperationResult result = client.step_open_writer(
             path, error, error_size, &run.operation);
@@ -344,6 +569,7 @@ static bool wait_open(StorageSmbClient &client, const char *path,
 static bool wait_write(StorageSmbClient &client, const uint8_t *data,
                        size_t size, RunContext &run,
                        char *error, size_t error_size) {
+    SmbRequestScope request_scope(run);
     while (true) {
         size_t written = 0;
         const StorageSmbOperationResult result = client.step_write(
@@ -357,6 +583,7 @@ static bool wait_write(StorageSmbClient &client, const uint8_t *data,
 
 static bool wait_close(StorageSmbClient &client, RunContext &run,
                        char *error, size_t error_size) {
+    SmbRequestScope request_scope(run);
     while (true) {
         const StorageSmbOperationResult result = client.step_close_writer(
             error, error_size, &run.operation);
@@ -492,150 +719,195 @@ struct RootFileState {
     char directory[48];
     char path[80];
     uint8_t marker[20] = {'A', 'B', 'S', 'R', 1};
+    uint32_t files_revision = 0, catalog_revision = 0;
+    SdStorage::Session source;
 };
 
 static bool read_root_state(const SmbConfig &config, const char *path,
                              uint8_t *buffer, size_t buffer_size,
                              RootFileState &out, char *error, size_t error_size,
                              RunContext &run) {
-    if (!state_marker_path(config, path + 1, out.directory, sizeof(out.directory),
-                           out.path, sizeof(out.path))) return false;
-    if (!storage.run([&](fs::FS &fs) { out.exists = fs.exists(path); return true; }))
-        return false;
-    if (!out.exists) return true;
+    for (;;) {
+        SmbSource source{path, true};
+        out.confirmed = false;
+        if (!state_marker_path(config, path + 1, out.directory, sizeof(out.directory),
+                               out.path, sizeof(out.path))) return false;
+        if (!storage.run([&](fs::FS &fs) { out.exists = fs.exists(path); return true; }))
+            return false;
+        if (!out.exists) return true;
 
-    SdStorage::Reader input;
-    if (!input.open(storage, path)) {
-        snprintf(error, error_size, "local_open:%s", path);
-        return false;
-    }
-    const uint64_t size = input.size();
-    uint32_t crc = crc32_ieee_initial();
-    for (uint64_t remaining = size; remaining;) {
-        if (run_aborted(&run)) {
-            copy_text(error, error_size, "preempted");
+        SdStorage::Reader input;
+        if (!input.open(storage, path)) {
+            snprintf(error, error_size, "local_open:%s", path);
             return false;
         }
-        const size_t wanted = remaining < buffer_size ? remaining : buffer_size;
-        if (input.read(buffer, wanted) != wanted) {
-            copy_text(error, error_size, "local_read_short");
-            return false;
+        const uint64_t size = input.size();
+        source.size = size;
+        uint32_t crc = crc32_ieee_initial();
+        bool changed = false;
+        for (uint64_t remaining = size; remaining;) {
+            if (!source.checkpoint(run, &input, changed, error, error_size)) return false;
+            if (changed) break;
+            const size_t wanted = remaining < buffer_size ? remaining : buffer_size;
+            if (input.read(buffer, wanted) != wanted) {
+                copy_text(error, error_size, "local_read_short");
+                return false;
+            }
+            crc = crc32_ieee_update(crc, buffer, wanted);
+            remaining -= wanted;
+            source.offset += wanted;
+            advance_export(run, size - remaining, "root_inventory");
         }
-        crc = crc32_ieee_update(crc, buffer, wanted);
-        remaining -= wanted;
-    }
-    input.close();
-    SdStorage::put_le32(out.marker + 8, static_cast<uint32_t>(size));
-    SdStorage::put_le32(out.marker + 12, static_cast<uint32_t>(size >> 32));
-    SdStorage::put_le32(out.marker + 16, crc32_ieee_finish(crc));
+        input.close();
+        if (changed) continue;
+        SdStorage::put_le32(out.marker + 8, static_cast<uint32_t>(size));
+        SdStorage::put_le32(out.marker + 12, static_cast<uint32_t>(size >> 32));
+        SdStorage::put_le32(out.marker + 16, crc32_ieee_finish(crc));
 
-    SdStorage::Reader marker;
-    if (marker.open(storage, out.path)) {
-        uint8_t saved[sizeof(out.marker)];
-        out.confirmed = marker.size() == sizeof(saved) &&
-            marker.read(saved, sizeof(saved)) == sizeof(saved) &&
-            memcmp(saved, out.marker, sizeof(saved)) == 0;
+        SdStorage::Reader marker;
+        if (marker.open(storage, out.path)) {
+            uint8_t saved[sizeof(out.marker)];
+            out.confirmed = marker.size() == sizeof(saved) &&
+                marker.read(saved, sizeof(saved)) == sizeof(saved) &&
+                memcmp(saved, out.marker, sizeof(saved)) == 0;
+        }
+        out.files_revision = source.files;
+        out.catalog_revision = source.catalog;
+        out.source = source.token;
+        return source.token.valid();
     }
-    return storage.valid();
 }
 
 static bool sync_smb_file(StorageSmbClient &client, const char *local_path,
                           const RootFileState *root, uint8_t *buffer,
                           size_t buffer_size, RunContext &run,
-                          char *error, size_t error_size) {
+                          char *error, size_t error_size, const SmbConfig *config = nullptr) {
     note_seen();
-    SdStorage::Reader input;
-    if (!input.open(storage, local_path)) {
-        snprintf(error, error_size, "local_open:%s", local_path);
+    if (root && !root->source.valid()) {
+        copy_text(error, error_size, "source_changed");
         return false;
     }
-    const uint64_t local_size = input.size();
-    char remote[aircannect::AC_STORAGE_SMB_REMOTE_PATH_MAX];
-    if (!client.make_remote_path(local_path, remote, sizeof(remote))) {
-        input.close();
-        copy_text(error, error_size, "remote_path_too_long");
-        return false;
-    }
+    RootFileState refreshed;
+    for (;;) {
+        SmbSource source{local_path, root != nullptr};
+        bool changed = false;
+        if (!source.checkpoint(run, nullptr, changed, error, error_size)) return false;
+        if (root && (root->files_revision != SdStorage::files_revision() ||
+                     root->catalog_revision != EdfCatalog::revision())) {
+            if (!config) { copy_text(error, error_size, "source_changed"); return false; }
+            if (!read_root_state(*config, local_path, buffer, buffer_size, refreshed,
+                                 error, error_size, run)) return false;
+            root = &refreshed;
+            if (!root->exists) return true;
+        }
+        source = SmbSource{local_path, root != nullptr};
+        advance_export(run, 0, "file_inventory");
+        SdStorage::Reader input;
+        if (!input.open(storage, local_path)) {
+            snprintf(error, error_size, "local_open:%s", local_path);
+            return false;
+        }
+        const uint64_t local_size = input.size();
+        source.size = local_size;
+        char remote[aircannect::AC_STORAGE_SMB_REMOTE_PATH_MAX];
+        if (!client.make_remote_path(local_path, remote, sizeof(remote))) {
+            input.close();
+            copy_text(error, error_size, "remote_path_too_long");
+            return false;
+        }
 
-    StorageSmbRemoteStat remote_stat;
-    if (!wait_stat(client, remote, remote_stat, run, error, error_size)) {
-        input.close();
-        return false;
-    }
-    if ((!root || root->confirmed) && remote_stat.exists && !remote_stat.directory &&
-        remote_stat.size == local_size) {
-        input.close();
-        note_skipped();
-        return true;
-    }
-
-    char parent[aircannect::AC_STORAGE_SMB_REMOTE_PATH_MAX];
-    copy_text(parent, sizeof(parent), remote);
-    char *slash = strrchr(parent, '/');
-    if (slash) {
-        *slash = 0;
-        if (!wait_ensure_directory(client, parent, run, error, error_size)) {
+        StorageSmbRemoteStat remote_stat;
+        if (!wait_stat(client, remote, remote_stat, run, error, error_size)) {
             input.close();
             return false;
         }
-    }
-    // A failed overwrite must not leave confirmation of the previous contents.
-    if (root) roots_cached = false;
-    if (root && !storage.mutate(root->path, [&](fs::FS &fs) {
-        return !fs.exists(root->path) || fs.remove(root->path);
-    })) {
-        copy_text(error, error_size, "state_marker_remove");
-        return false;
-    }
-    if (!wait_open(client, remote, run, error, error_size)) {
+        if ((!root || root->confirmed) && remote_stat.exists && !remote_stat.directory &&
+            remote_stat.size == local_size) {
+            input.close();
+            note_skipped();
+            advance_export(run, UINT64_MAX, "file_complete");
+            return true;
+        }
+
+        char parent[aircannect::AC_STORAGE_SMB_REMOTE_PATH_MAX];
+        copy_text(parent, sizeof(parent), remote);
+        char *slash = strrchr(parent, '/');
+        if (slash) {
+            *slash = 0;
+            if (!wait_ensure_directory(client, parent, run, error, error_size)) {
+                input.close();
+                return false;
+            }
+        }
+        // A failed overwrite must not leave confirmation of the previous contents.
+        if (root) roots_cached = false;
+        if (root && !storage.mutate(root->path, [&](fs::FS &fs) {
+            return !fs.exists(root->path) || fs.remove(root->path);
+        })) {
+            copy_text(error, error_size, "state_marker_remove");
+            return false;
+        }
+        if (!wait_open(client, remote, run, error, error_size)) {
+            input.close();
+            return false;
+        }
+
+        uint64_t sent = 0;
+        bool success = true;
+        while (sent < local_size) {
+            if (!source.checkpoint(run, &input, changed, error, error_size)) {
+                success = false;
+                break;
+            }
+            if (changed) break;
+            const size_t remaining = static_cast<size_t>(local_size - sent);
+            const size_t wanted = min(buffer_size, remaining);
+            const size_t read = input.read(buffer, wanted);
+            if (read != wanted ||
+                !wait_write(client, buffer, read, run, error, error_size)) {
+                if (read != wanted) copy_text(error, error_size, "local_read_short");
+                success = false;
+                break;
+            }
+            sent += read;
+            source.offset = sent;
+            run.operation.note_progress(millis());
+            advance_export(run, sent, "upload");
+            taskYIELD();
+        }
         input.close();
-        return false;
-    }
-
-    uint64_t sent = 0;
-    bool success = true;
-    while (sent < local_size) {
-        if (run_aborted(&run)) {
-            copy_text(error, error_size, "preempted");
-            success = false;
-            break;
+        if (changed && success) {
+            if (!wait_close(client, run, error, error_size)) return false;
+            continue;
         }
-        const size_t remaining = static_cast<size_t>(local_size - sent);
-        const size_t wanted = min(buffer_size, remaining);
-        const size_t read = input.read(buffer, wanted);
-        if (read != wanted ||
-            !wait_write(client, buffer, read, run, error, error_size)) {
-            if (read != wanted) copy_text(error, error_size, "local_read_short");
-            success = false;
-            break;
+        if (success) success = wait_close(client, run, error, error_size);
+        if (!success) {
+            client.abort_connection();
+            return false;
         }
-        sent += read;
-        run.operation.note_progress(millis());
-        taskYIELD();
-    }
-    input.close();
-    if (success) success = wait_close(client, run, error, error_size);
-    if (!success) {
-        client.abort_connection();
-        return false;
-    }
 
-    if (!wait_stat(client, remote, remote_stat, run, error, error_size) ||
-        !remote_stat.exists || remote_stat.directory ||
-        remote_stat.size != local_size) {
-        copy_text(error, error_size, "remote_verify_failed");
-        return false;
+        if (!wait_stat(client, remote, remote_stat, run, error, error_size) ||
+            !remote_stat.exists || remote_stat.directory ||
+            remote_stat.size != local_size) {
+            copy_text(error, error_size, "remote_verify_failed");
+            return false;
+        }
+        if (!source.token.valid()) {
+            copy_text(error, error_size, "source_changed");
+            return false;
+        }
+        note_uploaded(sent);
+        if (root && !write_smb_marker(root->directory, root->path,
+                                      root->marker, sizeof(root->marker))) {
+            copy_text(error, error_size, "state_marker_write");
+            return false;
+        }
+        Log::logf(CAT_EXPORT, LOG_DEBUG,
+                  "[SMB] uploaded %s bytes=%llu\n", local_path,
+                  static_cast<unsigned long long>(sent));
+        advance_export(run, UINT64_MAX, "file_complete");
+        return true;
     }
-    note_uploaded(sent);
-    if (root && !write_smb_marker(root->directory, root->path,
-                                  root->marker, sizeof(root->marker))) {
-        copy_text(error, error_size, "state_marker_write");
-        return false;
-    }
-    Log::logf(CAT_EXPORT, LOG_DEBUG,
-              "[SMB] uploaded %s bytes=%llu\n", local_path,
-              static_cast<unsigned long long>(sent));
-    return true;
 }
 
 static bool sync_session_files(StorageSmbClient &client,
@@ -645,12 +917,14 @@ static bool sync_session_files(StorageSmbClient &client,
                                char *error, size_t error_size) {
     char path[128];
     for (const char *suffix : SESSION_SUFFIXES) {
+        ++run.progress_step;
         snprintf(path, sizeof(path), "/DATALOG/%s/%s_%s.edf",
                  entry.therapy_day, entry.file_prefix, suffix);
         if (!sync_smb_file(client, path, nullptr, buffer, buffer_size,
                            run, error, error_size)) return false;
         snprintf(path, sizeof(path), "/DATALOG/%s/%s_%s.crc",
                  entry.therapy_day, entry.file_prefix, suffix);
+        ++run.progress_step;
         if (!sync_smb_file(client, path, nullptr, buffer, buffer_size,
                            run, error, error_size)) return false;
     }
@@ -662,12 +936,14 @@ static bool sync_root_files(StorageSmbClient &client, const SmbConfig &config,
                             RunContext &run,
                             char *error, size_t error_size) {
     for (const char *path : ROOT_FILES) {
+        ++run.progress_step;
         RootFileState state;
         if (!read_root_state(config, path, buffer, buffer_size, state, error, error_size, run))
             return false;
+        ++run.progress_step;
         if (!state.exists) continue;
         if (!sync_smb_file(client, path, &state, buffer, buffer_size,
-                           run, error, error_size)) return false;
+                           run, error, error_size, &config)) return false;
     }
     return true;
 }
@@ -746,16 +1022,20 @@ static bool run_smb(const Request &request, RunContext &run) {
 
     if (success) {
         for (uint32_t i = catalog.entries; success && i > 0; i--) {
-            if (run_aborted(&run)) {
+            SmbSource checkpoint{nullptr, false};
+            bool changed = false;
+            if (!checkpoint.checkpoint(run, nullptr, changed, error, sizeof(error))) {
                 success = false;
                 break;
             }
             EdfCatalog::Entry entry;
+            run.progress_step = uint64_t(catalog.entries - i + 1) << 32;
             if (!storage.run([&](fs::FS &) { return EdfCatalog::read(i - 1, entry); })) {
                 copy_text(error, sizeof(error), "catalog_read");
                 success = false;
                 break;
             }
+            advance_export(run, 0, "catalog");
             if (!entry.recording_ready() || state_marker_exists(config, entry)) continue;
             invalidate_backlog_entry(i - 1, SMB_VALID);
             portENTER_CRITICAL(&status_mux);
@@ -770,15 +1050,17 @@ static bool run_smb(const Request &request, RunContext &run) {
                 success = false;
             }
         }
-        if (success)
+        if (success) {
+            run.progress_step = uint64_t(catalog.entries + 1) << 32;
             success = sync_root_files(client, config, buffer, buffer_size, run,
                                       error, sizeof(error));
+        }
     }
 
     if (client.connected()) disconnect(client, run);
     else client.abort_connection();
     heap_caps_free(buffer);
-    if (!success || run_aborted(&run)) {
+    if (!success || run_interrupted(run)) {
         if (run_interrupted(run)) set_state(State::Idle);
         else set_state(State::Error,
                        error[0] ? error : "smb_sync_failed");
@@ -880,6 +1162,10 @@ static void sleephq_failed(const char *error, const SleepHqSync::Progress &progr
     sleephq_retry.pending = delay_ms != 0;
     sleephq_retry.blocked = !delay_ms;
     sleephq_retry.due_ms = millis() + delay_ms;
+    auto &diagnostics = export_progress[size_t(Engine::SleepHq)];
+    if (diagnostics.active)
+        note_export_progress(diagnostics, progress.phase ? progress.phase : "admission",
+                             delay_ms ? "retry_backoff" : "failed", delay_ms != 0);
     set_sleephq_state(State::Error, error);
     publish_sleephq_retry(delay_ms);
     Log::logf(CAT_EXPORT, delay_ms ? LOG_WARN : LOG_ERROR,
@@ -942,15 +1228,31 @@ static bool run_sleephq(const Request &request, RunContext &run) {
     run.operation.ctx = &run;
 
     SleepHqSync::Progress progress = {};
-    SleepHqSync::Run sync(config);
+    run.sleephq_progress = &progress;
+    SleepHqSync::Run sync(config, yield_sleephq_storage, &run);
     SleepHqSync::BacklogChanges changes = {};
-    bool success = request.action == Action::Repair || sync.resume(storage, run.operation, progress,
-        publish_sleephq_progress, nullptr, error, sizeof(error), &changes);
+    auto step = [&](auto &&action) {
+        for (;;) {
+            if (action()) return true;
+            if (sync.refresh_pending() && !run.storage_yielded &&
+                storage.valid() && !request_aborted(request)) {
+                error[0] = 0;
+                continue;
+            }
+            if (!run.storage_yielded || !sync.pause_for_yield(storage) ||
+                !resume_export_storage(request, run)) return false;
+            error[0] = 0;
+        }
+    };
+    bool success = request.action == Action::Repair || step([&] {
+        return sync.resume(storage, run.operation, progress,
+            publish_sleephq_progress, &run, error, sizeof(error), &changes);
+    });
     bool backlog_changed = changes.other_entries;
     aircannect::LargeTextBuffer visited(65536, 4096);
     uint32_t selected_days = 0;
     for (uint32_t i = catalog.entries; success && i > 0; i--) {
-        if (run_aborted(&run)) {
+        if (!step([&] { return !run_aborted(&run); })) {
             success = false;
             break;
         }
@@ -973,9 +1275,18 @@ static bool run_sleephq(const Request &request, RunContext &run) {
             break;
         }
         ++selected_days;
-        success = sync.sync_day(
-            storage, entry.therapy_day, request.action == Action::Repair, run.operation, progress,
-            publish_sleephq_progress, nullptr, error, sizeof(error), &changes);
+        run.progress_step = uint64_t(catalog.entries - i + 1) << 32;
+        progress.checkpoint_step = 0;
+        progress.checkpoint_units = 0;
+        progress.phase = "day_inventory";
+        advance_export(run, 0, "day_inventory");
+        success = step([&] {
+            const bool ok = sync.sync_day(
+                storage, entry.therapy_day, request.action == Action::Repair, run.operation, progress,
+                publish_sleephq_progress, &run, error, sizeof(error), &changes);
+            backlog_changed |= changes.other_entries;
+            return ok;
+        });
         backlog_changed |= changes.other_entries;
     }
     if (backlog_changed) {
@@ -989,10 +1300,11 @@ static bool run_sleephq(const Request &request, RunContext &run) {
         success = false;
     }
 
-    if (!success || run_aborted(&run)) {
+    if (!success || run_interrupted(run)) {
         if (run_interrupted(run)) set_sleephq_state(State::Idle);
         else sleephq_failed(error[0] ? error : "sleephq_sync_failed",
                             progress, sync.last_request());
+        run.sleephq_progress = nullptr;
         return false;
     }
 
@@ -1003,6 +1315,7 @@ static bool run_sleephq(const Request &request, RunContext &run) {
     publish_change();
     reset_sleephq_retry(config_revision);
     set_sleephq_state(State::Idle);
+    run.sleephq_progress = nullptr;
     return true;
 }
 
@@ -1274,11 +1587,27 @@ static RunResult run_logged(const Request &request,
               (unsigned long)(started - request.queued_ms));
     RunContext context = {};
     context.generation = request.generation;
+    context.request = &request;
     context.section = section;
     context.config_revision = config_revision;
+    context.progress = &begin_export_progress(request);
+    context.progress->watch.attempt();
+    note_export_progress(*context.progress, "admission", "working");
+    storage.set_io_observer(export_storage_wait, &context);
     const bool success = run(request, context);
+    storage.set_io_observer(nullptr, nullptr);
+    check_export_progress(context);
     T result;
     snapshot(result);
+    if (success && result.state != State::Disabled) {
+        context.progress_step = UINT64_MAX;
+        advance_export(context, 0, "complete");
+    }
+    const bool retry_pending = request.engine == Engine::SleepHq && sleephq_retry.pending;
+    if (retry_pending)
+        note_export_progress(*context.progress, context.progress->phase, "retry_backoff", true);
+    else if (!context.storage_yielded)
+        context.progress->active = false;
     if (!success && (generation_aborted(request.generation) || !storage.valid() ||
                      Config::revision(section) != config_revision)) {
         Log::logf(CAT_EXPORT, LOG_INFO, "[%s] Sync interrupted: %s\n", name,
@@ -1323,9 +1652,6 @@ const EngineAdapter engines[] = {
                  !Config::get().sleephq_client_secret.isEmpty(); },
      &sleephq_status.state, &sleephq_status.check, &sleephq_status_mux, set_sleephq_state, check_sleephq,
      [](const Request &request) {
-         if (request.kind != RequestKind::Manual && request.kind != RequestKind::Retry &&
-             sleephq_retry.config_revision == Config::revision(Config::Section::SleepHq) &&
-             (sleephq_retry.pending || sleephq_retry.blocked)) return RunResult::Finished;
          return run_logged(request, run_sleephq, get_sleephq_status, false);
      }},
 };
@@ -1356,10 +1682,23 @@ static void export_task(void *) {
     while (true) {
         const uint32_t shq_revision = Config::revision(Config::Section::SleepHq);
         if (sleephq_retry.config_revision != shq_revision) {
+            export_progress[size_t(Engine::SleepHq)].active = false;
             const bool failed = sleephq_retry.pending || sleephq_retry.blocked;
             reset_sleephq_retry(shq_revision);
             if (failed && __atomic_load_n(&sleephq_status.state, __ATOMIC_ACQUIRE) == State::Error)
                 set_sleephq_state(State::Idle);
+        }
+        auto &retry_progress = export_progress[size_t(Engine::SleepHq)];
+        if (retry_progress.active && sleephq_retry.pending) {
+            const bool backoff = static_cast<int32_t>(millis() - sleephq_retry.due_ms) < 0;
+            const bool standby = AirSenseState::device_standby();
+            const bool local = SdStorage::local_access_allowed();
+            const bool network = WiFi.status() == WL_CONNECTED;
+            const bool readers = SdStorage::waiting_for_readers();
+            note_export_progress(retry_progress, retry_progress.phase,
+                !standby ? "standby" : !local ? "usb" : !network ? "network" :
+                backoff ? "retry_backoff" : readers ? "sd_reader_wait" : "queued",
+                !standby || !local || !network || backoff || readers);
         }
         refresh_backlog();
         Request request;
@@ -1400,19 +1739,23 @@ static void export_task(void *) {
         }
         request_backlog_refresh();
 
+        initialize_export_progress(request);
         for (const auto &engine : engines) {
             if (generation_aborted(request.generation)) break;
-            if (request.kind == RequestKind::PostTherapy) {
-                if (!(Config::get().*engine.enabled && Config::get().*engine.automatic)) continue;
-            } else if (request.engine != engine.id) continue;
-            Request selected = request;
-            selected.engine = engine.id;
-            if (request.kind == RequestKind::PostTherapy)
-                selected.config_revision = Config::revision(engine.section);
+            Request selected;
+            if (!select_export_request(request, engine, selected)) continue;
+            auto &progress = begin_export_progress(selected);
+            progress.queued = false;
             while (!request_aborted(selected)) {
                 const bool ready = WiFi.status() == WL_CONNECTED &&
                     AirSenseState::device_standby();
-                __atomic_store_n(&storage_demand, ready, __ATOMIC_RELEASE);
+                const bool local = SdStorage::local_access_allowed();
+                const bool readers = SdStorage::waiting_for_readers();
+                check_waiting_exports();
+                note_export_progress(progress, "admission",
+                    !AirSenseState::device_standby() ? "standby" : !local ? "usb" :
+                    !ready ? "network" : readers ? "sd_reader_wait" : "storage_busy", !ready || !local || readers);
+                if (!ready) storage.end();
                 if (!ready || !storage.begin()) {
                     vTaskDelay(pdMS_TO_TICKS(100));
                     continue;
@@ -1422,9 +1765,9 @@ static void export_task(void *) {
                     !request_aborted(selected);
                 storage.end();
                 if (!yielded) break;
-                engine.set_state(State::Pending, nullptr);
             }
-            __atomic_store_n(&storage_demand, false, __ATOMIC_RELEASE);
+            storage.end();
+            if (request_aborted(selected) && !sleephq_retry.pending) progress.active = false;
         }
         settle_request(request);
     }
@@ -1600,10 +1943,6 @@ bool busy() {
     return false;
 }
 
-bool storage_requested() {
-    return __atomic_load_n(&storage_demand, __ATOMIC_ACQUIRE);
-}
-
 static State configured_state(State state, bool enabled) {
     if (state == State::Pending || state == State::Working) return state;
     if (!enabled) return State::Disabled;
@@ -1670,7 +2009,6 @@ void init() {}
 uint32_t revision() { return 0; }
 PublicationStamp publication_stamp() { return {}; }
 bool busy() { return false; }
-bool storage_requested() { return false; }
 void therapy_started() {}
 bool request_post_therapy(const EdfCatalog::Entry &) { return false; }
 bool request_manual(Engine, Action, const char *, const char *, const char **error) {

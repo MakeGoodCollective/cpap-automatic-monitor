@@ -31,6 +31,20 @@ typedef enum {
 } log_cat_t;
 
 namespace Log {
+    // Accumulate enabled profiling scopes without allocation or log output.
+    class ScopedMicros {
+    public:
+        ScopedMicros(uint64_t &elapsed, bool enabled)
+            : elapsed_(enabled ? &elapsed : nullptr), started_(enabled ? micros() : 0) {}
+        ~ScopedMicros() { if (elapsed_) *elapsed_ += uint32_t(micros() - started_); }
+        ScopedMicros(const ScopedMicros &) = delete;
+        ScopedMicros &operator=(const ScopedMicros &) = delete;
+
+    private:
+        uint64_t *elapsed_;
+        uint32_t started_;
+    };
+
     void init();
     void boot();
     const char *reset_reason_name();

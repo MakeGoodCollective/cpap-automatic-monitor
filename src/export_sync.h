@@ -99,10 +99,6 @@ void request_backlog_refresh(bool files_changed = false);
 uint32_t revision();
 PublicationStamp publication_stamp();
 bool busy();
-// The worker is ready to acquire or still holds its background SD session.
-// Offline/standby waits and report preparation do not request this priority.
-// Admission hint only: callers must still obtain their own SD session.
-bool storage_requested();
 void get_status(Status &out);
 void get_sleephq_status(SleepHqStatus &out);
 const char *action_blocked(Engine engine, Action action);

@@ -23,9 +23,16 @@ struct Progress {
     char import_status[aircannect::AC_SLEEPHQ_STATUS_MAX];
     const char *phase;
     char file[128];
+    // Attempt-local traversal cursor; the export owner retains its high-water.
+    uint32_t checkpoint_step = 0;
+    uint64_t checkpoint_units = 0;
+    // A bounded response must finish; hard cancellation is never deferred.
+    bool network_request = false;
 };
 
 using ProgressCallback = void (*)(void *context, const Progress &progress);
+// Source-read checkpoint on the export worker, never an HTTP event/abort callback.
+using StorageYieldCallback = bool (*)(void *context);
 
 struct BacklogChanges {
     bool entry;
@@ -44,10 +51,14 @@ bool pending_files(SdStorage::Session &storage, const Config &config,
 // One run owns authentication and team resolution across catalog entries.
 class Run {
 public:
-    explicit Run(const Config &config);
+    explicit Run(const Config &config, StorageYieldCallback yield = nullptr,
+                 void *yield_context = nullptr);
     ~Run();
     Run(const Run &) = delete;
     Run &operator=(const Run &) = delete;
+    // Call only after I/O unwinds, before ending a still-valid yielded lease.
+    bool pause_for_yield(const SdStorage::Session &storage);
+    bool refresh_pending() const { return refresh_pending_; }
     bool resume(SdStorage::Session &storage,
                 aircannect::BackgroundOperationControl &operation,
                 Progress &progress, ProgressCallback callback, void *context,
@@ -61,10 +72,16 @@ public:
 
 private:
     struct Inventory;
+    struct DayWork;
     const Config config_;
     aircannect::SleepHqClient client_;
     uint32_t team_id_ = 0;
     Inventory *inventory_ = nullptr;
+    DayWork *day_ = nullptr;
+    bool checkpointed_ = false;
+    StorageYieldCallback yield_ = nullptr;
+    void *yield_context_ = nullptr;
+    bool refresh_pending_ = false;
 };
 
 }  // namespace SleepHqSync

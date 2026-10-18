@@ -16,6 +16,7 @@
 #include "sd_storage.h"
 #include "debug_log.h"
 #include "export_sync.h"
+#include "airsense_state.h"
 
 namespace StorageBrowser {
 namespace {
@@ -116,6 +117,7 @@ public:
     Ready ready;
     Released released = nullptr;
     SdStorage::Session session;
+    SdStorage::Reader input;
     uint8_t *ring = nullptr;
     size_t capacity = 0;
     uint8_t *copy_buffer = nullptr;
@@ -169,6 +171,44 @@ public:
         return false;
     }
 
+    bool admit_reader(const char *path) {
+        while (!cancelled.load() && SdStorage::mounted() && SdStorage::local_access_allowed() &&
+               AirSenseState::local_background_allowed()) {
+            if (session.begin(SdStorage::Access::ReadOnly, path)) return true;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        return fail("storage_wait_interrupted", path);
+    }
+
+    void close_input() {
+        input.close();
+        // Only the current file is protected. Keep the admission, not its old
+        // scope, while draining output or waiting for the next file's Writer.
+        if (!mutating(request.kind))
+            while (!cancelled.load() && session.valid() && !session.protect_read(nullptr))
+                vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    bool open_input(const char *path, bool directory = false) {
+        close_input();
+        if (!mutating(request.kind)) {
+            for (;;) {
+                if (!checkpoint()) return false;
+                if (session.protect_read(directory ? nullptr : path)) break;
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+        }
+        return input.open(session, path, directory);
+    }
+
+    bool checkpoint() {
+        return (!cancelled.load() && session.valid()) || fail("interrupted");
+    }
+
+    bool next_input(SdStorage::Reader::Entry &entry, bool &end) {
+        return checkpoint() && input.next(entry, end);
+    }
+
     size_t read(uint8_t *out, size_t length) override {
         const uint32_t tail = consumed.load();
         length = std::min<size_t>(length, produced.load() - tail);
@@ -182,7 +222,7 @@ public:
     bool emit(const uint8_t *data, size_t length) {
         uint32_t progress = millis();
         while (length) {
-            if (cancelled.load() || !session.valid()) return fail("interrupted");
+            if (!checkpoint()) return false;
             const uint32_t head = produced.load();
             const size_t room = capacity - (head - consumed.load());
             if (!room) {
@@ -230,8 +270,7 @@ public:
 };
 
 bool list(Job &job, aircannect::LargeTextBuffer &json) {
-    SdStorage::Reader dir;
-    if (!dir.open(job.session, job.request.path, true)) return job.fail("directory_open_failed");
+    if (!job.open_input(job.request.path, true)) return job.fail("directory_open_failed");
     json = "{\"ok\":true";
     aircannect::json_add_string(json, "path", job.request.path);
     json += ",\"entries\":[";
@@ -239,7 +278,7 @@ bool list(Job &job, aircannect::LargeTextBuffer &json) {
     bool end = false;
     SdStorage::Reader::Entry entry;
     while (!end) {
-        if (job.cancelled.load() || !dir.next(entry, end)) return job.fail("directory_read_failed");
+        if (!job.next_input(entry, end)) return job.fail("directory_read_failed");
         if (end) break;
         if (seen++ < job.request.offset) continue;
         if (count == 32) break;
@@ -254,15 +293,18 @@ bool list(Job &job, aircannect::LargeTextBuffer &json) {
     json += ']';
     aircannect::json_add_bool(json, "more", !end);
     json += '}';
+    job.close_input();
     return !json.overflowed() || job.fail("listing_no_memory");
 }
 
 bool collect(Job &job) {
     const char *selection = job.request.selection;
     if (!*selection) {
-        SdStorage::Reader file;
-        if (file.open(job.session, job.request.path))
-            return job.add(job.request.path, file.size(), false, file.modified());
+        if (job.open_input(job.request.path)) {
+            const bool added = job.add(job.request.path, job.input.size(), false, job.input.modified());
+            job.close_input();
+            return added;
+        }
         if (!job.add(job.request.path, 0, true)) return false;
     } else {
         while (*selection) {
@@ -270,10 +312,10 @@ bool collect(Job &job) {
             const size_t length = end ? size_t(end - selection) : strlen(selection);
             char path[256];
             if (!child_path(job.request.path, selection, length, path)) return job.fail("invalid_child_path");
-            SdStorage::Reader file;
-            const bool regular = file.open(job.session, path);
-            if (!job.add(path, regular ? file.size() : 0, !regular,
-                         regular ? file.modified() : 0)) return false;
+            const bool regular = job.open_input(path);
+            if (!job.add(path, regular ? job.input.size() : 0, !regular,
+                         regular ? job.input.modified() : 0)) return false;
+            job.close_input();
             selection = end ? end + 1 : selection + length;
         }
     }
@@ -282,18 +324,18 @@ bool collect(Job &job) {
         if (!job.entries[i].directory) continue;
         char parent[256];
         strcpy(parent, job.entries[i].path);
-        SdStorage::Reader dir;
-        if (!dir.open(job.session, parent, true)) return job.fail("directory_open_failed", parent);
+        if (!job.open_input(parent, true)) return job.fail("directory_open_failed", parent);
         bool end = false;
         SdStorage::Reader::Entry entry;
         while (!end) {
-            if (job.cancelled.load() || !dir.next(entry, end)) return job.fail("directory_read_failed", parent);
+            if (!job.next_input(entry, end)) return job.fail("directory_read_failed", parent);
             if (end) break;
             char path[256];
             if (!child_path(parent, entry.name, strlen(entry.name), path))
                 return job.fail("invalid_child_path", parent);
             if (!job.add(path, entry.size, entry.directory, entry.modified)) return false;
         }
+        job.close_input();
     }
     return true;
 }
@@ -341,8 +383,9 @@ uint64_t zip_data_size(uint32_t size, size_t block_bytes) {
     return uint64_t(size) + 5 * (size ? (uint64_t(size) + block_bytes - 1) / block_bytes : 1);
 }
 
-bool copy_file(Job &job, SdStorage::Reader &file, uint32_t *checksum = nullptr,
+bool copy_file(Job &job, uint32_t *checksum = nullptr,
                const char *path = nullptr, uint64_t limit = UINT64_MAX) {
+    auto &file = job.input;
     uint8_t *buffer = job.copy_buffer;
     uint64_t remaining = std::min(file.size(), limit);
     uint32_t crc = crc32_ieee_initial();
@@ -356,7 +399,7 @@ bool copy_file(Job &job, SdStorage::Reader &file, uint32_t *checksum = nullptr,
             SdStorage::put_le16(block + 3, uint16_t(~count));
             if (!job.emit(block, sizeof(block))) return false;
         }
-        if (file.read(buffer, count) != count) return job.fail("file_read_failed", path);
+        if (!job.checkpoint() || file.read(buffer, count) != count) return job.fail("file_read_failed", path);
         if (!job.emit(buffer, count)) return false;
         if (checksum) crc = crc32_ieee_update(crc, buffer, count);
         remaining -= count;
@@ -374,11 +417,11 @@ size_t range_header(const Job &job, unsigned index, char (&out)[160]) {
 
 bool immutable_file(const std::shared_ptr<Job> &transfer) {
     auto &job = *transfer;
-    SdStorage::Reader file;
-    if (!file.open(job.session, job.request.path)) {
+    if (!job.open_input(job.request.path)) {
         job.ready(404, "artifact_unavailable", nullptr, 0);
         return job.fail("file_open_failed");
     }
+    auto &file = job.input;
     job.representation = file.size();
     uint64_t length = 0;
     char header[160];
@@ -398,12 +441,12 @@ bool immutable_file(const std::shared_ptr<Job> &transfer) {
         return true;
     }
     job.ready(job.request.range_count ? 206 : 200, nullptr, transfer, length);
-    if (!job.request.range_count) return copy_file(job, file);
+    if (!job.request.range_count) return copy_file(job);
     for (unsigned i = 0; i < job.request.range_count; ++i) {
         const auto &range = job.request.ranges[i];
         if (job.request.range_count > 1 &&
             !job.emit(reinterpret_cast<const uint8_t *>(header), range_header(job, i, header))) return false;
-        if (!file.seek(range.first) || !copy_file(job, file, nullptr, nullptr,
+        if (!file.seek(range.first) || !copy_file(job, nullptr, nullptr,
             uint64_t(range.last) - range.first + 1)) return job.fail("range_read_failed");
         if (job.request.range_count > 1 && !job.emit(reinterpret_cast<const uint8_t *>("\r\n"), 2)) return false;
     }
@@ -433,10 +476,11 @@ bool archive(Job &job) {
         put_le16(header + 26, length);
         if (!job.emit(header, sizeof(header)) ||
             !job.emit(reinterpret_cast<const uint8_t *>(name), length)) return false;
-        SdStorage::Reader file;
-        if (!file.open(job.session, entry.path)) return job.fail("file_open_failed", entry.path);
+        if (!job.open_input(entry.path)) return job.fail("file_open_failed", entry.path);
+        auto &file = job.input;
         if (file.size() != entry.size) return job.fail("file_size_changed", entry.path);
-        if (!copy_file(job, file, &entry.crc, entry.path)) return false;
+        if (!copy_file(job, &entry.crc, entry.path)) return false;
+        job.close_input();
         uint8_t descriptor[16];
         put_le32(descriptor, 0x08074b50);
         put_le32(descriptor + 4, entry.crc);
@@ -485,14 +529,17 @@ void produce(void *context) {
     job->report(LOG_DEBUG, "started");
     const SdStorage::Access access = mutating(job->request.kind)
         ? SdStorage::Access::Exclusive : SdStorage::Access::ReadOnly;
-    const char *read_root = access == SdStorage::Access::ReadOnly && job->request.kind != Kind::List
+    const char *read_root = access == SdStorage::Access::ReadOnly &&
+        (job->request.kind == Kind::File || job->request.kind == Kind::Immutable)
         ? job->request.path : nullptr;
-    bool admitted = job->session.begin(access, read_root);
-    // Wait for a checkpoint/overlapping write in this producer, never AsyncTCP.
-    while (!admitted && !job->cancelled.load() &&
+    bool admitted = access == SdStorage::Access::ReadOnly ? job->admit_reader(read_root)
+        : job->session.begin(access);
+    // Mutation admission is bounded. Downloads wait behind existing background
+    // work until admitted or disconnected, never on the AsyncTCP callback.
+    while (access == SdStorage::Access::Exclusive && !admitted && !job->cancelled.load() &&
            SdStorage::local_access_allowed() && uint32_t(millis() - job->started_ms) < 2000) {
         vTaskDelay(pdMS_TO_TICKS(10));
-        admitted = job->session.begin(access, read_root);
+        admitted = job->session.begin(access);
     }
     if (admitted && job->request.kind == Kind::Immutable)
         Log::logf(CAT_STORAGE, LOG_DEBUG, "artifact admitted wait=%ums path=%s\n",
@@ -530,10 +577,10 @@ void produce(void *context) {
     } else if (job->request.kind == Kind::Immutable) {
         success = immutable_file(job);
     } else if (job->request.kind == Kind::File) {
-        SdStorage::Reader file;
-        if (file.open(job->session, job->request.path)) {
+        if (job->open_input(job->request.path)) {
+            auto &file = job->input;
             job->ready(200, nullptr, job, file.size());
-            success = copy_file(*job, file);
+            success = copy_file(*job);
         } else {
             job->fail("file_open_failed");
             job->ready(409, "file_unavailable", nullptr, 0);
@@ -546,6 +593,7 @@ void produce(void *context) {
     if (!mutating(job->request.kind) && admitted)
         job->report(success ? LOG_DEBUG : job->failure_level,
             success ? "producer_done" : job->failure);
+    job->close_input();
     job->session.end();
     if (job->released) job->released();
     free(job->copy_buffer);

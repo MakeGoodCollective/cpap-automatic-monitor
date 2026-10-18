@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <atomic>
 #include "storage_browser.h"
 
 // Local EDF ownership is independent of the UART/ClinicalJobs report path.
@@ -44,8 +45,9 @@ StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
     bool document, StorageBrowser::Request &ranges, StorageBrowser::Ready ready,
     std::weak_ptr<StorageBrowser::Transfer> &active);
 
-// Two active jobs, coalesced identical requests, bounded PSRAM result retention. Admission
-// and polling do no SD work. Completion changes status.revision only; source
+// Two work jobs, plus one Days slot when background work fills admission.
+// Identical requests coalesce; result retention is bounded and prefers PSRAM.
+// Admission and polling do no SD work. Completion changes status.revision only; source
 // invalidation also changes status.data_revision. JSON carries both revisions.
 bool submit(const Request &request, uint32_t &id, const char **error = nullptr);
 uint32_t prepare_before_export(const char *therapy_day);
@@ -71,11 +73,14 @@ public:
 private:
     friend int poll(uint32_t id, Result &out);
     uint32_t id_ = 0;
+    std::atomic<uint16_t> *readers_ = nullptr;
     const char *data_ = nullptr;
     size_t length_ = 0;
 };
 
-// 202 pending; 200 payload; 400/409/410/422/503 terminal error payload or expired.
+// 202 pending, including retained jobs awaiting a contended result lock; the
+// owner republishes after that lock clears. Unknown/expired IDs return 410.
+// 200 payload; 400/409/422/503 terminal error payload or unavailable owner.
 int poll(uint32_t id, Result &out);
 
 }  // namespace EdfReport

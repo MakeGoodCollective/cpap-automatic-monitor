@@ -42,6 +42,19 @@ constexpr uint8_t PHASE_PROCESSING = 2;
 constexpr uint32_t IMPORT_POLL_INTERVAL_MS = 5000;
 constexpr uint32_t IMPORT_POLL_TIMEOUT_MS = 15 * 60 * 1000UL;
 
+// Traversal order for diagnostics, not a persisted format or control state.
+enum class WorkStage : uint8_t {
+    Hash = 1, ExistingImport, Discovery, Merge, Destination, Target,
+    Files, Verify, Process, Confirm,
+};
+
+static void checkpoint(Progress &progress, WorkStage stage, const char *phase,
+                        uint32_t index = 0) {
+    progress.phase = phase;
+    progress.checkpoint_step = (uint32_t(stage) << 24) + index;
+    progress.checkpoint_units = 0;
+}
+
 struct Journal {
     uint8_t phase;
     uint8_t flags;
@@ -80,8 +93,14 @@ struct FileReader {
     SdStorage::Reader file;
     char path[128];
     uint64_t size;
+    Progress *progress = nullptr;
+    uint64_t offset = 0;
+    StorageYieldCallback checkpoint = nullptr;
+    void *checkpoint_context = nullptr;
 
     bool open() {
+        offset = 0;
+        if (progress) progress->checkpoint_units = 0;
         if (file) file.close();
         if (!storage) return false;
         if (!file.open(*storage, path) || file.size() != size) {
@@ -96,7 +115,18 @@ struct FileReader {
         FileReader *reader = static_cast<FileReader *>(context);
         read_size = 0;
         if (!reader || !reader->file || !out) return false;
+        if (reader->storage->yield_requested() && reader->checkpoint) {
+            reader->file.close();
+            if (!reader->checkpoint(reader->checkpoint_context) ||
+                !reader->file.open(*reader->storage, reader->path) ||
+                reader->file.size() != reader->size || !reader->file.seek(reader->offset))
+                return false;
+        }
         read_size = reader->file.read(out, length);
+        if (read_size == length) {
+            reader->offset += read_size;
+            if (reader->progress) reader->progress->checkpoint_units = reader->offset;
+        }
         return read_size == length;
     }
 
@@ -117,6 +147,21 @@ static bool operation_allows(const BackgroundOperationControl &operation,
     set_error(error, error_size,
               aircannect::background_operation_stop_error(stop));
     return false;
+}
+
+template <typename F>
+static bool network_request(Progress &progress, BackgroundOperationControl &operation, F &&request,
+                            bool *uncertain = nullptr) {
+    // Observe a pending yield before the bounded response begins. Once latched,
+    // the client's normal abort path rejects it without starting another request.
+    const auto stop = operation.stop_reason(millis());
+    const bool previous = progress.network_request;
+    progress.network_request = true;
+    // A rejected preflight cannot leave an unknown remote write to reconcile.
+    if (uncertain && stop == BackgroundOperationStop::None) *uncertain = true;
+    const bool ok = request();
+    progress.network_request = previous;
+    return ok;
 }
 
 static void publish(const Progress &progress, ProgressCallback callback,
@@ -479,13 +524,15 @@ bool pending_files(SdStorage::Session &storage, const Config &config,
     return true;
 }
 
-Run::Run(const Config &config) : config_(config) {
+Run::Run(const Config &config, StorageYieldCallback yield, void *yield_context)
+    : config_(config), yield_(yield), yield_context_(yield_context) {
     client_.configure(config_);
 }
 
 bool Run::resume(SdStorage::Session &storage, BackgroundOperationControl &operation,
                  Progress &progress, ProgressCallback callback, void *context,
                  char *error, size_t error_size, BacklogChanges *changes) {
+    refresh_pending_ = false;
     if (changes) *changes = {};
     StatePaths paths;
     if (!build_state_paths(config_, paths)) return false;
@@ -513,10 +560,13 @@ struct DayFile {
     char hash[33] = {};
     char day[9] = {};
     uint64_t size = 0;
+    uint32_t source_epoch = 0;
     bool root = false;
     bool local = false;
     bool present = false;
     bool available = false;
+    bool seen = false;
+    bool counted = false;
 };
 
 struct DayFiles {
@@ -551,6 +601,14 @@ struct DaySnapshot {
     uint32_t count = 0;
     DayFiles files;
     ~DaySnapshot() { free(entries); }
+
+    void swap(DaySnapshot &other) {
+        std::swap(entries, other.entries);
+        std::swap(count, other.count);
+        std::swap(files.items, other.files.items);
+        std::swap(files.count, other.files.count);
+        std::swap(files.capacity, other.files.capacity);
+    }
 };
 
 struct DayState {
@@ -632,8 +690,15 @@ static void file_path(const char *day, const DayFile &file, char *out, size_t si
     else snprintf(out, size, "/DATALOG/%s/%s", day, file.name);
 }
 
+struct HashCursor {
+    char name[80] = {};
+    uint64_t offset = 0, size = 0;
+    md5_context_t md5;
+};
+
 static bool hash_file(SdStorage::Session &storage, const char *day, DayFile &file,
-                      BackgroundOperationControl &operation, char *error, size_t error_size) {
+                      BackgroundOperationControl &operation, Progress &progress,
+                      char *error, size_t error_size, HashCursor *saved = nullptr) {
     char path[128];
     file_path(day, file, path, sizeof(path));
     SdStorage::Reader reader;
@@ -642,8 +707,18 @@ static bool hash_file(SdStorage::Session &storage, const char *day, DayFile &fil
         return false;
     }
     file.size = reader.size();
-    md5_context_t md5;
-    esp_rom_md5_init(&md5);
+    HashCursor local;
+    HashCursor &cursor = saved ? *saved : local;
+    if (strcmp(cursor.name, file.name) || cursor.size != file.size) {
+        copy_cstr(cursor.name, sizeof(cursor.name), file.name);
+        cursor.offset = 0;
+        cursor.size = file.size;
+        esp_rom_md5_init(&cursor.md5);
+    }
+    if (cursor.offset && !reader.seek(cursor.offset)) {
+        set_error(error, error_size, "source_seek_failed");
+        return false;
+    }
     std::unique_ptr<uint8_t, decltype(&aircannect::Memory::free)> buffer(
         static_cast<uint8_t *>(aircannect::Memory::alloc_large(SdStorage::READ_CHUNK_BYTES)),
         aircannect::Memory::free);
@@ -651,7 +726,8 @@ static bool hash_file(SdStorage::Session &storage, const char *day, DayFile &fil
         set_error(error, error_size, "hash_buffer_alloc");
         return false;
     }
-    uint64_t remaining = file.size;
+    uint64_t remaining = file.size - cursor.offset;
+    progress.checkpoint_units = cursor.offset;
     while (remaining) {
         if (!operation_allows(operation, error, error_size)) return false;
         const size_t n = remaining < SdStorage::READ_CHUNK_BYTES ? remaining : SdStorage::READ_CHUNK_BYTES;
@@ -659,14 +735,17 @@ static bool hash_file(SdStorage::Session &storage, const char *day, DayFile &fil
             set_error(error, error_size, "source_read_failed");
             return false;
         }
-        esp_rom_md5_update(&md5, buffer.get(), n);
+        esp_rom_md5_update(&cursor.md5, buffer.get(), n);
         remaining -= n;
+        cursor.offset += n;
+        progress.checkpoint_units = cursor.offset;
         operation.note_progress(millis());
     }
     reader.close();
-    esp_rom_md5_update(&md5, reinterpret_cast<const uint8_t *>(file.name), strlen(file.name));
+    esp_rom_md5_update(&cursor.md5, reinterpret_cast<const uint8_t *>(file.name), strlen(file.name));
     uint8_t digest[16];
-    esp_rom_md5_final(digest, &md5);
+    esp_rom_md5_final(digest, &cursor.md5);
+    cursor.name[0] = 0;
     return aircannect::hex_encode(digest, sizeof(digest), file.hash,
                                   sizeof(file.hash), aircannect::HexCase::Lower);
 }
@@ -705,6 +784,7 @@ static bool snapshot_day(SdStorage::Session &storage, const char *day,
             copy_cstr(file.name, sizeof(file.name), spec.name);
             file.root = index < 3;
             file.local = true;
+            file.source_epoch = entry.finalized_epoch;
             if (!snapshot.files.append(file)) {
                 set_error(error, error_size, "day_inventory_alloc");
                 return false;
@@ -757,12 +837,31 @@ struct RemoteDay {
 };
 
 static bool read_remote(SleepHqClient &client, uint32_t id, RemoteDay &remote,
-                         BackgroundOperationControl &operation) {
+                         BackgroundOperationControl &operation, Progress &progress,
+                         uint32_t *next_page = nullptr) {
     bool more = true;
-    for (uint32_t page = 1; more; ++page) {
+    for (uint32_t page = next_page ? *next_page : 1; more; ++page) {
         size_t count = 0;
-        if (!client.list_import_files(id, page, RemoteDay::receive, &remote,
-                                      count, more, &operation)) return false;
+        const size_t before = remote.files.count;
+        const bool had_day = remote.has_day, had_other = remote.other_day;
+        struct Page {
+            RemoteDay *remote; Progress *progress; uint32_t page, received;
+        } cursor{&remote, &progress, page, 0};
+        if (!network_request(progress, operation, [&] { return client.list_import_files(id, page,
+            [](void *ctx, const SleepHqRemoteFile &file) {
+                auto &cursor = *static_cast<Page *>(ctx);
+                if (!RemoteDay::receive(cursor.remote, file)) return false;
+                cursor.progress->checkpoint_units = (uint64_t(cursor.page) << 32) | ++cursor.received;
+                return true;
+            }, &cursor, count, more, &operation); })) {
+            // An interrupted response may already have delivered some records.
+            remote.files.count = before;
+            remote.has_day = had_day;
+            remote.other_day = had_other;
+            return false;
+        }
+        if (next_page) *next_page = page + 1;
+        progress.checkpoint_units = (uint64_t(page) << 32) | UINT32_MAX;
         operation.note_progress(millis());
     }
     return true;
@@ -815,7 +914,7 @@ static bool wait_import(SleepHqClient &client, uint32_t id,
     const uint32_t started = millis();
     for (;;) {
         if (!operation_allows(operation, error, error_size)) return false;
-        if (!client.get_import(id, info, &operation)) {
+        if (!network_request(progress, operation, [&] { return client.get_import(id, info, &operation); })) {
             set_error(error, error_size, client.last_error());
             return false;
         }
@@ -877,38 +976,72 @@ struct Run::Inventory {
     aircannect::LargeTextBuffer files{16384 * sizeof(DayFile), 8192};
     aircannect::LargeTextBuffer stored{16 * sizeof(DayFile), 4096};
     bool ready = false;
+    uint32_t page = 1, ids[16] = {}, remote_page = 1, visited = 0;
+    size_t count = 0, next = 0;
+    bool page_loaded = false, more = true;
+    RemoteDay remote{nullptr};
+
+    void reset_scan() {
+        if (ready) return;
+        imports.clear();
+        files.clear();
+        page = remote_page = 1;
+        visited = 0;
+        count = next = 0;
+        page_loaded = false;
+        more = true;
+        remote.files.count = 0;
+        remote.other_day = remote.has_day = remote.overflow = remote.invalid = false;
+    }
 
     bool load(SleepHqClient &client, uint32_t team, BackgroundOperationControl &operation,
-              char *error, size_t error_size) {
+              Progress &progress, char *error, size_t error_size) {
         if (ready) return true;
         const uint32_t started = millis();
-        // An incomplete scan is not a reusable inventory after a failed attempt.
-        imports.clear(); files.clear();
-        struct Page { uint32_t ids[16]; size_t count; uint32_t team; };
-        bool more = true;
-        for (uint32_t page = 1; more; ++page) {
-            Page list = {{}, 0, team};
-            size_t count = 0;
-            if (!client.list_imports(team, page,
+        struct Page {
+            uint32_t ids[16]; size_t count; uint32_t team;
+            Progress *progress; uint32_t page, received;
+        };
+        while (page_loaded || more) {
+            checkpoint(progress, WorkStage::Discovery, "discover_imports", visited * 2);
+            if (!page_loaded) {
+                Page list = {{}, 0, team, &progress, page, 0};
+                size_t received = 0;
+                if (!network_request(progress, operation, [&] { return client.list_imports(team, page,
                 [](void *ctx, const SleepHqImportInfo &item) {
                     auto &p = *static_cast<Page *>(ctx);
+                    p.progress->checkpoint_units = (uint64_t(p.page) << 32) | ++p.received;
                     if (item.team_id != p.team) return true;
                     if (p.count == 16) return false;
                     p.ids[p.count++] = item.id;
                     return true;
-                }, &list, count, more, &operation)) {
-                set_error(error, error_size, client.last_error());
-                return false;
+                }, &list, received, more, &operation); })) {
+                    set_error(error, error_size, client.last_error());
+                    return false;
+                }
+                memcpy(ids, list.ids, sizeof(ids));
+                count = list.count;
+                next = 0;
+                page_loaded = true;
             }
-            for (size_t i = 0; i < list.count; ++i) {
-                RemoteDay remote{nullptr};
-                if (!read_remote(client, list.ids[i], remote, operation)) {
-                    if (missing_import(client)) continue;
+            progress.checkpoint_units = (uint64_t(page) << 32) | UINT32_MAX;
+            for (; next < count; ++next) {
+                checkpoint(progress, WorkStage::Discovery, "discover_imports",
+                             visited * 2 + 1);
+                if (!read_remote(client, ids[next], remote, operation, progress, &remote_page)) {
+                    if (missing_import(client)) {
+                        remote.files.count = 0;
+                        remote_page = 1;
+                        remote.other_day = remote.has_day = false;
+                        ++visited;
+                        continue;
+                    }
                     set_error(error, error_size, remote.overflow ? "remote_inventory_alloc" :
                         remote.invalid ? "remote_inventory_invalid" : client.last_error());
                     return false;
                 }
-                Import import{list.ids[i], uint32_t(files.length() / sizeof(DayFile)),
+                progress.checkpoint_units = UINT64_MAX;
+                Import import{ids[next], uint32_t(files.length() / sizeof(DayFile)),
                               uint32_t(remote.files.count), remote.other_day};
                 if (!files.append(reinterpret_cast<const char *>(remote.files.items),
                                   remote.files.count * sizeof(DayFile)) ||
@@ -917,7 +1050,15 @@ struct Run::Inventory {
                         ? "remote_inventory_limit" : "remote_inventory_alloc");
                     return false;
                 }
+                free(remote.files.items);
+                remote.files.items = nullptr;
+                remote.files.count = remote.files.capacity = 0;
+                remote.other_day = remote.has_day = false;
+                remote_page = 1;
+                ++visited;
             }
+            page_loaded = false;
+            ++page;
         }
         ready = true;
         Log::logf(CAT_EXPORT, LOG_DEBUG, "[SLEEPHQ] Discovered imports=%u files=%u elapsed=%lums\n",
@@ -954,7 +1095,123 @@ struct Run::Inventory {
     }
 };
 
+struct Run::DayWork {
+    enum class Phase : uint8_t {
+        Start, Existing, Discovery, Destination, Target, Files,
+        Verify, Process, RecoverProcess, WaitProcess, Confirm, Done,
+    };
+    DaySnapshot snapshot;
+    SdStorage::Session source;
+    HashCursor hash;
+    char day[9] = {};
+    uint32_t catalog_revision = 0, files_revision = 0;
+    Phase phase = Phase::Start;
+    DayState state;
+    Journal legacy = {};
+    aircannect::SleepHqImportInfo info;
+    RemoteDay remote{day};
+    uint32_t remote_page = 1, object_page = 1, fingerprint = 0, confirm_index = 0;
+    size_t merge_offset = 0, file_index = 0;
+    uint32_t uploaded_before = 0, present_before = 0, attached_before = 0;
+    bool migrating = false, reconcile_objects = false, info_loaded = false;
+    bool remote_loaded = false, object_finished = false, object_found = false;
+    bool upload_unknown = false, process_unknown = false;
+    bool finished = false;
+
+    void advance(Phase next) {
+        phase = next;
+        free(remote.files.items);
+        remote.files.items = nullptr;
+        remote.files.count = remote.files.capacity = 0;
+        remote.other_day = remote.has_day = remote.overflow = remote.invalid = false;
+        remote_page = 1;
+        remote_loaded = false;
+    }
+
+    bool read_membership(SleepHqClient &client, BackgroundOperationControl &operation,
+                         Progress &progress) {
+        if (remote_loaded) return true;
+        remote_loaded = read_remote(client, state.import_id, remote, operation, progress, &remote_page);
+        return remote_loaded;
+    }
+
+    bool refresh(SdStorage::Session &storage, const char *selected, bool reuse, bool continuing,
+                 char *error, size_t error_size) {
+        EdfCatalog::Status published;
+        EdfCatalog::get_status(published);
+        if (continuing && !strcmp(day, selected) && published.ready &&
+            catalog_revision == EdfCatalog::revision() &&
+            files_revision == SdStorage::files_revision()) {
+            source = storage;
+            return true;
+        }
+        DaySnapshot fresh;
+        if (!snapshot_day(storage, selected, fresh, error, error_size)) return false;
+        const uint32_t catalog = EdfCatalog::revision();
+        const uint32_t files = SdStorage::files_revision();
+        const bool same_day = !strcmp(day, selected);
+        const bool external_change = files_revision != files;
+        const bool roots_changed = external_change || catalog_revision != catalog;
+        bool keep_hash = false;
+        for (size_t i = 0; i < fresh.files.count; ++i) {
+            auto &file = fresh.files.items[i];
+            const auto *old = snapshot.files.find(file.name);
+            if (!reuse || !old || external_change ||
+                (file.root ? roots_changed : !same_day || old->source_epoch != file.source_epoch))
+                continue;
+            copy_cstr(file.hash, sizeof(file.hash), old->hash);
+            file.size = old->size;
+            file.available = old->available;
+            file.seen = continuing && same_day && old->seen;
+            file.counted = continuing && same_day && old->counted;
+            keep_hash |= !strcmp(file.name, hash.name);
+        }
+        if (!keep_hash) hash.name[0] = 0;
+        if (continuing && same_day && !external_change) {
+            for (size_t i = 0; i < snapshot.files.count; ++i) {
+                const auto &file = snapshot.files.items[i];
+                if (!file.local && !fresh.files.append(file)) {
+                    set_error(error, error_size, "day_inventory_alloc");
+                    return false;
+                }
+            }
+        }
+        snapshot.swap(fresh);
+        source = storage;
+        copy_cstr(day, sizeof(day), selected);
+        catalog_revision = catalog;
+        files_revision = files;
+        advance(Phase::Start);
+        state = {};
+        legacy = {};
+        info = {};
+        info_loaded = false;
+        merge_offset = file_index = confirm_index = 0;
+        object_page = 1;
+        object_finished = object_found = upload_unknown = process_unknown = false;
+        finished = false;
+        return true;
+    }
+};
+
+bool Run::pause_for_yield(const SdStorage::Session &storage) {
+    if (!storage.valid() || (day_ && day_->day[0] && !day_->source.valid() &&
+        !checkpointed_)) return false;
+    if (day_ && day_->upload_unknown) {
+        day_->reconcile_objects = true;
+        day_->object_page = 1;
+        day_->object_finished = day_->object_found = day_->upload_unknown = false;
+    }
+    if (day_ && day_->process_unknown) day_->phase = DayWork::Phase::RecoverProcess;
+    checkpointed_ = true;
+    return true;
+}
+
 Run::~Run() {
+    if (day_) {
+        day_->~DayWork();
+        free(day_);
+    }
     if (inventory_) {
         inventory_->~Inventory();
         free(inventory_);
@@ -965,6 +1222,7 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
                   BackgroundOperationControl &operation,
                   Progress &progress, ProgressCallback callback, void *context,
                   char *error, size_t error_size, BacklogChanges *changes) {
+    refresh_pending_ = false;
     if (changes) *changes = {};
     if (!operation_allows(operation, error, error_size)) return false;
     StatePaths paths, legacy_paths;
@@ -973,168 +1231,229 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
         set_error(error, error_size, "invalid_day_or_config");
         return false;
     }
-    const SdStorage::Session source = storage;
-    DaySnapshot snapshot;
-    if (!snapshot_day(storage, day, snapshot, error, error_size)) return false;
-    DayState state;
-    const auto loaded = load_day(storage, paths, day, state);
-    Journal legacy = {};
-    const auto old = load_journal(storage, legacy_paths, legacy);
-    if (loaded == JournalLoad::Invalid || old == JournalLoad::Invalid) {
-        set_error(error, error_size, "inflight_invalid");
+    if (day_ && day_->day[0] && !day_->source.valid() && !checkpointed_) {
+        set_error(error, error_size, "source_changed");
         return false;
     }
-    if (loaded == JournalLoad::Unavailable || old == JournalLoad::Unavailable) {
-        set_error(error, error_size, "storage_unavailable");
+    if (!day_) {
+        void *memory = aircannect::Memory::alloc_large(sizeof(DayWork));
+        if (!memory) { set_error(error, error_size, "day_inventory_alloc"); return false; }
+        day_ = new (memory) DayWork;
+    }
+    if (inventory_ && !checkpointed_) inventory_->reset_scan();
+    if (!day_->refresh(storage, day, checkpointed_ || day_->finished, checkpointed_, error, error_size))
         return false;
-    }
-    const bool migrating = old == JournalLoad::Valid && !strcmp(legacy.therapy_day, day);
-    const bool unfinished = loaded == JournalLoad::Valid && state.phase != 0;
-    const bool reconcile_objects = repair || migrating || unfinished;
-    bool confirmed = loaded == JournalLoad::Valid && state.phase == 0 && state.import_id;
-    for (uint32_t i = 0; confirmed && i < snapshot.count; ++i)
-        confirmed = marker_valid(storage, legacy_paths, snapshot.entries[i]);
-    if (confirmed && !repair && !migrating) return true;
-    const uint32_t uploaded_before = progress.files_uploaded;
-    const uint32_t present_before = progress.files_skipped;
-    const uint32_t attached_before = progress.files_attached;
-    if (!inventory_) {
-        void *memory = aircannect::Memory::alloc_large(sizeof(Inventory));
-        if (!memory) { set_error(error, error_size, "remote_inventory_alloc"); return false; }
-        inventory_ = new (memory) Inventory;
-    }
-
-    if (state.phase == 0) state.phase = 1;
-    if (!save_day(storage, paths, day, state)) {
-        set_error(error, error_size, "inflight_write");
-        return false;
-    }
-
-    if (changes) changes->other_entries = true;
-    copy_cstr(progress.current_day, sizeof(progress.current_day), day);
-    progress.phase = "day_inventory";
-    publish(progress, callback, context);
-    for (size_t i = 0; i < snapshot.files.count; ++i)
-        if (!hash_file(storage, day, snapshot.files.items[i], operation, error, error_size))
-            return false;
-    if (!team_id_ && !client_.resolve_team_id(team_id_, &operation)) {
-        set_error(error, error_size, client_.last_error());
-        return false;
-    }
-    if (state.import_id && state.team_id != team_id_) {
-        set_error(error, error_size, "import_team_changed");
-        return false;
-    }
-    if (!state.import_id && migrating && legacy.team_id == team_id_) {
-        state.import_id = legacy.import_id;
-        state.phase = 1;
-    }
-    SleepHqImportInfo info;
-    if (state.import_id) {
-        if (!client_.get_import(state.import_id, info, &operation)) {
-            if (!missing_import(client_)) {
-                set_error(error, error_size, client_.last_error());
-                return false;
-            }
-            state.import_id = 0;
-            state.phase = 1;
-        } else {
-            RemoteDay remote{day};
-            if (info.team_id != team_id_ ||
-                !read_remote(client_, state.import_id, remote, operation)) {
-                set_error(error, error_size, info.team_id != team_id_
-                    ? "import_team_changed" : client_.last_error());
-                return false;
-            }
-            // Never automatically rewrite a multi-day or another machine's import.
-            if (remote.other_day || (remote.files.find("Identification.tgt") &&
-                                    !same_device(remote, snapshot.files))) {
-                state.import_id = 0;
-                state.phase = 1;
-            } else if (!merge_remote(snapshot.files, remote.files, error, error_size)) return false;
-        }
-    }
-
-    // Find a day destination or recover remote state; confirmed days skip discovery.
-    if (!state.import_id || reconcile_objects) {
-        progress.phase = "discover_imports";
-        if (!inventory_->load(client_, team_id_, operation, error, error_size)) return false;
-        for (size_t offset = 0; offset < inventory_->imports.length(); offset += sizeof(Inventory::Import)) {
-            RemoteDay remote{day};
-            uint32_t id;
-            if (!inventory_->select(offset, day, remote, id)) {
-                set_error(error, error_size, remote.invalid ? "remote_inventory_invalid" : "day_inventory_alloc");
-                return false;
-            }
-            if (!remote.has_day || !same_device(remote, snapshot.files)) continue;
-            if (!merge_remote(snapshot.files, remote.files, error, error_size)) return false;
-            if (!state.import_id && !remote.other_day) state.import_id = id;
-        }
-    }
-    if (!state.import_id) {
-        progress.phase = "create_import";
-        if (!client_.create_import(team_id_, info, &operation)) {
-            set_error(error, error_size, client_.last_error());
+    checkpointed_ = false;
+    const SdStorage::Session &source = day_->source;
+    auto &snapshot = day_->snapshot;
+    auto &work = *day_;
+    auto &state = work.state;
+    auto &legacy = work.legacy;
+    auto &info = work.info;
+    using Phase = DayWork::Phase;
+    if (work.phase == Phase::Start) {
+        const auto loaded = load_day(storage, paths, day, state);
+        const auto old = load_journal(storage, legacy_paths, legacy);
+        if (loaded == JournalLoad::Invalid || old == JournalLoad::Invalid) {
+            set_error(error, error_size, "inflight_invalid");
             return false;
         }
-        state.import_id = info.id;
-        state.phase = 1;
-    }
-    state.team_id = team_id_;
-    progress.import_id = state.import_id;
-    publish(progress, callback, context);
-    // Persist the destination before adding any files. A lost ACK is recovered
-    // from its remote inventory, rather than from an optimistic local bit mask.
-    if (!save_day(storage, paths, day, state)) {
-        set_error(error, error_size, "inflight_write");
-        return false;
-    }
-    if (migrating && !remove_journal(storage, legacy_paths)) {
-        set_error(error, error_size, "inflight_remove");
-        return false;
-    }
-    progress.phase = "import_status";
-    if (!wait_import(client_, state.import_id, operation, info, nullptr,
-                     progress, callback, context, error, error_size)) return false;
+        if (loaded == JournalLoad::Unavailable || old == JournalLoad::Unavailable) {
+            set_error(error, error_size, "storage_unavailable");
+            return false;
+        }
+        work.migrating = old == JournalLoad::Valid && !strcmp(legacy.therapy_day, day);
+        const bool unfinished = loaded == JournalLoad::Valid && state.phase != 0;
+        work.reconcile_objects = repair || work.migrating || unfinished;
+        bool confirmed = loaded == JournalLoad::Valid && state.phase == 0 && state.import_id;
+        for (uint32_t i = 0; confirmed && i < snapshot.count; ++i)
+            confirmed = marker_valid(storage, legacy_paths, snapshot.entries[i]);
+        if (confirmed && !repair && !work.migrating) { work.finished = true; return true; }
+        work.uploaded_before = progress.files_uploaded;
+        work.present_before = progress.files_skipped;
+        work.attached_before = progress.files_attached;
+        if (!inventory_) {
+            void *memory = aircannect::Memory::alloc_large(sizeof(Inventory));
+            if (!memory) { set_error(error, error_size, "remote_inventory_alloc"); return false; }
+            inventory_ = new (memory) Inventory;
+        }
 
-    RemoteDay target{day};
-    if (!read_remote(client_, state.import_id, target, operation)) {
-        set_error(error, error_size, client_.last_error());
-        return false;
-    }
-    if (target.other_day || (target.files.find("Identification.tgt") &&
-                            !same_device(target, snapshot.files))) {
-        set_error(error, error_size, "remote_inventory_changed");
-        return false;
-    }
-    if (!merge_remote(snapshot.files, target.files, error, error_size)) return false;
-    bool changed = false;
-    for (size_t i = 0; i < snapshot.files.count; ++i) {
-        auto &f = snapshot.files.items[i];
-        const auto *remote = target.files.find(f.name, f.hash);
-        f.present = remote && remote->size == f.size && remote->root == f.root;
-        f.available |= f.present;
-        changed |= !f.present;
-    }
-    const uint32_t fingerprint = manifest_fingerprint(snapshot.files);
-    const bool recovered = state.phase == 2 && state.fingerprint == fingerprint &&
-        sleephq_classify_import_status(info.status) == SleepHqImportStatusKind::Success &&
-        info.processed_at[0] && strcmp(info.processed_at, state.processed_at) && !changed;
-    if (!recovered) {
-        // Reattach the desired STR last even if an older association with this
-        // hash exists alongside other STR revisions in the remote import.
-        if (auto *str = snapshot.files.find("STR.edf")) str->present = false;
-        state.phase = 1;
-        state.fingerprint = fingerprint;
+        if (state.phase == 0) state.phase = 1;
         if (!save_day(storage, paths, day, state)) {
             set_error(error, error_size, "inflight_write");
             return false;
         }
+
+        if (changes) changes->other_entries = true;
+        copy_cstr(progress.current_day, sizeof(progress.current_day), day);
+        progress.checkpoint_step = 0;
+        progress.checkpoint_units = 0;
+        progress.phase = "day_inventory";
+        publish(progress, callback, context);
+        auto hash_one = [&](size_t i) {
+            if (!snapshot.files.items[i].local || snapshot.files.items[i].hash[0]) return true;
+            checkpoint(progress, WorkStage::Hash, "hash", i + 1);
+            if (!hash_file(storage, day, snapshot.files.items[i], operation, progress,
+                           error, error_size, &day_->hash))
+                return false;
+            progress.checkpoint_units = UINT64_MAX;
+            return true;
+        };
+        // Finish a retained detail prefix before new roots reuse the MD5 cursor.
+        const auto *partial = snapshot.files.find(work.hash.name);
+        if (partial && !hash_one(partial - snapshot.files.items)) return false;
+        for (size_t i = 0; i < snapshot.files.count; ++i)
+            if (!hash_one(i)) return false;
+        work.advance(Phase::Existing);
+    }
+    if (changes) changes->other_entries = true;
+    if (work.phase == Phase::Existing) {
+        checkpoint(progress, WorkStage::ExistingImport, "existing_import");
+        if (!team_id_ && !network_request(progress, operation, [&] { return client_.resolve_team_id(team_id_, &operation); })) {
+            set_error(error, error_size, client_.last_error());
+            return false;
+        }
+        if (state.import_id && state.team_id != team_id_) {
+            set_error(error, error_size, "import_team_changed");
+            return false;
+        }
+        if (!state.import_id && work.migrating && legacy.team_id == team_id_) {
+            state.import_id = legacy.import_id;
+            state.phase = 1;
+        }
+        if (state.import_id) {
+            if (!work.info_loaded && !network_request(progress, operation, [&] {
+                    return client_.get_import(state.import_id, info, &operation);
+                })) {
+                if (!missing_import(client_)) {
+                    set_error(error, error_size, client_.last_error());
+                    return false;
+                }
+                state.import_id = 0;
+                state.phase = 1;
+            } else {
+                work.info_loaded = true;
+                auto &remote = work.remote;
+                if (info.team_id != team_id_ ||
+                    !work.read_membership(client_, operation, progress)) {
+                    set_error(error, error_size, info.team_id != team_id_
+                        ? "import_team_changed" : client_.last_error());
+                    return false;
+                }
+                // Never automatically rewrite a multi-day or another machine's import.
+                if (remote.other_day || (remote.files.find("Identification.tgt") &&
+                                        !same_device(remote, snapshot.files))) {
+                    state.import_id = 0;
+                    state.phase = 1;
+                } else if (!merge_remote(snapshot.files, remote.files, error, error_size)) return false;
+            }
+        }
+        work.advance(Phase::Discovery);
+    }
+
+    // Find a day destination or recover remote state; confirmed days skip discovery.
+    if (work.phase == Phase::Discovery) {
+        if (!state.import_id || work.reconcile_objects) {
+            checkpoint(progress, WorkStage::Discovery, "discover_imports");
+            if (!inventory_->load(client_, team_id_, operation, progress, error, error_size)) return false;
+            for (size_t &offset = work.merge_offset; offset < inventory_->imports.length(); offset += sizeof(Inventory::Import)) {
+                checkpoint(progress, WorkStage::Merge, "merge_inventory", offset / sizeof(Inventory::Import) + 1);
+                if (!operation_allows(operation, error, error_size)) return false;
+                RemoteDay remote{day};
+                uint32_t id;
+                if (!inventory_->select(offset, day, remote, id)) {
+                    set_error(error, error_size, remote.invalid ? "remote_inventory_invalid" : "day_inventory_alloc");
+                    return false;
+                }
+                if (!remote.has_day || !same_device(remote, snapshot.files)) continue;
+                if (!merge_remote(snapshot.files, remote.files, error, error_size)) return false;
+                if (!state.import_id && !remote.other_day) state.import_id = id;
+            }
+        }
+        work.advance(Phase::Destination);
+    }
+    if (work.phase == Phase::Destination) {
+        checkpoint(progress, WorkStage::Destination, "destination");
+        if (!state.import_id) {
+            progress.phase = "create_import";
+            if (!network_request(progress, operation, [&] { return client_.create_import(team_id_, info, &operation); })) {
+                set_error(error, error_size, client_.last_error());
+                return false;
+            }
+            state.import_id = info.id;
+            state.phase = 1;
+        }
+        state.team_id = team_id_;
+        progress.import_id = state.import_id;
+        publish(progress, callback, context);
+        // Persist the destination before adding any files. A lost ACK is recovered
+        // from its remote inventory, rather than from an optimistic local bit mask.
+        if (!save_day(storage, paths, day, state)) {
+            set_error(error, error_size, "inflight_write");
+            return false;
+        }
+        if (work.migrating && !remove_journal(storage, legacy_paths)) {
+            set_error(error, error_size, "inflight_remove");
+            return false;
+        }
+        progress.phase = "import_status";
+        if (!wait_import(client_, state.import_id, operation, info, nullptr,
+                         progress, callback, context, error, error_size)) return false;
+        work.advance(Phase::Target);
+    }
+    if (work.phase == Phase::Target) {
+        auto &target = work.remote;
+        checkpoint(progress, WorkStage::Target, "target_inventory");
+        if (!work.read_membership(client_, operation, progress)) {
+            set_error(error, error_size, client_.last_error());
+            return false;
+        }
+        if (target.other_day || (target.files.find("Identification.tgt") &&
+                                !same_device(target, snapshot.files))) {
+            set_error(error, error_size, "remote_inventory_changed");
+            return false;
+        }
+        if (!merge_remote(snapshot.files, target.files, error, error_size)) return false;
+        bool changed = false;
         for (size_t i = 0; i < snapshot.files.count; ++i) {
             auto &f = snapshot.files.items[i];
+            const auto *remote = target.files.find(f.name, f.hash);
+            f.present = remote && remote->size == f.size && remote->root == f.root;
+            f.available |= f.present;
+            changed |= !f.present;
+        }
+        work.fingerprint = manifest_fingerprint(snapshot.files);
+        const bool recovered = state.phase == 2 && state.fingerprint == work.fingerprint &&
+            sleephq_classify_import_status(info.status) == SleepHqImportStatusKind::Success &&
+            info.processed_at[0] && strcmp(info.processed_at, state.processed_at) && !changed;
+        if (!recovered) {
+            // Reattach the desired STR last even if an older association with this
+            // hash exists alongside other STR revisions in the remote import.
+            if (auto *str = snapshot.files.find("STR.edf")) str->present &= str->counted;
+            state.phase = 1;
+            state.fingerprint = work.fingerprint;
+            if (!save_day(storage, paths, day, state)) {
+                set_error(error, error_size, "inflight_write");
+                return false;
+            }
+            work.advance(Phase::Files);
+        } else work.advance(Phase::Confirm);
+    }
+    if (work.phase == Phase::Files) {
+        for (size_t &i = work.file_index; i < snapshot.files.count; ++i) {
+            auto &f = snapshot.files.items[i];
             if (!operation_allows(operation, error, error_size)) return false;
-            ++progress.files_seen;
-            if (f.present) { ++progress.files_skipped; continue; }
+            const bool counted = f.counted;
+            if (!f.seen) ++progress.files_seen;
+            f.seen = true;
+            checkpoint(progress, WorkStage::Files, "attach", (i + 1) * 4);
+            if (f.present) {
+                if (!counted) ++progress.files_skipped;
+                f.counted = true;
+                ++progress.checkpoint_step;
+                progress.checkpoint_units = UINT64_MAX;
+                continue;
+            }
             char remote_path[32];
             snprintf(remote_path, sizeof(remote_path), f.root ? "./" : "./DATALOG/%s/", day);
             file_path(day, f, progress.file, sizeof(progress.file));
@@ -1146,35 +1465,79 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
             attach.path = remote_path;
             attach.content_hash = f.hash;
             SleepHqUploadResult result;
-            struct HashMatch { const DayFile *file; bool found; } match{&f, f.available || inventory_->known(f)};
+            struct HashMatch {
+                const DayFile *file; bool found;
+                Progress *progress; uint32_t page, received;
+            } match{&f, work.object_found || f.available || inventory_->known(f), &progress, 0, 0};
             // Normal day appends upload unknown objects without a per-file search.
             // Recovery can still find accepted objects missing their association.
-            bool more = reconcile_objects && !match.found;
-            for (uint32_t page = 1; more && !match.found; ++page) {
+            bool more = work.reconcile_objects && !match.found && !work.object_finished;
+            for (uint32_t &page = work.object_page; more && !match.found; ++page) {
                 size_t count = 0;
-                if (!client_.list_team_files(team_id_, page, 100,
+                match.page = page;
+                match.received = 0;
+                if (!network_request(progress, operation, [&] { return client_.list_team_files(team_id_, page, 100,
                     [](void *ctx, const SleepHqRemoteFile &remote) {
                         auto &m = *static_cast<HashMatch *>(ctx);
+                        m.progress->checkpoint_units = (uint64_t(m.page) << 32) | ++m.received;
                         if (!strcmp(remote.name, m.file->name) &&
                             !strcmp(remote.content_hash, m.file->hash) && remote.size == m.file->size)
                             m.found = true;
                         return true;
-                    }, &match, count, more, &operation, f.name)) {
+                    }, &match, count, more, &operation, f.name); })) {
                     set_error(error, error_size, client_.last_error());
                     return false;
                 }
                 operation.note_progress(millis());
+                progress.checkpoint_units = (uint64_t(page) << 32) | UINT32_MAX;
+                work.object_found = match.found;
+                work.object_finished = !more || match.found;
             }
+            ++progress.checkpoint_step;
+            progress.checkpoint_units = 0;
             if (match.found) {
-                if (!client_.attach_file(attach, result, &operation)) {
+                if (!network_request(progress, operation, [&] { return client_.attach_file(attach, result, &operation); })) {
                     set_error(error, error_size, client_.last_error());
                     return false;
                 }
                 ++progress.files_attached;
             } else {
+                struct YieldContext {
+                    Run *run; SdStorage::Session *storage;
+                    SdStorage::Session token;
+                    bool root;
+                } yielding{this, &storage, storage, f.root};
                 FileReader reader;
                 reader.storage = &storage;
                 reader.size = f.size;
+                reader.progress = &progress;
+                if (yield_) {
+                    reader.checkpoint_context = &yielding;
+                    reader.checkpoint = [](void *context) {
+                        auto &checkpoint = *static_cast<YieldContext *>(context);
+                        auto &run = *checkpoint.run;
+                        auto &work = *run.day_;
+                        if (!checkpoint.token.valid()) return false;
+                        run.checkpointed_ = true;
+                        if (!run.yield_(run.yield_context_)) return false;
+                        checkpoint.token = *checkpoint.storage;
+                        EdfCatalog::Status catalog;
+                        EdfCatalog::get_status(catalog);
+                        if (catalog.ready && work.catalog_revision == EdfCatalog::revision() &&
+                            work.files_revision == SdStorage::files_revision()) {
+                            work.source = *checkpoint.storage;
+                            run.checkpointed_ = false;
+                            return true;
+                        }
+                        run.refresh_pending_ = true;
+                        // STR can change without changing a finalized detail.
+                        // Finish that HTTP body, then refresh roots before any
+                        // verification or processing of the day's manifest.
+                        if (catalog.ready && !checkpoint.root &&
+                            work.files_revision == SdStorage::files_revision()) return true;
+                        return false;
+                    };
+                }
                 file_path(day, f, reader.path, sizeof(reader.path));
                 if (!reader.open()) { set_error(error, error_size, "source_changed"); return false; }
                 SleepHqUploadRequest upload;
@@ -1188,9 +1551,11 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
                 upload.ctx = &reader;
                 upload.operation = &operation;
                 progress.phase = "upload";
-                const bool ok = client_.upload_file(upload, result);
+                const bool ok = network_request(progress, operation,
+                    [&] { return client_.upload_file(upload, result); }, &work.upload_unknown);
                 reader.file.close();
                 if (!ok) { set_error(error, error_size, client_.last_error()); return false; }
+                work.upload_unknown = false;
                 ++progress.files_uploaded;
                 progress.bytes_uploaded += result.bytes;
             }
@@ -1202,11 +1567,19 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
                 return false;
             }
             operation.note_progress(millis());
+            progress.checkpoint_units = UINT64_MAX;
+            f.present = f.counted = true;
             publish(progress, callback, context);
+            if (refresh_pending_) return false;
+            work.object_page = 1;
+            work.object_found = work.object_finished = false;
         }
-        target.files.count = 0;
-        target.other_day = target.has_day = false;
-        if (!read_remote(client_, state.import_id, target, operation)) {
+        work.advance(Phase::Verify);
+    }
+    if (work.phase == Phase::Verify) {
+        auto &target = work.remote;
+        checkpoint(progress, WorkStage::Verify, "verify_inventory");
+        if (!work.read_membership(client_, operation, progress)) {
             set_error(error, error_size, client_.last_error());
             return false;
         }
@@ -1221,7 +1594,7 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
         }
         if (!verify_source(source, operation, error, error_size)) return false;
         // Capture the server's generation, not the ESP wall clock.
-        if (!client_.get_import(state.import_id, info, &operation)) {
+        if (!network_request(progress, operation, [&] { return client_.get_import(state.import_id, info, &operation); })) {
             set_error(error, error_size, client_.last_error());
             return false;
         }
@@ -1231,23 +1604,48 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
             set_error(error, error_size, "inflight_write");
             return false;
         }
-        progress.phase = "process_import";
-        if (!client_.process_import(state.import_id, &operation)) {
+        work.advance(Phase::Process);
+    }
+    if (work.phase == Phase::RecoverProcess) {
+        if (!network_request(progress, operation, [&] { return client_.get_import(state.import_id, info, &operation); })) {
             set_error(error, error_size, client_.last_error());
             return false;
         }
+        const auto kind = sleephq_classify_import_status(info.status);
+        const bool completed = kind == SleepHqImportStatusKind::Success &&
+            info.processed_at[0] && strcmp(info.processed_at, state.processed_at);
+        work.process_unknown = false;
+        work.advance(completed ? Phase::Confirm : status_needs_process(info.status) ||
+            kind == SleepHqImportStatusKind::Success || kind == SleepHqImportStatusKind::Failure
+                ? Phase::Process : Phase::WaitProcess);
+    }
+    if (work.phase == Phase::Process) {
+        checkpoint(progress, WorkStage::Process, "process_import");
+        if (!verify_source(source, operation, error, error_size)) return false;
+        if (!network_request(progress, operation,
+            [&] { return client_.process_import(state.import_id, &operation); }, &work.process_unknown)) {
+            set_error(error, error_size, client_.last_error());
+            return false;
+        }
+        work.process_unknown = false;
+        work.advance(Phase::WaitProcess);
+    }
+    if (work.phase == Phase::WaitProcess) {
         if (!wait_import(client_, state.import_id, operation, info, state.processed_at,
                          progress, callback, context, error, error_size)) return false;
+        work.advance(Phase::Confirm);
     }
     if (!verify_source(source, operation, error, error_size)) return false;
-    for (uint32_t i = 0; i < snapshot.count; ++i) {
+    for (uint32_t &i = work.confirm_index; i < snapshot.count; ++i) {
+        checkpoint(progress, WorkStage::Confirm, "confirm", i + 1);
+        if (!verify_source(source, operation, error, error_size)) return false;
         if (!write_marker(storage, legacy_paths, snapshot.entries[i])) {
             set_error(error, error_size, "done_marker_write");
             return false;
         }
     }
     state.phase = 0;
-    state.fingerprint = fingerprint;
+    state.fingerprint = work.fingerprint;
     copy_cstr(state.processed_at, sizeof(state.processed_at), info.processed_at);
     if (!save_day(storage, paths, day, state)) {
         set_error(error, error_size, "inflight_write");
@@ -1256,11 +1654,13 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
     Log::logf(CAT_EXPORT, LOG_INFO,
               "[SLEEPHQ] Day %s synchronized sessions=%lu import=%lu uploaded=%u attached=%u present=%u\n",
               day, (unsigned long)snapshot.count, (unsigned long)state.import_id,
-              progress.files_uploaded - uploaded_before, progress.files_attached - attached_before,
-              progress.files_skipped - present_before);
+              progress.files_uploaded - work.uploaded_before, progress.files_attached - work.attached_before,
+              progress.files_skipped - work.present_before);
     progress.file[0] = 0;
     progress.current_day[0] = 0;
     publish(progress, callback, context);
+    day_->finished = true;
+    work.advance(Phase::Done);
     return true;
 }
 

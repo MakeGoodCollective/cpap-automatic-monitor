@@ -84,6 +84,14 @@ struct RecordedBounds {
     bool present = false;
 };
 
+struct RecordScanPosition {
+    enum class Phase : uint8_t { Leading, Trailing, Done, Empty };
+    uint32_t ordinal = 0, record = 0;
+    uint32_t first = 0, slot = 0, valid_mask = 0;
+    Phase phase = Phase::Leading;
+    bool paired_pending = false;
+};
+
 // Our finalized BRP/PLD/SAD/EVE/CSL only: no CRC/SHA checks or recovery.
 // Reject incomplete/mismatched file sizes and unfinished record counts (-1).
 // Output is usable only on success; zero-record headers are valid.
@@ -114,8 +122,12 @@ bool visit_valid_intervals(const Reader &reader, const Header &header,
 // Selected numeric channel only: trim wholly invalid leading/trailing records,
 // retain any edge record with a valid sample (including zero), and do not trim
 // interior gaps. This is distinct from per-sample validity coverage above.
+// Optional position resumes after failed reads, including within a record.
+// ordinal counts completed records in traversal order, including the tail.
+// Reset position to {} when the source, header or selected signal changes.
+// A completed position returns the same bounds without reading again.
 bool recorded_bounds(const Reader &reader, const Header &header,
-                     size_t signal, RecordedBounds &out);
+                     size_t signal, RecordedBounds &out, RecordScanPosition *position = nullptr);
 
 // Skip timekeeping TALs, retain the one event-bearing TAL in our records.
 // EVE onset is publication/end: display its band at end-duration..end without

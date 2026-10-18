@@ -68,7 +68,9 @@ Lookup index_candidate(const SdStorage::Session &session, const uint8_t digest[3
 
 // One source, one record traversal, all selected tracks. Scratch lives in PSRAM
 // and is independent of duration. Base transposition and x4 passes read the
-// private binary spool, never source EDF again. No global state or new worker.
+// private binary spool, never source EDF again. The same 4 KiB input buffer
+// batches nearby spans; reduction checks cancellation at most 64 cells apart.
+// No global state or new worker.
 class Producer {
 public:
     // The token is copied; cancellation context must outlive the producer.
@@ -84,11 +86,16 @@ public:
     // Clears interruption only, never a permanent producer error.
     bool resume(const SdStorage::Session &session);
     uint32_t processed_records() const;
+    // Logical phase and completed bytes; stable across pause/resume.
+    uint64_t progress() const;
     // Retry the same record after interruption. Only a complete spool record
     // advances processed_records() and the source digest.
     bool record(const ReportEdf::Header &header, const uint8_t *data, size_t bytes);
     // False with error()=="interrupted" is resumable, including inside a tile
-    // or verification pass. Successful finish is idempotent.
+    // or verification pass. Successful finish is idempotent. Reboot rebuilds
+    // the source spool; tile checkpoints follow level boundaries after 1 MiB
+    // of new output, never after the final level. Lost tile output can span
+    // that budget plus one complete level, which can itself be large.
     bool finish(Publication &out);
     const char *error() const;
 

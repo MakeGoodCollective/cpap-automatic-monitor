@@ -2,6 +2,7 @@
 #if AB_STORAGE_HAS_SDCARD
 #include "report_artifact_builder.h"
 #include "crc.h"
+#include "debug_log.h"
 #include "hex_util.h"
 #include "memory_manager.h"
 #include <FS.h>
@@ -34,6 +35,9 @@ struct Digest {
 namespace {
 constexpr size_t PATH_BYTES = 192;
 constexpr size_t REFERENCE_BYTES = 116;
+constexpr uint32_t CHECKPOINT_MIN_BYTES = 1024 * 1024;
+constexpr uint32_t REDUCE_BATCH_CELLS = 64;
+constexpr size_t REDUCE_READBACK_BYTES = 16 * SdStorage::READ_CHUNK_BYTES;
 
 bool named_path(const char *prefix, const char *suffix, char (&out)[PATH_BYTES]) {
     const int count = snprintf(out, sizeof(out), "%s.%s", prefix, suffix);
@@ -50,16 +54,6 @@ bool content_path(const char *prefix, const uint8_t hash[32], char (&out)[PATH_B
     if (!end || !aircannect::hex_encode(hash, 32, text, sizeof(text), aircannect::HexCase::Lower)) return false;
     return snprintf(out, sizeof(out), "%.*s/%.*s%s%s.%s", int(end - prefix), prefix,
         document ? 2 : 0, text, document ? "/" : "", text, document ? "abp" : "abt") < int(sizeof(out));
-}
-
-bool exact_read(SdStorage::Reader &reader, uint64_t offset, uint8_t *out, size_t count) {
-    if (!reader.seek(offset)) return false;
-    for (size_t done = 0; done < count;) {
-        const size_t take = std::min(count - done, SdStorage::READ_CHUNK_BYTES);
-        if (reader.read(out + done, take) != take) return false;
-        done += take;
-    }
-    return true;
 }
 
 void reference_bytes(const uint8_t key[32], const Publication &publication,
@@ -90,7 +84,7 @@ Lookup lookup(const SdStorage::Session &session, const char *prefix,
     SdStorage::Reader reader;
     if (!reader.open(session, path)) return Lookup::Failed;
     if (reader.size() != sizeof(bytes)) return Lookup::Invalid;
-    if (!exact_read(reader, 0, bytes, sizeof(bytes))) return Lookup::Failed;
+    if (!reader.read_at(0, bytes, sizeof(bytes))) return Lookup::Failed;
     if (memcmp(bytes, "ABAREF01", 8) || memcmp(bytes + 12, key, 32) ||
         SdStorage::get_le32(bytes + 108) ||
         crc32_ieee(bytes, 112) != SdStorage::get_le32(bytes + 112)) return Lookup::Invalid;
@@ -99,7 +93,7 @@ Lookup lookup(const SdStorage::Session &session, const char *prefix,
     memcpy(out.source, bytes + 76, 32);
     reader.close();
     if (!content_path(prefix, out.digest, path) || !reader.open(session, path)) return Lookup::Failed;
-    if (reader.size() != out.bytes || !exact_read(reader, 0, bytes, HEADER_BYTES)) return Lookup::Invalid;
+    if (reader.size() != out.bytes || !reader.read_at(0, bytes, HEADER_BYTES)) return Lookup::Invalid;
     if (memcmp(bytes, "ABTILE01", 8) || SdStorage::get_le16(bytes + 8) != VERSION ||
         SdStorage::get_le32(bytes + 12) != out.bytes || memcmp(bytes + 20, out.source, 32)) return Lookup::Invalid;
     return Lookup::Ready;
@@ -150,7 +144,7 @@ Lookup document_head(const SdStorage::Session &session, const char *prefix, unsi
     if (!exists) return Lookup::Missing;
     SdStorage::Reader reader;
     uint8_t bytes[84];
-    if (!reader.open(session, path) || !exact_read(reader, 0, bytes, sizeof(bytes))) return Lookup::Failed;
+    if (!reader.open(session, path) || !reader.read_at(0, bytes, sizeof(bytes))) return Lookup::Failed;
     if (reader.size() != sizeof(bytes) || memcmp(bytes, "ABDOC001", 8) ||
         crc32_ieee(bytes, 80) != SdStorage::get_le32(bytes + 80)) return Lookup::Invalid;
     out.generation = SdStorage::get_le32(bytes + 8);
@@ -342,6 +336,16 @@ Lookup index_candidate(const SdStorage::Session &session, const uint8_t digest[3
 }
 
 struct Producer::Work {
+    struct Timings {
+        uint64_t setup = 0, spool = 0, base = 0, reduce = 0;
+        uint64_t checkpoint = 0, restore = 0, verify = 0, publish = 0;
+        uint64_t base_io = 0, reduce_io = 0, base_write = 0, reduce_write = 0;
+        uint64_t base_read = 0, reduce_read = 0, base_open = 0, reduce_open = 0;
+        uint64_t reduce_flush = 0;
+        uint32_t checkpoints = 0, pauses = 0;
+        bool enabled = Log::get_cat_level(CAT_REPORT) >= LOG_DEBUG, reported = false;
+    } timing;
+    static_assert(sizeof(Timings) <= 152, "bounded producer phase counters");
     enum class Phase : uint8_t {
         Records, Restore, RestoreBytes, RestoreCommit, Header, Tiles, Checkpoint,
         Seal, VerifyPart, PublishContent, VerifyExisting, RemovePart,
@@ -371,8 +375,10 @@ struct Producer::Work {
 
     Digest content;
     uint64_t made = 0;
+    uint32_t checkpointed = 0;
     size_t channel = 0, level_index = 0;
     uint32_t first = 0, at = 0, loaded = UINT32_MAX, children = 0;
+    uint32_t cached_spans = 0;
     Cell cell;
     bool base_values = false, tile_started = false;
 
@@ -418,16 +424,27 @@ struct Producer::Work {
         writer.close();
         writer_open = false;
     }
-    bool output_file(const char *path, uint64_t complete) {
+    bool output_file(const char *path, uint64_t complete,
+                     SdStorage::Writer::Mode mode = SdStorage::Writer::Mode::Sequential) {
         if (writer_open) return true;
-        writer_open = writer.open(session, path, complete, complete != 0);
+        writer_open = writer.open(session, path, complete, complete != 0, mode);
         return writer_open;
     }
     bool append(const uint8_t *bytes, size_t length) {
         if (!active()) return false;
-        if (!output_file(part_path, made) || !writer.write(bytes, length)) {
-            writer.close(); writer_open = false;
-            return fail("artifact_write");
+        {
+            auto &elapsed = level_index ? timing.reduce_write : timing.base_write;
+            Log::ScopedMicros measured(elapsed, timing.enabled && phase == Phase::Tiles);
+            bool opened;
+            {
+                auto &elapsed = level_index ? timing.reduce_open : timing.base_open;
+                Log::ScopedMicros measured(elapsed, timing.enabled && phase == Phase::Tiles);
+                opened = output_file(part_path, made, SdStorage::Writer::Mode::Readback);
+            }
+            if (!opened || !writer.write(bytes, length)) {
+                writer.close(); writer_open = false;
+                return fail("artifact_write");
+            }
         }
         if (!content.add(bytes, length)) return fail("artifact_digest");
         made += length;
@@ -435,7 +452,13 @@ struct Producer::Work {
     }
     bool checkpoint() {
         if (!active()) return false;
-        if (!output_file(part_path, made)) return fail("checkpoint_open");
+        // A live pause retains RAM cursors. Durable recovery can replay at
+        // most this byte budget plus the next complete level after a reboot.
+        // The final level goes straight to verified atomic publication.
+        if (made == metadata.bytes || made - checkpointed < CHECKPOINT_MIN_BYTES) return true;
+        Log::ScopedMicros measured(timing.checkpoint, timing.enabled);
+        if (timing.enabled) ++timing.checkpoints;
+        if (!output_file(part_path, made, SdStorage::Writer::Mode::Readback)) return fail("checkpoint_open");
         const bool flushed = writer.finish(made);
         writer_open = false;
         if (!flushed) return fail("checkpoint_flush");
@@ -447,15 +470,18 @@ struct Producer::Work {
         Document document;
         if (!named_path(prefix, "checkpoint", path) ||
             !document_publish(session, path, metadata.source, bytes, sizeof(bytes), document)) return fail("checkpoint_write");
+        checkpointed = made;
         return true;
     }
     void fresh() {
         close();
         content.reset();
         made = 0;
+        checkpointed = 0;
         phase = Phase::Header;
     }
     bool restore() {
+        Log::ScopedMicros measured(timing.restore, timing.enabled);
         char path[PATH_BYTES];
         Document document;
         aircannect::LargeTextBuffer saved(128, 128);
@@ -487,6 +513,7 @@ struct Producer::Work {
         return true;
     }
     bool restore_step() {
+        Log::ScopedMicros measured(timing.restore, timing.enabled);
         char scratch[PATH_BYTES];
         if (!reader && !reader.open(session, part_path)) return fail("checkpoint_open");
         if (restore_tail && (!named_path(prefix, "resume.part", scratch) ||
@@ -494,7 +521,7 @@ struct Producer::Work {
         while (restored < restore_bytes) {
             if (!active()) return false;
             const size_t take = std::min(sizeof(input), size_t(restore_bytes - restored));
-            if (!exact_read(reader, restored, input, take)) {
+            if (!reader.read_at(restored, input, take)) {
                 if (!session.valid()) return fail("interrupted");
                 fresh();
                 return true;
@@ -516,6 +543,7 @@ struct Producer::Work {
         return true;
     }
     bool restore_commit() {
+        Log::ScopedMicros measured(timing.restore, timing.enabled);
         if (restore_tail) {
             char scratch[PATH_BYTES];
             if (!named_path(prefix, "resume.part", scratch) || !output_file(scratch, restored)) return fail("checkpoint_open");
@@ -530,14 +558,15 @@ struct Producer::Work {
             if (!moved) return fail("checkpoint_restore");
         }
         made = restored;
+        checkpointed = restored;
         phase = Phase::Tiles;
         return true;
     }
     bool base() {
+        Log::ScopedMicros measured(timing.base, timing.enabled);
         const auto &track = metadata.tracks[channel];
         const auto &level = track.levels[0];
         if (made != level.offset + uint64_t(first / TILE_SAMPLES) * RAW_TILE_BYTES) return fail("artifact_layout");
-        if (!reader && (!reader.open(session, spool_path) || reader.size() != spooled)) return fail("spool_open");
         const uint32_t end = first + std::min<uint32_t>(TILE_SAMPLES, track.count - first);
         while (at < end) {
             if (!active()) return false;
@@ -545,17 +574,65 @@ struct Producer::Work {
             const uint32_t take = std::min(end - at, track.samples_per_record - slot);
             const uint64_t begin = uint64_t(record) * stride + offsets[channel];
             const size_t mask_begin = slot / 8, mask_bytes = (slot + take + 7) / 8 - mask_begin;
-            if (!base_values) {
-                if (!exact_read(reader, begin + slot * 2, input, take * 2)) return fail("spool_read");
-                base_values = true;
+            const size_t values_bytes = size_t(track.samples_per_record) * 2;
+            const size_t record_bytes = values_bytes + (track.samples_per_record + 7) / 8;
+            const bool cached = record_bytes <= sizeof(input) && loaded != UINT32_MAX &&
+                record >= loaded && record - loaded < cached_spans;
+            const uint8_t *values, *mask;
+            uint32_t bit_base;
+            if (!cached && !reader) {
+                Log::ScopedMicros measured(timing.base_io, timing.enabled);
+                bool opened;
+                {
+                    Log::ScopedMicros measured(timing.base_open, timing.enabled);
+                    opened = reader.open(session, spool_path);
+                }
+                if (!opened || reader.size() != spooled) return fail("spool_open");
             }
-            if (!active()) return false;
-            if (!exact_read(reader, begin + track.samples_per_record * 2 + mask_begin,
-                            input + TILE_SAMPLES * 2, mask_bytes)) return fail("spool_read");
+            if (record_bytes <= sizeof(input)) {
+                // Retain whole channel spans across tile boundaries. For
+                // narrow records, include neighbours only for spans at least
+                // as large as the mean selected span. This reduces calls while
+                // bounding overread by the actual selected channel count.
+                if (!cached) {
+                    Log::ScopedMicros measured(timing.base_io, timing.enabled);
+                    const size_t count = stride <= metadata.track_count * record_bytes ?
+                        std::min<size_t>(records - record, 1 + (sizeof(input) - record_bytes) / stride) : 1;
+                    {
+                        Log::ScopedMicros measured(timing.base_read, timing.enabled);
+                        if (!reader.read_at(begin, input, record_bytes + (count - 1) * stride)) return fail("spool_read");
+                    }
+                    loaded = record;
+                    cached_spans = count;
+                }
+                const size_t offset = size_t(record - loaded) * stride;
+                values = input + offset + slot * 2;
+                mask = input + offset + values_bytes;
+                bit_base = slot;
+            } else {
+                if (!base_values) {
+                    Log::ScopedMicros measured(timing.base_io, timing.enabled);
+                    {
+                        Log::ScopedMicros measured(timing.base_read, timing.enabled);
+                        if (!reader.read_at(begin + slot * 2, input, take * 2)) return fail("spool_read");
+                    }
+                    base_values = true;
+                }
+                if (!active()) return false;
+                {
+                    Log::ScopedMicros measured(timing.base_io, timing.enabled);
+                    Log::ScopedMicros read(timing.base_read, timing.enabled);
+                    if (!reader.read_at(begin + values_bytes + mask_begin,
+                                        input + TILE_SAMPLES * 2, mask_bytes)) return fail("spool_read");
+                }
+                values = input;
+                mask = input + TILE_SAMPLES * 2;
+                bit_base = slot - mask_begin * 8;
+            }
             for (uint32_t n = 0; n < take; ++n) {
-                const uint32_t bit = slot + n - mask_begin * 8;
-                const bool valid = (input[TILE_SAMPLES * 2 + bit / 8] >> (bit % 8)) & 1;
-                put_raw(output, at + n - first, int16_t(SdStorage::get_le16(input + n * 2)), valid);
+                const uint32_t bit = bit_base + n;
+                const bool valid = (mask[bit / 8] >> (bit % 8)) & 1;
+                put_raw(output, at + n - first, int16_t(SdStorage::get_le16(values + n * 2)), valid);
             }
             at += take;
             base_values = false;
@@ -563,28 +640,54 @@ struct Producer::Work {
         return append(output, RAW_TILE_BYTES);
     }
     bool reduce() {
+        Log::ScopedMicros measured(timing.reduce, timing.enabled);
         const auto &track = metadata.tracks[channel];
         const auto &previous = track.levels[level_index - 1], &level = track.levels[level_index];
         if (made != level.offset + uint64_t(first / TILE_SAMPLES) * REDUCED_TILE_BYTES) return fail("artifact_layout");
-        if (!reader) {
-            if (!output_file(part_path, made) || !writer.flush(made)) return fail("artifact_flush");
-            if (!reader.open(session, part_path)) return fail("artifact_open");
-        }
         const size_t input_bytes = level_index == 1 ? RAW_TILE_BYTES : REDUCED_TILE_BYTES;
+        // Large levels keep a sequential input stream instead of seeking the
+        // update-mode Writer back and forth across the growing file.
+        const bool readback = previous.bytes <= REDUCE_READBACK_BYTES;
         const uint32_t end = first + std::min<uint32_t>(TILE_SAMPLES, level.count - first);
         while (at < end) {
-            if (!active()) return false;
+            // Bound CPU work too, without asking the owner once per cell.
+            // Every SD read and output append still rechecks admission.
+            if (at % REDUCE_BATCH_CELLS == 0 && !active()) return false;
             const uint64_t begin = uint64_t(at) * 4;
             const uint32_t count = std::min<uint64_t>(4, previous.count - begin);
             while (children < count) {
                 const uint32_t p = begin + children, tile = p / TILE_SAMPLES;
-                if (loaded != tile) {
+                if (loaded == UINT32_MAX || tile < loaded || tile - loaded >= cached_spans) {
                     if (!active()) return false;
-                    if (!exact_read(reader, previous.offset + uint64_t(tile) * input_bytes,
-                                    input, input_bytes)) return fail("artifact_read");
+                    Log::ScopedMicros measured(timing.reduce_io, timing.enabled);
+                    {
+                        Log::ScopedMicros measured(timing.reduce_open, timing.enabled);
+                        if (!output_file(part_path, made, SdStorage::Writer::Mode::Readback)) return fail("artifact_open");
+                    }
+                    if (!readback && !reader) {
+                        {
+                            Log::ScopedMicros measured(timing.reduce_flush, timing.enabled);
+                            if (!writer.flush(made)) return fail("artifact_flush");
+                        }
+                        {
+                            Log::ScopedMicros measured(timing.reduce_open, timing.enabled);
+                            if (!reader.open(session, part_path)) return fail("artifact_open");
+                        }
+                    }
+                    const uint32_t count = std::min<size_t>(sizeof(input) / input_bytes,
+                        tile_count(previous.count) - tile);
+                    {
+                        Log::ScopedMicros measured(timing.reduce_read, timing.enabled);
+                        const uint64_t offset = previous.offset + uint64_t(tile) * input_bytes;
+                        const bool read = readback ? writer.read_at(offset, input, count * input_bytes) :
+                            reader.read_at(offset, input, count * input_bytes);
+                        if (!read) return fail("artifact_read");
+                    }
                     loaded = tile;
+                    cached_spans = count;
                 }
-                const Cell next = level_index == 1 ? raw_cell(input, p % TILE_SAMPLES) : get_cell(input, p % TILE_SAMPLES);
+                const auto *bytes = input + size_t(tile - loaded) * input_bytes;
+                const Cell next = level_index == 1 ? raw_cell(bytes, p % TILE_SAMPLES) : get_cell(bytes, p % TILE_SAMPLES);
                 if (next.valid > expected(track, previous, p) || !merge(cell, next)) return fail("artifact_cell");
                 ++children;
             }
@@ -623,15 +726,20 @@ struct Producer::Work {
                 return true;
             }
         }
+        reader.close();
         phase = Phase::Seal;
         return true;
     }
     bool verify(const char *path) {
-        if (!reader && (!reader.open(session, path) || reader.size() != publication.bytes)) return fail("artifact_length");
+        Log::ScopedMicros measured(timing.verify, timing.enabled);
+        if (!reader) {
+            if (!reader.open(session, path) || reader.size() != publication.bytes) return fail("artifact_length");
+            if (verified && !reader.seek(verified)) return fail("artifact_verify");
+        }
         while (verified < publication.bytes) {
             if (!active()) return false;
             const size_t take = std::min(sizeof(input), size_t(publication.bytes - verified));
-            if (!exact_read(reader, verified, input, take) || !verification.add(input, take)) return fail("artifact_verify");
+            if (reader.read(input, take) != take || !verification.add(input, take)) return fail("artifact_verify");
             verified += take;
         }
         uint8_t value[32];
@@ -640,6 +748,7 @@ struct Producer::Work {
         return true;
     }
     bool publish() {
+        Log::ScopedMicros measured(timing.publish, timing.enabled && phase != Phase::VerifyExisting);
         char final[PATH_BYTES], reference[PATH_BYTES];
         if (!content_path(prefix, publication.digest, final) || !reference_path(prefix, key, reference)) return fail("artifact_path");
         bool exists = false;
@@ -677,7 +786,7 @@ struct Producer::Work {
         if (!session.run([&](fs::FS &fs) { exists = fs.exists(reference); return true; })) return fail("reference_stat");
         if (exists) {
             if (!reader.open(session, reference) || reader.size() != sizeof(ref) ||
-                !exact_read(reader, 0, input, sizeof(ref)) || memcmp(input, ref, sizeof(ref))) return fail("reference_conflict");
+                !reader.read_at(0, input, sizeof(ref)) || memcmp(input, ref, sizeof(ref))) return fail("reference_conflict");
             reader.close();
         } else {
             bool moved = false;
@@ -687,6 +796,36 @@ struct Producer::Work {
         published = true;
         phase = Phase::Done;
         return true;
+    }
+    void log_timing() {
+        if (!timing.enabled || timing.reported) return;
+        timing.reported = true;
+        const char *name = strrchr(prefix, '/');
+        name = name ? name + 1 : prefix;
+        Log::logf(CAT_REPORT, LOG_DEBUG,
+            "artifact %.19s ms setup=%llu spool=%llu base=%llu reduce=%llu\n", name,
+            static_cast<unsigned long long>(timing.setup / 1000),
+            static_cast<unsigned long long>(timing.spool / 1000),
+            static_cast<unsigned long long>(timing.base / 1000),
+            static_cast<unsigned long long>(timing.reduce / 1000));
+        Log::logf(CAT_REPORT, LOG_DEBUG,
+            "artifact %.19s ms checkpoint=%llu restore=%llu verify=%llu publish=%llu\n", name,
+            static_cast<unsigned long long>(timing.checkpoint / 1000),
+            static_cast<unsigned long long>(timing.restore / 1000),
+            static_cast<unsigned long long>(timing.verify / 1000),
+            static_cast<unsigned long long>(timing.publish / 1000));
+        Log::logf(CAT_REPORT, LOG_DEBUG,
+            "artifact %.19s ms base_io=%llu reduce_io=%llu base_write=%llu reduce_write=%llu\n", name,
+            static_cast<unsigned long long>(timing.base_io / 1000),
+            static_cast<unsigned long long>(timing.reduce_io / 1000),
+            static_cast<unsigned long long>(timing.base_write / 1000),
+            static_cast<unsigned long long>(timing.reduce_write / 1000));
+        Log::logf(CAT_REPORT, LOG_DEBUG,
+            "artifact %.19s ms read=%llu open=%llu flush=%llu checkpoints=%lu pauses=%lu\n", name,
+            static_cast<unsigned long long>((timing.base_read + timing.reduce_read) / 1000),
+            static_cast<unsigned long long>((timing.base_open + timing.reduce_open) / 1000),
+            static_cast<unsigned long long>(timing.reduce_flush / 1000),
+            static_cast<unsigned long>(timing.checkpoints), static_cast<unsigned long>(timing.pauses));
     }
 };
 
@@ -704,6 +843,8 @@ const char *Producer::error() const {
 
 void Producer::pause() {
     if (!work_) return;
+    Log::ScopedMicros measured(work_->timing.setup, work_->timing.enabled);
+    if (work_->timing.enabled) ++work_->timing.pauses;
     work_->close();
     work_->paused = true;
     work_->interrupted = true;
@@ -712,6 +853,7 @@ void Producer::pause() {
 bool Producer::resume(const SdStorage::Session &session) {
     if (!work_ || work_->failure) return false;
     auto &w = *work_;
+    Log::ScopedMicros measured(w.timing.setup, w.timing.enabled);
     w.close();
     w.session = session;
     w.paused = false;
@@ -721,10 +863,33 @@ bool Producer::resume(const SdStorage::Session &session) {
 
 uint32_t Producer::processed_records() const { return work_ ? work_->written_records : 0; }
 
+uint64_t Producer::progress() const {
+    if (!work_) return 0;
+    const auto &w = *work_;
+    using Phase = Work::Phase;
+    uint64_t phase = 0, bytes = 0;
+    switch (w.phase) {
+    case Phase::Records: bytes = w.spooled; break;
+    case Phase::Restore: case Phase::RestoreBytes: case Phase::RestoreCommit:
+        phase = 1; bytes = w.restored; break;
+    case Phase::Header: case Phase::Tiles: case Phase::Checkpoint: case Phase::Seal:
+        phase = 2; bytes = w.made; break;
+    case Phase::VerifyPart: phase = 3; bytes = w.verified; break;
+    case Phase::PublishContent: phase = 4; break;
+    case Phase::VerifyExisting: phase = 4; bytes = w.verified; break;
+    case Phase::RemovePart: phase = 5; break;
+    case Phase::Reference: phase = 6; break;
+    case Phase::PublishReference: phase = 7; break;
+    case Phase::Done: phase = 8; break;
+    }
+    return (phase << 56) | bytes;
+}
+
 bool Producer::begin(const char *prefix, const uint8_t key[32], const ReportEdf::Header &header,
                      const Selection *tracks, size_t count) {
     if (!work_) return false;
     auto &w = *work_;
+    Log::ScopedMicros measured(w.timing.setup, w.timing.enabled);
     if (!w.active() || w.started) return w.fail("artifact_state");
     w.started = true;
     if (!std::isfinite(header.record_seconds) || header.record_seconds <= 0 ||
@@ -781,15 +946,34 @@ bool Producer::begin(const char *prefix, const uint8_t key[32], const ReportEdf:
 bool Producer::record(const ReportEdf::Header &header, const uint8_t *data, size_t bytes) {
     if (!work_ || !work_->active()) return false;
     auto &w = *work_;
+    Log::ScopedMicros measured(w.timing.spool, w.timing.enabled);
     if (!w.started || w.phase != Work::Phase::Records || !data || w.written_records >= w.records ||
         bytes != header.record_bytes) return w.fail("artifact_record");
     if (!w.output_file(w.spool_path, w.spooled)) return w.fail("spool_open");
+    const bool whole_record = w.stride <= sizeof(w.input);
     for (; w.record_channel < w.metadata.track_count; ++w.record_channel) {
+        if (!w.active()) return false;
         ReportEdf::RecordSamples samples;
         if (!ReportEdf::record_samples(header, data, bytes, w.signals[w.record_channel], samples)) return w.fail("artifact_record");
         const size_t count = samples.signal->samples_per_record;
         const size_t mask = (count + 7) / 8;
         if (mask > sizeof(w.input)) return w.fail("artifact_record_size");
+        if (count * 2 + mask <= sizeof(w.input)) {
+            auto *encoded = w.input + (whole_record ? w.offsets[w.record_channel] : 0);
+            memset(encoded + count * 2, 0, mask);
+            for (size_t n = 0; n < count; ++n) {
+                const auto sample = samples[n];
+                SdStorage::put_le16(encoded + n * 2, uint16_t(sample.raw));
+                if (sample.valid) encoded[count * 2 + n / 8] |= 1u << (n % 8);
+            }
+            if (whole_record) continue;
+            if (!w.writer.write(w.input, count * 2 + mask)) {
+                w.writer.close(); w.writer_open = false;
+                return w.fail("spool_write");
+            }
+            w.spooled += count * 2 + mask;
+            continue;
+        }
         while (w.record_sample < count) {
             if (!w.active()) return false;
             const size_t take = std::min<size_t>(count - w.record_sample, sizeof(w.input) / 2);
@@ -812,6 +996,14 @@ bool Producer::record(const ReportEdf::Header &header, const uint8_t *data, size
         w.spooled += mask;
         w.record_sample = 0;
     }
+    if (whole_record) {
+        if (!w.active()) return false;
+        if (!w.writer.write(w.input, w.stride)) {
+            w.writer.close(); w.writer_open = false;
+            return w.fail("spool_write");
+        }
+        w.spooled += w.stride;
+    }
     if (!w.source.add(data, bytes)) return w.fail("artifact_digest");
     ++w.written_records;
     w.record_channel = 0;
@@ -826,6 +1018,7 @@ bool Producer::finish(Publication &out) {
         if (!w.active()) return false;
         switch (w.phase) {
         case Work::Phase::Records: {
+            Log::ScopedMicros measured(w.timing.spool, w.timing.enabled);
             if (w.written_records != w.records || !w.output_file(w.spool_path, w.spooled)) return w.fail("spool_finish");
             const bool flushed = w.writer.finish(w.spooled);
             w.writer_open = false;
@@ -844,6 +1037,7 @@ bool Producer::finish(Publication &out) {
             break;
         case Work::Phase::Header:
             if (!w.made) {
+                Log::ScopedMicros measured(w.timing.setup, w.timing.enabled);
                 // A rejected checkpoint may leave an arbitrary private tail.
                 if (!encode(w.metadata, w.output, sizeof(w.output))) return w.fail("artifact_layout");
                 if (!w.append(w.output, w.metadata.header_bytes)) return false;
@@ -860,7 +1054,9 @@ bool Producer::finish(Publication &out) {
             w.phase = Work::Phase::Tiles;
             break;
         case Work::Phase::Seal: {
-            if (w.made != w.metadata.bytes || !w.output_file(w.part_path, w.made)) return w.fail("artifact_finish");
+            Log::ScopedMicros measured(w.timing.setup, w.timing.enabled);
+            if (w.made != w.metadata.bytes ||
+                !w.output_file(w.part_path, w.made, SdStorage::Writer::Mode::Readback)) return w.fail("artifact_finish");
             const bool flushed = w.writer.finish(w.made);
             w.writer_open = false;
             if (!flushed || !w.content.snapshot(w.publication.digest)) return w.fail("artifact_finish");
@@ -878,6 +1074,7 @@ bool Producer::finish(Publication &out) {
             break;
         }
     }
+    w.log_timing();
     out = w.publication;
     return true;
 }

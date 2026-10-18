@@ -916,8 +916,7 @@ static void sendReportResult(AsyncWebServerRequest *request, SleepReport::Source
         auto *response = new (std::nothrow) ReportResponse(code, std::move(result));
         if (response) request->send(response);
         else request->send(503, "application/json", "{\"error\":\"report_allocation_failed\"}");
-    } else if (code == 202 || (!pending && code == 503)) {
-        // Admission succeeded; a contended result lock is still an accepted job.
+    } else if (code == 202) {
         sendReportJob(request, source, id, pending);
     } else {
         request->send(code, "application/json", "{\"error\":\"report_job_unavailable\"}");

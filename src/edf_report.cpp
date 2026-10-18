@@ -47,7 +47,8 @@ size_t Result::read(size_t offset, char *out, size_t capacity) const {
 
 Result::~Result() { reset(); }
 Result::Result(Result &&other) noexcept
-    : id_(std::exchange(other.id_, 0)), data_(std::exchange(other.data_, nullptr)),
+    : id_(std::exchange(other.id_, 0)), readers_(std::exchange(other.readers_, nullptr)),
+      data_(std::exchange(other.data_, nullptr)),
       length_(std::exchange(other.length_, 0)) {}
 
 }  // namespace EdfReport
@@ -58,11 +59,11 @@ Result::Result(Result &&other) noexcept
 #include "air10_str_timeline.h"
 #include "airsense_state.h"
 #include "edf_catalog.h"
-#include "export_sync.h"
 #include "debug_log.h"
 #include "memory_manager.h"
 #include "large_text_buffer.h"
 #include "json_util.h"
+#include "job_progress_watch.h"
 #include "hex_util.h"
 #include "report_edf.h"
 #include "report_artifact_builder.h"
@@ -88,6 +89,10 @@ constexpr size_t INTERNAL_WORK = 8 * 1024;
 constexpr uint32_t RETAIN_MS = 6 * 60 * 60 * 1000;
 constexpr uint32_t DELIVERY_MS = 30000;
 constexpr uint32_t FOREGROUND_QUIET_MS = 1000;
+constexpr uint8_t FOREGROUND_BURST = 3;
+constexpr uint32_t FOREGROUND_TURN_MS = 5000;
+constexpr uint32_t BACKGROUND_TURN_MS = 100;
+constexpr uint32_t DAYS_PROTECTED_TURN_MS = 1000;
 constexpr size_t SLOT_COUNT = 2;
 constexpr size_t RETAINED_SLOTS = 32;
 constexpr double LEAK_THRESHOLD = 24;
@@ -303,26 +308,50 @@ struct Job {
     JobState state = JobState::Free;
     uint32_t id = 0, completed_ms = 0, data_revision = 0, cache_generation = 0;
     uint32_t artifact_revision = 0, files_revision = 0;
-    uint16_t readers = 0;
+    std::atomic<uint16_t> readers{0};
     uint16_t consumers = 1, deliveries = 0;
     bool delivered = false, cancelled = false, shared = false;
     bool background = false, recovered_index = false;
     mutable bool storage_yielded = false;
     uint32_t foreground_epoch = 0;
+    uint32_t days_epoch = 0;
+    uint32_t turn_started_ms = 0, turn_budget_ms = 0;
+    bool protected_turn = false, backfill_waiting = false;
+    mutable aircannect::JobProgressPoint turn_progress;
+    mutable bool turn_progress_set = false;
     int code = 0;
     const char *error = nullptr;
     mutable const char *issue = nullptr;
     mutable char issue_path[96] = {};
     mutable RetainedIssue accepted_issue;
     mutable uint64_t source_bytes = 0;
-    mutable uint32_t source_reads = 0, source_us = 0, tiles_us = 0;
+    mutable uint64_t source_us = 0, tiles_us = 0;
+    mutable uint64_t sleep_us = 0, observe_us = 0;
+    mutable uint64_t cleanup_us = 0, headroom_us = 0;
+    mutable uint32_t headroom_calls = 0;
+    mutable uint32_t source_reads = 0;
+    mutable uint32_t max_idle_ms = 0;
+    uint32_t admitted_ms = 0, attempts = 0, yields = 0;
+    uint64_t active_us = 0, index_us = 0;
+    // Histogram and resumed source work are subsets of their phases. Resume
+    // includes useful build_session work, not just reopening a paused input.
+    uint64_t prepare_numeric_us = 0, prepare_events_us = 0, prepare_histograms_us = 0;
+    uint64_t prepare_history_us = 0, prepare_summary_us = 0, prepare_publish_us = 0, prepare_resume_us = 0;
     bool diagnostics = false;
+    mutable aircannect::JobProgressWatch progress;
+    const char *wait_reason = "queued";
+    bool indexing = false;
+    uint32_t listed_days = 0;
     Payload body;
     mutable std::unique_ptr<SessionBuild> build;
     std::unique_ptr<SummaryWork> summary;
     std::unique_ptr<HistoryWork> history;
     std::unique_ptr<PrepareWork> preparation;
 };
+
+void observe_report_jobs(bool force = false, bool retained = false,
+                         const Job *io_job = nullptr, const SdStorage::IoEvent *io_event = nullptr);
+aircannect::JobProgressPoint report_progress_point(const Job &job);
 
 bool note_issue(const Job &job, const char *reason, const char *path = "") {
     if (!job.issue) {
@@ -361,15 +390,18 @@ struct SourceIssueScope {
     }
 };
 
+const char *action_name(Action action) {
+    return action == Action::Days ? "days" : action == Action::Summary ? "summary" :
+        action == Action::History ? "history" : action == Action::Prepare ? "prepare" : "reindex";
+}
+
 void log_result(const Job &job) {
     const bool expected = job.code == 409 || job.code == 410;
     const char *reason = expected ? job.error : job.issue ? job.issue : job.error;
     Log::logf(CAT_REPORT, expected ? LOG_DEBUG : job.code >= 500 ? LOG_ERROR :
         job.issue ? LOG_WARN : LOG_DEBUG,
         "EDF job=%lu %s day=%u code=%d %s path=%s\n",
-        (unsigned long)job.id, job.request.action == Action::Days ? "days" :
-        job.request.action == Action::Summary ? "summary" : job.request.action == Action::History ? "history" :
-        job.request.action == Action::Prepare ? "prepare" : "reindex",
+        (unsigned long)job.id, action_name(job.request.action),
         unsigned(job.request.day), job.code, reason ? reason : "complete",
         expected || !job.issue_path[0] ? "-" : job.issue_path);
 }
@@ -379,7 +411,7 @@ struct JobTiming {
     uint32_t id, started_us;
     Action action;
     uint32_t index_us = 0;
-    const Job *job;
+    Job *job;
 
     explicit JobTiming(Job *job)
         : enabled(job && Log::get_cat_level(CAT_REPORT) >= LOG_DEBUG),
@@ -387,34 +419,66 @@ struct JobTiming {
           action(job ? job->request.action : Action::Days), job(job) {
         if (job) {
             job->diagnostics = enabled;
-            job->source_bytes = 0;
-            job->source_reads = job->source_us = job->tiles_us = 0;
+            ++job->attempts;
         }
     }
 
     uint32_t stamp() const { return enabled ? micros() : 0; }
 
-    void log(int code, size_t bytes) const {
+    void finish(bool yielded = false) {
+        if (!job) return;
+        if (enabled) {
+            job->active_us += uint32_t(stamp() - started_us);
+            job->index_us += index_us;
+        }
+        if (yielded) ++job->yields;
+        started_us = stamp();
+        index_us = 0;
+    }
+
+    void log() {
         if (!enabled) return;
+        finish();
         Log::logf(CAT_REPORT, LOG_DEBUG,
-            "report job=%lu action=%s code=%d bytes=%u ms total=%lu "
-            "idx=%lu src=%lu tiles=%lu\n",
-            static_cast<unsigned long>(id), action == Action::Days ? "days" :
-                action == Action::Summary ? "summary" : action == Action::History ? "history" :
-                action == Action::Prepare ? "prepare" : "reindex", code,
-            static_cast<unsigned>(bytes), static_cast<unsigned long>((stamp() - started_us) / 1000),
-            static_cast<unsigned long>(index_us / 1000), static_cast<unsigned long>(job->source_us / 1000),
-            static_cast<unsigned long>(job->tiles_us / 1000));
-        if (job->source_reads) Log::logf(CAT_REPORT, LOG_DEBUG,
-            "report job=%lu source reads=%lu bytes=%llu\n", static_cast<unsigned long>(id),
-            static_cast<unsigned long>(job->source_reads), static_cast<unsigned long long>(job->source_bytes));
+            "report job=%lu ms elapsed=%lu active=%llu attempts=%lu yields=%lu gap_ms=%lu\n",
+            static_cast<unsigned long>(id), static_cast<unsigned long>(millis() - job->admitted_ms),
+            static_cast<unsigned long long>(job->active_us / 1000),
+            static_cast<unsigned long>(job->attempts), static_cast<unsigned long>(job->yields),
+            static_cast<unsigned long>(job->max_idle_ms));
+        Log::logf(CAT_REPORT, LOG_DEBUG, "report job=%lu ms idx=%llu src=%llu tiles=%llu histograms=%llu\n",
+            static_cast<unsigned long>(id), static_cast<unsigned long long>(job->index_us / 1000),
+            static_cast<unsigned long long>(job->source_us / 1000),
+            static_cast<unsigned long long>(job->tiles_us / 1000),
+            static_cast<unsigned long long>(job->prepare_histograms_us / 1000));
+        Log::logf(CAT_REPORT, LOG_DEBUG,
+            "report job=%lu source reads=%lu bytes=%llu headroom_ms=%llu calls=%lu\n",
+            static_cast<unsigned long>(id), static_cast<unsigned long>(job->source_reads),
+            static_cast<unsigned long long>(job->source_bytes),
+            static_cast<unsigned long long>(job->headroom_us / 1000),
+            static_cast<unsigned long>(job->headroom_calls));
+        if (action == Action::Prepare) {
+            Log::logf(CAT_REPORT, LOG_DEBUG, "report job=%lu ms numeric=%llu events=%llu cleanup=%llu obs=%llu\n",
+                static_cast<unsigned long>(id), static_cast<unsigned long long>(job->prepare_numeric_us / 1000),
+                static_cast<unsigned long long>(job->prepare_events_us / 1000),
+                static_cast<unsigned long long>(job->cleanup_us / 1000),
+                static_cast<unsigned long long>(job->observe_us / 1000));
+            Log::logf(CAT_REPORT, LOG_DEBUG, "report job=%lu ms history=%llu summary=%llu pub=%llu sleep=%llu\n",
+                static_cast<unsigned long>(id), static_cast<unsigned long long>(job->prepare_history_us / 1000),
+                static_cast<unsigned long long>(job->prepare_summary_us / 1000),
+                static_cast<unsigned long long>(job->prepare_publish_us / 1000),
+                static_cast<unsigned long long>(job->sleep_us / 1000));
+        }
     }
 };
 
 struct JobPool {
-    Job fallback[SLOT_COUNT];
+    Job fallback[SLOT_COUNT + 1];
     Job *data = fallback;
-    size_t count = SLOT_COUNT;
+    size_t count = SLOT_COUNT + 1;
+    // Admission/removal publishes these IDs under status_mux. Contended reads
+    // can validate a token without touching a Job being reset under mutex.
+    uint32_t retained_ids[RETAINED_SLOTS] = {};
+    bool delivery_waiting = false;
     Job *begin() { return data; }
     Job *end() { return data + count; }
 } jobs;
@@ -424,6 +488,20 @@ portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
 Status status;
 uint32_t next_id = 1, data_revision = 1;
 uint32_t foreground_epoch = 0;
+uint32_t days_epoch = 0;
+uint8_t foreground_turns = 0;
+uint8_t days_turns = 0;
+bool backfill_due = false;
+uint32_t backfill_work_ms = 0;
+enum class MaintenancePhase : uint8_t { Index, Publish, IndexGc, ArtifactGc, Count };
+struct MaintenanceProgress {
+    aircannect::JobProgressWatch watch;
+    MaintenancePhase phase = MaintenancePhase::Index;
+    uint64_t cursor = 0, steps = 0;
+    const char *wait_reason = "working";
+    bool active = false, complete = false, observing = false;
+} maintenance_progress[size_t(MaintenancePhase::Count)];
+MaintenanceProgress *maintenance_io = nullptr;
 uint32_t artifact_reads = 0;
 uint32_t foreground_at = 0;
 bool foreground_seen = false;
@@ -491,8 +569,8 @@ enum class IndexFailure : uint8_t { Error, WaitingCatalog, Preempted };
 IndexFailure index_failure = IndexFailure::Error;
 const char *index_error = nullptr;
 size_t index_error_entry = SIZE_MAX;
-bool migrate_cache(const SdStorage::Session &session);
-bool artifact_headroom(const SdStorage::Session &session, uint16_t day);
+bool migrate_cache(const SdStorage::Session &session, const Job *job);
+bool artifact_headroom(const SdStorage::Session &session, uint16_t day, const Job &job);
 void invalidate_str();
 bool dataset(const SdStorage::Session &session);
 
@@ -592,8 +670,21 @@ bool reusable(const Job &job) {
             (job.code == 200 && !job.issue ? RETAIN_MS : DELIVERY_MS)));
 }
 void reset_job(Job &job) {
+    portENTER_CRITICAL(&status_mux);
+    jobs.retained_ids[&job - jobs.data] = 0;
+    portEXIT_CRITICAL(&status_mux);
     job.~Job();
     new (&job) Job;
+}
+
+// Caller holds mutex; publish only fully admitted slots, before returning IDs.
+void admit_job(Job &job) {
+    job.admitted_ms = millis();
+    portENTER_CRITICAL(&status_mux);
+    jobs.retained_ids[&job - jobs.data] = job.id;
+    portEXIT_CRITICAL(&status_mux);
+    if (!job.background && job.request.action == Action::Days)
+        __atomic_add_fetch(&days_epoch, 1, __ATOMIC_RELEASE);
 }
 
 // Caller holds mutex. Undelivered results get the existing delivery grace;
@@ -620,13 +711,47 @@ bool aborted(const Job *job, const SdStorage::Session &session, bool cooperative
     // CPU codec/histogram loops also yield without a delay per sample or tile.
     static uint32_t batch_us = 0;
     const uint32_t now = micros();
-    if (uint32_t(now - batch_us) >= 4000) { vTaskDelay(1); batch_us = micros(); }
+    if (uint32_t(now - batch_us) >= 4000) {
+        vTaskDelay(1);
+        batch_us = micros();
+        if (job && job->diagnostics) job->sleep_us += uint32_t(batch_us - now);
+    }
+    const uint32_t observed = job && job->diagnostics ? micros() : 0;
+    observe_report_jobs();
+    if (job && job->diagnostics) job->observe_us += uint32_t(micros() - observed);
     if (cooperative && session.yield_requested()) {
         if (job) job->storage_yielded = true;
         return true;
     }
+    const bool backfill_limit = cooperative && job && !job->background &&
+        job->request.action != Action::Days && job->backfill_waiting &&
+        uint32_t(millis() - job->turn_started_ms) >= FOREGROUND_TURN_MS;
+    const bool turn_limit = cooperative && job && job->protected_turn &&
+        uint32_t(millis() - job->turn_started_ms) >= job->turn_budget_ms;
+    bool advanced = false;
+    if (cooperative && job) {
+        // Seed at the first real checkpoint, not the transient indexing flag
+        // on every resume. Reopening alone cannot spend the useful turn.
+        if (!job->turn_progress_set) {
+            job->turn_progress = report_progress_point(*job);
+            job->turn_progress_set = true;
+        } else if (backfill_limit || turn_limit) {
+            const auto point = report_progress_point(*job);
+            advanced = point.step > job->turn_progress.step ||
+                (point.step == job->turn_progress.step && point.units > job->turn_progress.units);
+        }
+    }
+    const bool backfill_turn = backfill_limit && advanced;
+    if (backfill_turn) backfill_due = true;
+    if (cooperative && job &&
+        (backfill_turn || (turn_limit && advanced) ||
+         (!job->protected_turn &&
+          ((job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE)) ||
+           (job->request.action != Action::Days && job->days_epoch != __atomic_load_n(&days_epoch, __ATOMIC_ACQUIRE)))))) {
+        job->storage_yielded = true;
+        return true;
+    }
     return (job && __atomic_load_n(&job->cancelled, __ATOMIC_ACQUIRE)) ||
-        (job && job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE)) ||
         !AirSenseState::local_background_allowed() || !session.valid();
 }
 
@@ -682,7 +807,7 @@ bool fingerprint(const SdStorage::Session &session, IndexedSession &entry) {
     });
 }
 
-bool refresh_index(const SdStorage::Session &session) {
+bool refresh_index(const SdStorage::Session &session, const Job *job = nullptr) {
     index_failure = IndexFailure::Error;
     index_error = "catalog_status";
     index_error_entry = SIZE_MAX;
@@ -692,7 +817,7 @@ bool refresh_index(const SdStorage::Session &session) {
         incremental = EdfCatalog::changes_since(catalog_generation, changes);
         return changes.catalog.ready;
     })) {
-        if (aborted(nullptr, session)) index_failure = IndexFailure::Preempted;
+        if (aborted(job, session)) index_failure = IndexFailure::Preempted;
         else if (!changes.catalog.ready) index_failure = IndexFailure::WaitingCatalog;
         return false;
     }
@@ -735,7 +860,7 @@ bool refresh_index(const SdStorage::Session &session) {
     } else ++index_scan.resumes;
     const size_t count = index_scan.full ? index_count : changes.count;
     for (; index_scan.next < count; ++index_scan.next) {
-        if (aborted(nullptr, session)) {
+        if (aborted(job, session)) {
             index_failure = IndexFailure::Preempted;
             return false;
         }
@@ -785,15 +910,15 @@ bool refresh_index(const SdStorage::Session &session) {
     }
     if (index_scan.full) {
         cache_usage_known = false;
-        if (!migrate_cache(session)) {
+        if (!migrate_cache(session, job)) {
             index_error = "cache_migrate";
-            if (aborted(nullptr, session)) index_failure = IndexFailure::Preempted;
+            if (aborted(job, session)) index_failure = IndexFailure::Preempted;
             return false;
         }
     }
     EdfCatalog::Status current;
     EdfCatalog::get_status(current);
-    if (aborted(nullptr, session) || !current.ready || current.generation != index_scan.catalog ||
+    if (aborted(job, session) || !current.ready || current.generation != index_scan.catalog ||
         SdStorage::files_revision() != index_scan.files ||
         __atomic_load_n(&invalidation_generation, __ATOMIC_ACQUIRE) != index_scan.invalidation) {
         index_failure = IndexFailure::Preempted;
@@ -842,9 +967,9 @@ struct Input {
         aircannect::Memory::free(header);
         aircannect::Memory::free(record);
     }
-    size_t read_source(uint8_t *out, size_t bytes) {
+    size_t read_source(uint64_t offset, uint8_t *out, size_t bytes) {
         const uint32_t started = job->diagnostics ? micros() : 0;
-        const size_t count = file.read(out, bytes);
+        const size_t count = file.read_at(offset, out, bytes) ? bytes : 0;
         if (job->diagnostics) {
             job->source_us += uint32_t(micros() - started);
             job->source_bytes += count;
@@ -879,7 +1004,6 @@ struct Input {
         reader = {[](void *ctx, uint64_t offset, uint8_t *out, size_t count) {
             auto &input = *static_cast<Input *>(ctx);
             if (aborted(input.job, input.session, !input.reading_header)) return false;
-            auto &file = input.file;
             const auto &header = *input.header;
             if (input.record && header.record_bytes && offset >= header.header_bytes &&
                 offset + count <= header.header_bytes + uint64_t(header.records) * header.record_bytes) {
@@ -891,11 +1015,10 @@ struct Input {
                     return true;
                 }
             }
-            if (!file.seek(offset)) return note_issue(*input.job, "source_seek", input.path);
             size_t done = 0;
             while (done < count) {
                 const size_t take = std::min(count - done, SdStorage::READ_CHUNK_BYTES);
-                if (input.read_source(out + done, take) != take)
+                if (input.read_source(offset + done, out + done, take) != take)
                     return note_issue(*input.job, "source_read", input.path);
                 done += take;
             }
@@ -926,11 +1049,11 @@ struct Input {
             record_loaded = 0;
         }
         if (record_loaded == header->record_bytes) return true;
-        if (!file.seek(base + record_loaded)) return note_issue(*job, "source_seek", path);
         while (record_loaded < header->record_bytes) {
             if (aborted(job, session)) return false;
             const size_t take = std::min<size_t>(header->record_bytes - record_loaded, SdStorage::READ_CHUNK_BYTES);
-            if (read_source(record + record_loaded, take) != take) return note_issue(*job, "source_read", path);
+            if (read_source(base + record_loaded, record + record_loaded, take) != take)
+                return note_issue(*job, "source_read", path);
             record_loaded += take;
         }
         return true;
@@ -1043,7 +1166,10 @@ struct ArtifactBuild {
         if (!complete && !aborted(input.job, input.session))
             note_issue(*input.job, producer->error(), input.path);
         if (input.job->diagnostics) input.job->tiles_us += uint32_t(micros() - started);
-        if (complete) producer.reset();
+        if (complete) {
+            Log::ScopedMicros measured(input.job->cleanup_us, input.job->diagnostics);
+            producer.reset();
+        }
         return complete;
     }
 };
@@ -1292,55 +1418,6 @@ struct PartGuard {
 bool start_part(PartGuard &, const uint8_t *, size_t);
 bool finish_part(PartGuard &, const char *, uint64_t);
 
-bool store_cache(const SdStorage::Session &session, const Job &job, const IndexedSession &entry,
-                 SessionData &data) {
-    if (data.header.events > MAX_DISK_EVENTS) return false;
-    char path[96], part[96];
-    cache_path(entry, "stats", path);
-    cache_path(entry, "stats.part", part);
-    data.header.bytes = sizeof(data.header) + total_bins(data.header) * sizeof(uint64_t) +
-        data.header.events * sizeof(Event);
-    if (!artifact_headroom(session, entry.day)) return false;
-    PartGuard part_guard{session, part};
-    if (!start_part(part_guard, reinterpret_cast<const uint8_t *>(&data.header), sizeof(data.header)) ||
-        !part_guard.writer.write(reinterpret_cast<const uint8_t *>(data.bins),
-                                 total_bins(data.header) * sizeof(uint64_t))) return false;
-    if (data.header.events <= MAX_EVENTS) {
-        if (!part_guard.writer.write(reinterpret_cast<const uint8_t *>(data.events),
-                                     data.header.events * sizeof(Event))) return false;
-    } else {
-        // Persist all events with a bounded block, not just the in-RAM prefix.
-        Input input(session, job);
-        Event block[32];
-        uint32_t events = 0;
-        size_t used = 0;
-        for (uint8_t kind : {uint8_t(3), uint8_t(4)}) {
-            if (!(entry.key.present & (1u << kind))) continue;
-            if (!input.open(session, entry, kind)) return false;
-            for (uint32_t i = 0; i < input.header->records; ++i) {
-                Event event;
-                if (!read_event(input, i, event)) return false;
-                if (event.kind == ReportEdf::EventKind::Unknown) continue;
-                block[used++] = event;
-                ++events;
-                if (used == 32) {
-                    if (!part_guard.writer.write(reinterpret_cast<uint8_t *>(block), sizeof(block))) return false;
-                    used = 0;
-                }
-            }
-            input.file.close();
-        }
-        if (events != data.header.events || !part_guard.writer.write(
-            reinterpret_cast<uint8_t *>(block), used * sizeof(Event))) return false;
-    }
-    part_guard.complete = finish_part(part_guard, path, data.header.bytes);
-    if (part_guard.complete) {
-        invalidate_day(entry.day);
-        __atomic_add_fetch(&cache_generation, 1, __ATOMIC_RELEASE);
-    }
-    return part_guard.complete;
-}
-
 ReportEdf::Histogram histogram(const CachedChannel &channel, uint64_t *bins) {
     ReportEdf::Histogram out;
     out.signal = channel.signal;
@@ -1465,15 +1542,25 @@ struct CsrPairing {
     }
 };
 
+struct CacheStore : ReportWork {
+    uint64_t written = 0;
+    size_t bins = 0, used = 0;
+    uint32_t events = 0, record = 0;
+    uint8_t kind = 3;
+    Event block[32];
+};
+
 struct SessionBuild : SessionData {
     Input input;
     std::unique_ptr<ReportArtifact::Producer> producer;
+    std::unique_ptr<CacheStore> cache_store;
     CsrPairing csr;
     RetainedIssue accepted_issue;
+    ReportEdf::RecordScanPosition bounds_position;
     char prefix[32] = {};
     uint32_t rebuild = 0, next_record = 0, event_count = 0;
     uint8_t header_kind = 0, numeric_kind = 0, event_kind = 3, readable_numeric = 0;
-    bool allocated = false, finished = false, artifacts;
+    bool allocated = false, finished = false, cache_stored = false, artifacts;
 
     SessionBuild(const SdStorage::Session &session, const Job &job,
                  const IndexedSession &entry, bool artifacts)
@@ -1483,9 +1570,12 @@ struct SessionBuild : SessionData {
         header.day = entry.day;
         header.partial = entry.key.present != 31 || entry.key.checksums != 31;
     }
-    bool matches(const IndexedSession &entry, bool charts) const {
+    bool matches_source(const IndexedSession &entry) const {
         return header.key == entry.key && header.day == entry.day &&
-            !strcmp(prefix, entry.entry.file_prefix) && rebuild == rebuild_generation && artifacts == charts;
+            !strcmp(prefix, entry.entry.file_prefix) && rebuild == rebuild_generation;
+    }
+    bool matches(const IndexedSession &entry, bool charts) const {
+        return matches_source(entry) && artifacts == charts;
     }
     void pause() {
         if (producer) producer->pause();
@@ -1493,6 +1583,104 @@ struct SessionBuild : SessionData {
         input.artifact = nullptr;
     }
 };
+
+bool store_cache(const SdStorage::Session &session, const Job &job, const IndexedSession &entry,
+                 SessionBuild &data) {
+    if (data.header.events > MAX_DISK_EVENTS) return false;
+    char path[96], part[96];
+    cache_path(entry, "stats", path);
+    cache_path(entry, "stats.part", part);
+    data.header.bytes = sizeof(data.header) + total_bins(data.header) * sizeof(uint64_t) +
+        data.header.events * sizeof(Event);
+    if (!data.cache_store) {
+        // Statistics have one private prefix, independent of chart production.
+        // Only the worker transfers its cursor, with all handles already closed.
+        xSemaphoreTake(mutex, portMAX_DELAY);
+        for (auto &other : jobs) {
+            if (&other == &job || other.state != JobState::Queued || !other.build ||
+                !other.build->finished || other.build->cache_stored || !other.build->matches_source(entry)) continue;
+            if (other.build->cache_store) {
+                data.cache_store = std::move(other.build->cache_store);
+                break;
+            }
+        }
+        xSemaphoreGive(mutex);
+        if (!data.cache_store) {
+            // Another selector may have completed the transferred prefix.
+            // Use the existing cache validator; keep our accepted RAM counters.
+            std::unique_ptr<SessionData> published(new (std::nothrow) SessionData);
+            if (!published) return false;
+            if (load_cache(session, entry, *published)) return true;
+            data.cache_store.reset(new (std::nothrow) CacheStore);
+        }
+    }
+    if (!data.cache_store) return false;
+    auto &work = *data.cache_store;
+    PartGuard part_guard{session, part};
+    part_guard.complete = work.written != 0;
+    if (!work.written) {
+        if (!artifact_headroom(session, entry.day, job) ||
+            !start_part(part_guard, reinterpret_cast<const uint8_t *>(&data.header), sizeof(data.header))) return false;
+        work.written = sizeof(data.header);
+    } else if (!part_guard.writer.open(session, part, work.written, true)) return false;
+    // Keep the committed private prefix across turns; stale/revoked writes may
+    // leave a tail, which append admission truncates to this RAM cursor.
+    part_guard.complete = true;
+    const size_t bin_bytes = total_bins(data.header) * sizeof(uint64_t);
+    while (work.bins < bin_bytes) {
+        if (aborted(&job, session)) return false;
+        const size_t take = std::min(bin_bytes - work.bins, SdStorage::WRITE_CHUNK_BYTES);
+        if (!part_guard.writer.write(reinterpret_cast<const uint8_t *>(data.bins) + work.bins, take)) return false;
+        work.bins += take;
+        work.written += take;
+    }
+    if (data.header.events <= MAX_EVENTS) {
+        while (work.events < data.header.events) {
+            if (aborted(&job, session)) return false;
+            const size_t count = std::min<size_t>(32, data.header.events - work.events);
+            const size_t bytes = count * sizeof(Event);
+            if (!part_guard.writer.write(reinterpret_cast<const uint8_t *>(data.events + work.events), bytes)) return false;
+            work.events += count;
+            work.written += bytes;
+        }
+    } else {
+        // The bounded RAM prefix cannot hold all annotations. Retain the replay
+        // cursor and one output block, never restart it on a short SD grant.
+        auto &input = data.input;
+        input.session = session;
+        for (; work.kind < 5; ++work.kind, work.record = 0) {
+            if (!(entry.key.present & (1u << work.kind))) continue;
+            if (!input.open(session, entry, work.kind)) return false;
+            while (work.record < input.header->records || work.used == 32) {
+                if (aborted(&job, session)) return false;
+                if (work.used == 32) {
+                    if (!part_guard.writer.write(reinterpret_cast<uint8_t *>(work.block), sizeof(work.block))) return false;
+                    work.written += sizeof(work.block);
+                    work.used = 0;
+                }
+                if (work.record == input.header->records) break;
+                Event event;
+                if (!read_event(input, work.record, event)) return false;
+                ++work.record;
+                if (event.kind == ReportEdf::EventKind::Unknown) continue;
+                work.block[work.used++] = event;
+                ++work.events;
+            }
+            input.file.close();
+        }
+        if (work.events != data.header.events) return false;
+        if (work.used) {
+            const size_t bytes = work.used * sizeof(Event);
+            if (!part_guard.writer.write(reinterpret_cast<uint8_t *>(work.block), bytes)) return false;
+            work.written += bytes;
+            work.used = 0;
+        }
+    }
+    if (work.written != data.header.bytes || !finish_part(part_guard, path, data.header.bytes)) return false;
+    invalidate_day(entry.day);
+    __atomic_add_fetch(&cache_generation, 1, __ATOMIC_RELEASE);
+    return true;
+}
 
 bool build_session(const SdStorage::Session &session, const Job &job,
                    const IndexedSession &entry, SessionBuild &work) {
@@ -1533,7 +1721,7 @@ bool build_session(const SdStorage::Session &session, const Job &job,
             }
             if (coverage >= 0) {
                 ReportEdf::RecordedBounds bounds;
-                if (!ReportEdf::recorded_bounds(input.reader, *input.header, coverage, bounds))
+                if (!ReportEdf::recorded_bounds(input.reader, *input.header, coverage, bounds, &work.bounds_position))
                     return false;
                 out.header.recorded = bounds.present;
                 out.header.usage_known |= bounds.present;
@@ -1644,7 +1832,7 @@ bool build_session(const SdStorage::Session &session, const Job &job,
 
 bool session_data(const SdStorage::Session &session, const Job &job,
                   const IndexedSession &entry, SessionData &out, bool artifacts = false) {
-    if (!artifacts && load_cache(session, entry, out)) {
+    if (!artifacts && !(job.build && job.build->matches(entry, artifacts)) && load_cache(session, entry, out)) {
         if (out.header.partial) note_issue(job, "partial_source", entry.entry.file_prefix);
         job.accepted_issue.capture(job);
         return true;
@@ -1674,8 +1862,11 @@ bool session_data(const SdStorage::Session &session, const Job &job,
     if (built.header.partial) note_issue(job, "partial_source", entry.entry.file_prefix);
     // The cache is derived and replaceable; failed persistence does not discard
     // useful parsed data or modify any source EDF/sidecar.
-    if (!built.header.partial && !store_cache(session, job, entry, built) && !aborted(&job, session))
-        note_issue(job, "cache_write", entry.entry.file_prefix);
+    if (!built.header.partial && !built.cache_stored) {
+        built.cache_stored = store_cache(session, job, entry, built);
+        if (!built.cache_stored && !aborted(&job, session))
+            note_issue(job, "cache_write", entry.entry.file_prefix);
+    }
     if (aborted(&job, session)) { built.pause(); return false; }
     job.accepted_issue.capture(job);
     out.header = built.header;
@@ -1773,7 +1964,9 @@ bool publication_key(const Request &request, uint8_t (&key)[32]) {
         reinterpret_cast<const uint8_t *>(identity.c_str()), identity.length(), key);
 }
 
-bool artifact_headroom(const SdStorage::Session &session, uint16_t day) {
+bool artifact_headroom(const SdStorage::Session &session, uint16_t day, const Job &job) {
+    Log::ScopedMicros measured(job.headroom_us, job.diagnostics);
+    if (job.diagnostics) ++job.headroom_calls;
     SdStorage::Status storage;
     if (!session.run([](fs::FS &) { SdStorage::refresh_usage(); return true; })) return false;
     SdStorage::get_status(storage);
@@ -1859,7 +2052,7 @@ bool publish_histograms(const SdStorage::Session &session, const IndexedSession 
 struct PrepareWork : ReportWork {
     enum Phase { Numeric, Events, History, Summary, Publish } phase = Numeric;
     size_t next = 0;
-    bool comma = false, loaded = false, event_comma = false, events_ready = false;
+    bool comma = false, loaded = false, numeric_missing = false, event_comma = false, events_ready = false;
     uint32_t next_event = 0;
     CsrPairing csr;
     Payload envelope, events;
@@ -1904,7 +2097,7 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
         }
         if (known == ReportArtifact::Lookup::Failed || known == ReportArtifact::Lookup::Invalid)
             return note_issue(job, "publication_read", manifest);
-        if (!artifact_headroom(session, day)) return note_issue(job, "recording_headroom");
+        if (!artifact_headroom(session, day, job)) return note_issue(job, "recording_headroom");
         job.preparation.reset(new (std::nothrow) PrepareWork);
         if (!job.preparation) return note_issue(job, "artifact_alloc");
         job.body.clear();
@@ -1915,20 +2108,25 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
     auto &work = *job.preparation;
     auto &comma = work.comma;
     if (work.phase == PrepareWork::Numeric) {
+        Log::ScopedMicros measured(job.prepare_numeric_us, job.diagnostics);
         for (size_t &i = work.next; i < index_count; ++i) {
             const auto &entry = index[i];
             if (!selected(entry, day, day)) continue;
-            bool missing = false;
-            for (uint8_t kind = 0; kind < 3; ++kind) {
-                if (!(entry.key.present & (1u << kind))) continue;
-                char prefix[96]; uint8_t key[32];
-                ReportArtifact::Publication publication;
-                if (!artifact_identity(entry, kind, prefix, key)) return note_issue(job, "artifact_digest");
-                const auto found = ReportArtifact::lookup(session, prefix, key, publication);
-                if (found == ReportArtifact::Lookup::Missing) missing = true;
-                else if (found != ReportArtifact::Lookup::Ready) return note_issue(job, "artifact_lookup", prefix);
+            if (aborted(&job, session)) return false;
+            if (!work.loaded) {
+                work.numeric_missing = false;
+                for (uint8_t kind = 0; kind < 3; ++kind) {
+                    if (!(entry.key.present & (1u << kind))) continue;
+                    char prefix[96]; uint8_t key[32];
+                    ReportArtifact::Publication publication;
+                    if (!artifact_identity(entry, kind, prefix, key)) return note_issue(job, "artifact_digest");
+                    const auto found = ReportArtifact::lookup(session, prefix, key, publication);
+                    if (found == ReportArtifact::Lookup::Missing) work.numeric_missing = true;
+                    else if (found != ReportArtifact::Lookup::Ready) return note_issue(job, "artifact_lookup", prefix);
+                }
+                work.loaded = true;
             }
-            if (missing) {
+            if (work.numeric_missing) {
                 std::unique_ptr<SessionData> data(new (std::nothrow) SessionData);
                 if (!data) return note_issue(job, "artifact_alloc");
                 if (!session_data(session, job, entry, *data, true)) return false;
@@ -1949,13 +2147,16 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
             }
             if (!references.good() || !job.body.append(references.c_str(), references.length())) return false;
             comma = reference_comma;
+            work.loaded = false;
         }
         job.body.print("],\"event_groups\":[");
         comma = false;
+        work.loaded = false;
         work.next = 0;
         work.phase = PrepareWork::Events;
     }
     if (work.phase == PrepareWork::Events) {
+        Log::ScopedMicros measured(job.prepare_events_us, job.diagnostics);
         for (size_t &i = work.next; i < index_count; ++i) {
             const auto &entry = index[i];
             if (!selected(entry, day, day)) continue;
@@ -1968,6 +2169,7 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
             }
             auto &histogram = work.histogram;
             if (!histogram.bytes) {
+                Log::ScopedMicros histogram_time(job.prepare_histograms_us, job.diagnostics);
                 ReportArtifact::Document published;
                 if (!publish_histograms(session, entry, data, published))
                     return note_issue(job, "histogram_publish");
@@ -2011,17 +2213,20 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
     }
     // History uses the same exact session statistics, never browser aggregates.
     if (work.phase == PrepareWork::History) {
+        Log::ScopedMicros measured(job.prepare_history_us, job.diagnostics);
         if (!history_json(session, job, true)) return false;
         job.body.clear();
         work.phase = PrepareWork::Summary;
     }
     if (work.phase == PrepareWork::Summary) {
+        Log::ScopedMicros measured(job.prepare_summary_us, job.diagnostics);
         if (!summary_json(session, job)) return false;
         work.envelope.append(job.body.c_str(), job.body.length());
         work.envelope.print("}");
         job.body.swap(work.envelope);
         work.phase = PrepareWork::Publish;
     }
+    Log::ScopedMicros publication_time(job.prepare_publish_us, job.diagnostics);
     if (!job.body.good() || aborted(&job, session, false)) return false;
     if (job.issue) {
         ReportArtifact::Document previous;
@@ -2090,6 +2295,8 @@ bool days_json(const SdStorage::Session &session, Job &job) {
         }
         job.body.print("}");
         n = end;
+        job.listed_days = n;
+        observe_report_jobs();
     }
     job.body.print("],\"periods\":[");
     bool period_comma = false;
@@ -2128,7 +2335,7 @@ void foreground_activity() {
 }
 
 bool cleanup_cancelled(void *context) {
-    return __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) || foreground_wait() || ExportSync::storage_requested() ||
+    return __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) || foreground_wait() ||
         aborted(nullptr, *static_cast<const SdStorage::Session *>(context));
 }
 
@@ -2524,7 +2731,7 @@ bool cache_name(const char *input, const char *&base) {
     return true;
 }
 
-bool migrate_cache(const SdStorage::Session &session) {
+bool migrate_cache(const SdStorage::Session &session, const Job *job) {
     if (rebuild_generation) return true;
     SdStorage::Reader directory;
     if (!directory.open(session, CACHE_DIR, true))
@@ -2532,7 +2739,7 @@ bool migrate_cache(const SdStorage::Session &session) {
     bool end = false;
     SdStorage::Reader::Entry file;
     while (!end) {
-        if (aborted(nullptr, session)) return false;
+        if (aborted(job, session)) return false;
         if (!directory.next(file, end)) return false;
         const char *base = nullptr;
         if (end || file.directory || !cache_name(file.name, base) || strstr(base, ".part")) continue;
@@ -2578,6 +2785,177 @@ struct HistoryWork : ReportWork {
     size_t next = 0;
     CacheHeader header;
 };
+
+aircannect::JobProgressPoint report_progress_point(const Job &job) {
+    static_assert(MAX_SESSION_COUNT <= UINT16_MAX, "report progress session cursor must fit 16 bits");
+    static_assert(PrepareWork::Publish + 2 <= UINT8_MAX, "report progress phase must fit 8 bits");
+    const uint64_t dataset = uint64_t(job.data_revision) << 32;
+    if (job.indexing) return {dataset, index_scan.next};
+    uint64_t phase = 1, item = 0, part = 0, units = 0;
+    bool history = job.request.action == Action::History;
+    bool summary = job.request.action == Action::Summary ||
+        (job.request.action == Action::Prepare && job.request.view == View::Period);
+    if (job.preparation) {
+        const auto &work = *job.preparation;
+        phase += work.phase;
+        item = work.next;
+        history = work.phase == PrepareWork::History;
+        summary = work.phase == PrepareWork::Summary;
+        if (work.phase == PrepareWork::Publish) phase = 6;
+        if (work.phase == PrepareWork::Events && work.loaded) {
+            part = 40 + (work.histogram.bytes != 0);
+            units = work.next_event;
+        }
+    }
+    if (summary && job.summary) {
+        item = job.summary->next;
+        if (job.summary->totals_written) {
+            ++phase;
+            history = true;
+        }
+    }
+    if (history && job.history) item = job.history->next;
+    if (job.build && part < 40) {
+        const auto &work = *job.build;
+        const auto &input = work.input;
+        const uint64_t source = input.record_offset == UINT64_MAX ? 0 :
+            input.record_offset - input.header->header_bytes + input.record_loaded;
+        if (work.header_kind < 5) {
+            part = 1 + work.header_kind;
+            units = source;
+            if (work.header_kind == 1 && input.header) {
+                const auto &position = work.bounds_position;
+                const uint64_t offset = input.header->header_bytes +
+                    uint64_t(position.record) * input.header->record_bytes;
+                units = uint64_t(position.ordinal) * input.header->record_bytes +
+                    (input.record_offset == offset ? input.record_loaded : 0);
+            }
+        } else if (work.numeric_kind < 3) {
+            part = 10 + work.numeric_kind;
+            // Count partial reads as well as spool/output work. The source
+            // offset belongs to the loaded record, not the next loop index.
+            units = source + (work.producer ? work.producer->progress() : 0);
+        } else {
+            part = 20 + work.event_kind;
+            units = work.next_record;
+        }
+        if (work.finished) {
+            part = 30 + (work.cache_store ? work.cache_store->kind - 3 : 0);
+            units = work.cache_store ? work.cache_store->written + work.cache_store->record : 0;
+        }
+    }
+    if (job.request.action == Action::Days) units = job.listed_days;
+    // Dataset revision (32), phase (8), session cursor (16), source stage (8).
+    // Phases/stages reach 6/41; cursors include the catalog end sentinel.
+    // Only an accepted dataset replacement advances the epoch, not a retry.
+    return {dataset | (phase << 24) | (item << 8) | part, units};
+}
+
+void report_progress(const Job &job, aircannect::JobProgressPoint point, bool paused) {
+    using Event = aircannect::JobProgressWatch::Event;
+    const auto event = job.progress.observe(millis(), point, paused);
+    if (job.diagnostics) job.max_idle_ms = std::max(job.max_idle_ms,
+        std::max(job.progress.idle_ms(), job.progress.notice_ms()));
+    if (event == Event::None) return;
+    Log::logf(CAT_REPORT, event == Event::Resumed ? LOG_INFO : LOG_WARN,
+        "EDF job=%lu %s %s day=%u wait=%s no_progress=%lus attempts=%lu\n",
+        static_cast<unsigned long>(job.id), event == Event::Resumed ? "resumed" :
+        event == Event::Stalled ? "stalled" : "still stalled", action_name(job.request.action), unsigned(job.request.day),
+        job.wait_reason, static_cast<unsigned long>(job.progress.notice_ms() / 1000),
+        static_cast<unsigned long>(job.progress.attempts()));
+}
+
+uint64_t maintenance_cursor(MaintenancePhase phase) {
+    switch (phase) {
+        case MaintenancePhase::Index: return index_scan.next;
+        case MaintenancePhase::IndexGc: return uint64_t(index_cleanup.shard) * 2 + index_cleanup.discovered;
+        case MaintenancePhase::ArtifactGc: return artifact_cleanup.next * 2 + artifact_cleanup.discovered;
+        default: return 0;
+    }
+}
+
+bool maintenance_suspended(MaintenancePhase phase) {
+    if (phase != MaintenancePhase::IndexGc && phase != MaintenancePhase::ArtifactGc) return false;
+    if (__atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) || foreground_wait()) return true;
+    // GC is idle work: queued/running reports intentionally own this worker.
+    // Artifact GC also preserves retained result pins until their release.
+    if (xSemaphoreTake(mutex, 0) != pdTRUE) return true;
+    bool pinned = false;
+    for (const auto &job : jobs)
+        if (job.state == JobState::Queued || job.state == JobState::Running ||
+            (phase == MaintenancePhase::ArtifactGc && job.state != JobState::Free && !evictable(job))) pinned = true;
+    xSemaphoreGive(mutex);
+    return pinned;
+}
+
+void observe_maintenance_progress(MaintenanceProgress &work, bool retained = false, bool complete = false,
+                                  const SdStorage::IoEvent *io_event = nullptr) {
+    if (!work.active) return;
+    const bool readers = io_event ? *io_event == SdStorage::IoEvent::WaitingForReader :
+        SdStorage::waiting_for_readers() || maintenance_suspended(work.phase);
+    const bool paused = !AirSenseState::local_background_allowed() || !SdStorage::local_access_allowed() ||
+        readers;
+    const uint64_t cursor = maintenance_cursor(work.phase);
+    if (!retained && cursor != work.cursor) { work.cursor = cursor; work.steps = 0; }
+    using Event = aircannect::JobProgressWatch::Event;
+    const auto event = retained ? work.watch.check(millis(), paused) :
+        work.watch.observe(millis(), complete ? aircannect::JobProgressPoint{UINT64_MAX, 0} :
+            aircannect::JobProgressPoint{work.cursor, work.steps}, paused);
+    if (event != Event::None) {
+        const char *phase = work.phase == MaintenancePhase::Index ? "index" :
+            work.phase == MaintenancePhase::Publish ? "index_publish" :
+            work.phase == MaintenancePhase::IndexGc ? "index_gc" : "artifact_gc";
+        Log::logf(CAT_REPORT, event == Event::Resumed ? LOG_INFO : LOG_WARN,
+            "EDF maintenance %s phase=%s wait=%s no_progress=%lus attempts=%lu\n",
+            event == Event::Resumed ? "resumed" : event == Event::Stalled ? "stalled" : "still stalled", phase,
+            work.wait_reason, static_cast<unsigned long>(work.watch.notice_ms() / 1000),
+            static_cast<unsigned long>(work.watch.attempts()));
+    }
+    if (complete) work.active = false;
+}
+
+void observe_report_jobs(bool force, bool retained, const Job *io_job, const SdStorage::IoEvent *io_event) {
+    static uint32_t observed_ms = 0;
+    const uint32_t now = millis();
+    if (!force && uint32_t(now - observed_ms) < 250) return;
+    observed_ms = now;
+    // The exact SD wait belongs to this caller; other queued work uses the
+    // admission hint without masking an unrelated operation's stalled I/O.
+    for (auto &work : maintenance_progress)
+        observe_maintenance_progress(work, true, false, !io_job && &work == maintenance_io ? io_event : nullptr);
+    const bool paused = !AirSenseState::local_background_allowed() || !SdStorage::local_access_allowed();
+    const bool readers = SdStorage::waiting_for_readers();
+    if (xSemaphoreTake(mutex, retained ? 0 : portMAX_DELAY) != pdTRUE) return;
+    for (const auto &job : jobs) {
+        if (job.cancelled || (job.state != JobState::Queued && job.state != JobState::Running)) continue;
+        const bool reader_wait = io_event && &job == io_job ? *io_event == SdStorage::IoEvent::WaitingForReader : readers;
+        report_progress(job, !retained && job.state == JobState::Running ? report_progress_point(job) :
+            aircannect::JobProgressPoint{}, paused || reader_wait);
+    }
+    xSemaphoreGive(mutex);
+}
+
+void observe_report_io(void *context, SdStorage::IoEvent event, const char *path) {
+    auto *job = static_cast<Job *>(context);
+    auto *work = job ? nullptr : maintenance_io;
+    if (event == SdStorage::IoEvent::Complete) {
+        if (work && work->observing) {
+            ++work->steps;
+            observe_maintenance_progress(*work);
+        }
+        return;
+    }
+    const char *previous = job ? job->wait_reason : work ? work->wait_reason : nullptr;
+    const char *reason = event == SdStorage::IoEvent::WaitingForReader ? "sd_reader_wait" :
+        path ? "sd_write_wait" : "sd_io_wait";
+    if (job) job->wait_reason = reason;
+    else if (work) work->wait_reason = reason;
+    // Close/destruction callbacks can observe a half-reset input or producer.
+    // Only age retained high-water marks while a filesystem request is pending.
+    observe_report_jobs(true, true, job, &event);
+    if (job) job->wait_reason = previous;
+    else if (work) work->wait_reason = previous;
+}
 
 bool history_json(const SdStorage::Session &session, Job &job, bool build) {
     constexpr size_t DAYS = HistoryWork::DAYS, METRICS = 6;
@@ -3296,16 +3674,20 @@ bool reindex(const SdStorage::Session &session, Job &job) {
     return job.body.good();
 }
 
-void defer_job(Job *job) {
+void defer_job(Job *job, const char *reason) {
     if (!job) return;
     xSemaphoreTake(mutex, portMAX_DELAY);
     if (job->cancelled) reset_job(*job);
-    else job->state = JobState::Queued;
+    else {
+        job->wait_reason = reason;
+        job->state = JobState::Queued;
+    }
     xSemaphoreGive(mutex);
+    observe_report_jobs(true);
 }
 
 bool enqueue_backfill(const SdStorage::Session &session) {
-    if (!backfill_enabled || ExportSync::storage_requested()) return false;
+    if (!backfill_enabled) return false;
     if (background_retry && int32_t(millis() - background_retry) < 0) return false;
     if (background_retry) { background_retry = 0; backfill_before = UINT16_MAX; backfill_period = 0; }
     const uint32_t current = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
@@ -3338,51 +3720,165 @@ bool enqueue_backfill(const SdStorage::Session &session) {
     }
     xSemaphoreTake(mutex, portMAX_DELAY);
     Job *slot = nullptr;
-    for (auto &candidate : jobs) if (reusable(candidate) || evictable(candidate)) { slot = &candidate; break; }
+    size_t active = 0;
+    bool pending = false;
+    for (auto &candidate : jobs) {
+        if (candidate.state == JobState::Queued || candidate.state == JobState::Running) {
+            ++active;
+            pending |= candidate.request == request;
+        }
+        if (!slot && (reusable(candidate) || evictable(candidate))) slot = &candidate;
+    }
+    if (pending || active >= SLOT_COUNT) slot = nullptr;
     if (slot) {
         reset_job(*slot);
         slot->request = request;
         slot->id = next_id++;
         if (!next_id) next_id = 1;
         slot->state = JobState::Queued;
+        slot->progress.check(millis());
         slot->background = true;
         slot->foreground_epoch = __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
         slot->consumers = 0;
+        admit_job(*slot);
     }
     xSemaphoreGive(mutex);
     return slot != nullptr;
 }
 
+void finish_maintenance_progress() {
+    for (auto &work : maintenance_progress) {
+        if (!work.active) continue;
+        const bool complete = work.complete || (work.phase == MaintenancePhase::Index ? !dirty() :
+            work.phase == MaintenancePhase::Publish ? !index_commit_pending && !retired_index.bytes &&
+                published_index_data == __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE) &&
+                published_index_artifacts == status.artifact_revision :
+            work.phase == MaintenancePhase::IndexGc ? !index_cleanup_pending() : !artifact_cleanup_pending());
+        if (complete) observe_maintenance_progress(work, false, true);
+    }
+}
+
+void maintenance_wait(const char *reason) {
+    for (auto &work : maintenance_progress)
+        if (work.active && !work.complete) work.wait_reason = reason;
+}
+
+bool maintenance_work(SdStorage::Session &session, MaintenancePhase phase,
+                      bool (*operation)(const SdStorage::Session &)) {
+    auto &work = maintenance_progress[size_t(phase)];
+    finish_maintenance_progress();
+    // Retain each phase across interleaved retries. A pinned collector must not
+    // pause index publication or inherit its progress and stall warnings.
+    if (!work.active) {
+        work = {};
+        work.phase = phase;
+        work.active = true;
+    }
+    // Count completed steps within this retained phase/cursor, not attempts.
+    // Replaying a failed publication's prefix cannot advance its high-water mark.
+    work.cursor = maintenance_cursor(phase);
+    work.steps = 0;
+    work.wait_reason = "working";
+    work.watch.attempt();
+    observe_maintenance_progress(work, true);
+    maintenance_io = &work;
+    work.observing = true;
+    const bool ok = operation(session);
+    work.observing = false;
+    if (!ok && session.yield_requested()) work.wait_reason = "storage_busy";
+    work.complete = ok && (phase == MaintenancePhase::IndexGc ? !index_cleanup_pending() :
+        phase == MaintenancePhase::ArtifactGc ? !artifact_cleanup_pending() : true);
+    observe_maintenance_progress(work);
+    return ok;
+}
+
 bool work_once() {
     static const char *reported_index_error = nullptr;
-    Job *job = nullptr;
+    // Keep a refused admission's FIFO ticket across worker retries.
+    static SdStorage::Session session;
+    session.set_admission_notify([](void *) { if (wake) xSemaphoreGive(wake); });
+    maintenance_io = nullptr;
+    finish_maintenance_progress();
+    observe_report_jobs(true);
+    Job *foreground = nullptr, *days = nullptr, *backfill = nullptr;
     xSemaphoreTake(mutex, portMAX_DELAY);
     for (auto &candidate : jobs) {
         if (candidate.state != JobState::Free && reusable(candidate)) reset_job(candidate);
-        if (candidate.state == JobState::Queued && (!job ||
-            (job->background && !candidate.background) || (job->background == candidate.background &&
-            int32_t(candidate.id - job->id) < 0))) job = &candidate;
+        if (candidate.state != JobState::Queued) continue;
+        Job *&oldest = candidate.background ? backfill :
+            candidate.request.action == Action::Days ? days : foreground;
+        if (!oldest || int32_t(candidate.id - oldest->id) < 0) oldest = &candidate;
     }
-    if (job) job->state = JobState::Running;
+    // Serve foreground promptly, but reserve a useful bounded backfill turn
+    // after a burst. SD ownership and peer turns remain SdStorage's decision.
+    const bool backfill_pending = backfill_enabled &&
+        (!background_retry || int32_t(millis() - background_retry) >= 0) &&
+        (backfill_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE) || backfill_before ||
+         backfill_period < sizeof(PERIODS) / sizeof(PERIODS[0]));
+    if (!backfill && !backfill_pending) { backfill_due = false; backfill_work_ms = 0; }
+    const bool discover_backfill = !backfill && backfill_pending && (foreground || days) &&
+        (backfill_due || foreground_turns >= FOREGROUND_BURST);
+    const bool protected_backfill = (foreground || days) && backfill &&
+        (backfill_due || foreground_turns >= FOREGROUND_BURST);
+    const bool protected_foreground = days && foreground && days_turns >= FOREGROUND_BURST;
+    Job *job = discover_backfill ? nullptr : protected_backfill ? backfill : protected_foreground ? foreground :
+        days ? days : foreground ? foreground : backfill;
+    if (job) {
+        job->state = JobState::Running;
+        job->protected_turn = protected_backfill || protected_foreground;
+        job->turn_budget_ms = protected_backfill ? BACKGROUND_TURN_MS - backfill_work_ms : DAYS_PROTECTED_TURN_MS;
+        job->backfill_waiting = (backfill || backfill_pending) && !job->background;
+        job->foreground_epoch = __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
+        job->days_epoch = __atomic_load_n(&days_epoch, __ATOMIC_ACQUIRE);
+        job->storage_yielded = false;
+    }
     xSemaphoreGive(mutex);
-    if (!AirSenseState::local_background_allowed()) {
-        defer_job(job); publish(State::Blocked, "not_idle"); return false;
-    }
-    if (!SdStorage::local_access_allowed()) { defer_job(job); publish(State::Blocked, "usb_storage"); return false; }
-    if (!SdStorage::mounted()) { defer_job(job); publish(State::Blocked, "no_sd"); return false; }
-    if (job && job->background && ExportSync::storage_requested()) {
-        defer_job(job); publish(State::WaitingStorage, "export_pending"); return false;
+    const char *blocked = !AirSenseState::local_background_allowed() ? "not_idle" :
+        !SdStorage::local_access_allowed() ? "usb_storage" : !SdStorage::mounted() ? "no_sd" : nullptr;
+    if (blocked) {
+        session.end();
+        maintenance_wait(blocked);
+        observe_report_jobs(true);
+        defer_job(job, blocked);
+        publish(State::Blocked, blocked);
+        return false;
     }
     if (!job && !dirty() && !index_commit_pending && !retired_index.bytes && !index_cleanup_pending() && !artifact_cleanup_pending() && published_index_artifacts == status.artifact_revision &&
-        (!backfill_enabled || (!backfill_before && backfill_period >= sizeof(PERIODS) / sizeof(PERIODS[0])) || ExportSync::storage_requested() ||
-        (background_retry && int32_t(millis() - background_retry) < 0))) { publish(State::Ready); return false; }
-    SdStorage::Session session;
-    if (!session.begin()) { defer_job(job); publish(State::WaitingStorage, "storage_busy"); return false; }
+        (!backfill_enabled || (!backfill_before && backfill_period >= sizeof(PERIODS) / sizeof(PERIODS[0])) ||
+        (background_retry && int32_t(millis() - background_retry) < 0))) { session.end(); publish(State::Ready); return false; }
+    session.set_io_observer(observe_report_io, job);
+    if (!session.begin()) {
+        maintenance_wait("storage_busy");
+        observe_report_jobs(true);
+        defer_job(job, "storage_busy");
+        publish(State::WaitingStorage, "storage_busy");
+        return false;
+    }
+    maintenance_wait("working");
     if (job) {
+        if (!job->background && foreground_turns < FOREGROUND_BURST) ++foreground_turns;
+        if (!job->background && job->request.action != Action::Days) days_turns = 0;
+        else if (job->request.action == Action::Days && days_turns < FOREGROUND_BURST) ++days_turns;
+        job->turn_started_ms = millis();
+        job->turn_progress_set = false;
+        job->progress.attempt();
+        job->wait_reason = "working";
+        job->indexing = true;
         job->files_revision = SdStorage::files_revision();
         job->recovered_index = false;
     }
     JobTiming timing(job);
+    const auto finish_backfill_turn = [&](bool complete = false) {
+        if (!protected_backfill) return;
+        // SD peers can interrupt even a reserved report turn. Charge its
+        // admitted time across retries, including a grant lost to reopen work.
+        backfill_work_ms += std::min(BACKGROUND_TURN_MS, uint32_t(millis() - job->turn_started_ms));
+        if (complete || backfill_work_ms >= BACKGROUND_TURN_MS) {
+            foreground_turns = 0;
+            backfill_due = false;
+            backfill_work_ms = 0;
+        }
+    };
     publish(State::Building);
     const uint32_t index_started = timing.stamp();
     bool recovered_index = false;
@@ -3406,14 +3902,25 @@ bool work_once() {
             if (!recovered_index) job->body.clear();
         }
     }
-    const bool indexed = recovered_index || refresh_index(session);
+    const bool observe_index = !job && (dirty() || maintenance_progress[size_t(MaintenancePhase::Index)].active);
+    const bool indexed = recovered_index || (observe_index ?
+        maintenance_work(session, MaintenancePhase::Index,
+            [](const SdStorage::Session &source) { return refresh_index(source); }) : refresh_index(session, job));
+    observe_report_jobs(true);
+    if (job) job->indexing = false;
     timing.index_us = timing.stamp() - index_started;
     if (!indexed) {
         const bool preempted = !session.valid() || !AirSenseState::local_background_allowed();
         const bool yielding = session.yield_requested();
+        if (preempted || yielding || index_failure == IndexFailure::Preempted)
+            maintenance_wait(preempted ? "not_idle" : "storage_busy");
+        else if (index_failure == IndexFailure::WaitingCatalog) maintenance_wait("catalog_not_ready");
         session.end();
+        timing.finish(preempted || yielding || index_failure == IndexFailure::Preempted);
+        finish_backfill_turn();
         if (preempted || yielding || index_failure == IndexFailure::Preempted || index_failure == IndexFailure::WaitingCatalog) {
-            defer_job(job);
+            defer_job(job, preempted ? "not_idle" : yielding || index_failure == IndexFailure::Preempted ?
+                "storage_busy" : "catalog_not_ready");
             publish(preempted ? State::Blocked : State::WaitingStorage,
                     preempted ? "not_idle" : yielding || index_failure == IndexFailure::Preempted ? "storage_busy" : "catalog_not_ready");
         } else {
@@ -3429,9 +3936,8 @@ bool work_once() {
                 error_body(*job, job->cancelled ? 410 : 503, job->cancelled ? "cancelled" : "index_unavailable");
                 job->state = JobState::Complete;
                 job->completed_ms = millis();
-                const int code = job->code;
-                const size_t bytes = job->body.length();
-                timing.log(code, bytes);
+                log_result(*job);
+                timing.log();
                 xSemaphoreGive(mutex);
                 portENTER_CRITICAL(&status_mux);
                 ++status.revision;
@@ -3448,23 +3954,48 @@ bool work_once() {
     }
     if (!job) {
         if (session.yield_requested()) {
+            maintenance_wait("storage_busy");
             session.end();
             publish(State::WaitingStorage, "storage_busy");
             return false;
         }
-        const bool checkpoint = index_commit_pending && !ExportSync::storage_requested();
-        if (checkpoint && !publish_index(session))
+        if (discover_backfill) {
+            // Discover one candidate with the existing owner path, even while
+            // one long foreground job remains queued. No extra job slot.
+            const bool more = enqueue_backfill(session);
+            if (!more) {
+                // A matching foreground job already serves this candidate, or
+                // both work slots are occupied. Let that work advance first.
+                backfill_due = false;
+                backfill_work_ms = 0;
+                foreground_turns = 0;
+            }
+            session.end();
+            publish(State::Building);
+            return true;
+        }
+        const auto checkpoint_index = [&]() {
+            const bool pending = index_commit_pending || retired_index.bytes ||
+                published_index_data != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE) ||
+                published_index_artifacts != status.artifact_revision;
+            return pending ? maintenance_work(session, MaintenancePhase::Publish, publish_index) : publish_index(session);
+        };
+        const bool checkpoint = index_commit_pending;
+        if (checkpoint && !checkpoint_index())
             Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
         const bool more = enqueue_backfill(session);
         // Backfill publishes each day independently. Persist the derived list
         // only when this run finishes or safely pauses, not after every day.
-        if (!more && !checkpoint && !ExportSync::storage_requested() && !publish_index(session))
+        if (!more && !checkpoint && !checkpoint_index())
             Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
-        const bool cleaning = !more && !ExportSync::storage_requested() && !retired_index.bytes &&
-            published_index_artifacts == status.artifact_revision && index_cleanup_pending() && cleanup_indexes(session);
-        const bool collecting = !more && !ExportSync::storage_requested() && !retired_index.bytes && !index_cleanup_pending() &&
-            published_index_artifacts == status.artifact_revision && artifact_cleanup_pending() && cleanup_artifacts(session);
+        const bool cleaning = !more && !retired_index.bytes &&
+            published_index_artifacts == status.artifact_revision && index_cleanup_pending() &&
+            maintenance_work(session, MaintenancePhase::IndexGc, cleanup_indexes);
+        const bool collecting = !more && !retired_index.bytes && !index_cleanup_pending() &&
+            published_index_artifacts == status.artifact_revision && artifact_cleanup_pending() &&
+            maintenance_work(session, MaintenancePhase::ArtifactGc, cleanup_artifacts);
         session.end();
+        finish_maintenance_progress();
         publish(State::Ready);
         return more || (cleaning && index_cleanup_pending()) || (collecting && artifact_cleanup_pending());
     }
@@ -3480,9 +4011,7 @@ bool work_once() {
     job->error = job->issue = nullptr;
     job->issue_path[0] = 0;
     job->accepted_issue.restore(*job);
-    job->storage_yielded = false;
     job->recovered_index = recovered_index;
-    job->foreground_epoch = __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE);
     xSemaphoreGive(mutex);
     bool success = false;
     if (__atomic_load_n(&job->cancelled, __ATOMIC_ACQUIRE)) error_body(*job, 410, "cancelled");
@@ -3491,6 +4020,18 @@ bool work_once() {
     else {
         bool resumed = true;
         if (job->build) {
+            Log::ScopedMicros measured(job->prepare_resume_us,
+                job->diagnostics && job->request.action == Action::Prepare);
+            uint64_t *phase_time = nullptr;
+            if (job->preparation) switch (job->preparation->phase) {
+                case PrepareWork::Numeric: phase_time = &job->prepare_numeric_us; break;
+                case PrepareWork::Events: phase_time = &job->prepare_events_us; break;
+                case PrepareWork::History: phase_time = &job->prepare_history_us; break;
+                case PrepareWork::Summary: phase_time = &job->prepare_summary_us; break;
+                case PrepareWork::Publish: phase_time = &job->prepare_publish_us; break;
+            }
+            Log::ScopedMicros resumed_phase(phase_time ? *phase_time : job->prepare_resume_us,
+                job->diagnostics && job->request.action == Action::Prepare && phase_time);
             const IndexedSession *entry = nullptr;
             for (size_t i = 0; i < index_count; ++i)
                 if (job->build->matches(index[i], job->build->artifacts)) { entry = &index[i]; break; }
@@ -3519,16 +4060,17 @@ bool work_once() {
     const bool changed = SdStorage::files_revision() != job->files_revision ||
         job->data_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE) ||
         (!recovered_index && (catalog.generation != catalog_generation || SdStorage::files_revision() != file_revision));
-    const bool yielded = !success && (job->storage_yielded || session.yield_requested() ||
-        (job->background && job->foreground_epoch != __atomic_load_n(&foreground_epoch, __ATOMIC_ACQUIRE)));
+    const bool yielded = !success && (job->storage_yielded || session.yield_requested());
     if (success && !job->background && job->request.action == Action::Prepare &&
         !interrupted && !changed && !yielded) {
+        Log::ScopedMicros measured(job->prepare_publish_us, job->diagnostics);
         // Includes post-therapy preparation before export. Failure to checkpoint
         // must not invalidate an independently committed day publication.
         index_commit_pending = true;
         if (!publish_index(session)) Log::logf(CAT_REPORT, LOG_DEBUG, "Report index publication deferred\n");
     }
     if (job->background && !interrupted && !changed && !yielded) {
+        foreground_turns = 0;
         if (job->request.view == View::Period) ++backfill_period;
         else backfill_before = job->request.day;
         if (!success && job->issue && (!strcmp(job->issue, "partial_source") ||
@@ -3543,7 +4085,12 @@ bool work_once() {
         } else if (!success && (!job->issue || strcmp(job->issue, "recording_headroom"))) background_retry = millis() + 30000;
     }
     if (job->build) job->build->pause();
+    if (interrupted || yielded) maintenance_wait(interrupted ? "not_idle" : "storage_busy");
+    observe_report_jobs(true);
     session.end();
+    finish_maintenance_progress();
+    timing.finish(yielded || interrupted || changed);
+    finish_backfill_turn(success);
     xSemaphoreTake(mutex, portMAX_DELAY);
     if (job->cancelled) error_body(*job, 410, "cancelled");
     else if (interrupted || changed || yielded) {
@@ -3554,20 +4101,20 @@ bool work_once() {
         job->state = JobState::Queued;
         if (job->consumers) job->background = false;
         job->code = 0;
+        job->wait_reason = interrupted ? "not_idle" : changed ? "data_changed" : "storage_yield";
         xSemaphoreGive(mutex);
         publish(interrupted ? State::Blocked : State::Building, interrupted ? "not_idle" : "");
         return yielded;
     } else if (!success && !job->code) error_body(*job, 503, "report_build_failed");
+    if (success && !job->cancelled) report_progress(*job, {UINT64_MAX, 0}, false);
     job->build.reset();
     clear_assembly(*job);
     job->state = JobState::Complete;
     job->completed_ms = millis();
     job->cache_generation = __atomic_load_n(&cache_generation, __ATOMIC_ACQUIRE);
     job->artifact_revision = status.artifact_revision;
-    const int code = job->code;
-    const size_t bytes = job->body.length();
     log_result(*job);
-    timing.log(code, bytes);
+    timing.log();
     xSemaphoreGive(mutex);
     portENTER_CRITICAL(&status_mux);
     ++status.revision;
@@ -3581,8 +4128,14 @@ void worker(void *) {
         if (work_once()) continue;
         Status publication;
         get_status(publication);
+        bool pending = false;
+        xSemaphoreTake(mutex, portMAX_DELAY);
+        for (const auto &job : jobs) pending |= job.state == JobState::Queued;
+        xSemaphoreGive(mutex);
+        for (const auto &work : maintenance_progress)
+            pending |= work.active && !maintenance_suspended(work.phase);
         const bool retry = background_retry || publication.state == State::WaitingStorage ||
-            publication.state == State::Blocked;
+            publication.state == State::Blocked || pending;
         const uint32_t quiet = publication.state == State::Ready ? foreground_wait() : 0;
         xSemaphoreTake(wake, retry ? pdMS_TO_TICKS(1000) : quiet ? pdMS_TO_TICKS(quiet) : portMAX_DELAY);
     }
@@ -3667,6 +4220,15 @@ void tick() {
     if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return;
     for (auto &job : jobs) if (job.state != JobState::Free && reusable(job)) reset_job(job);
     xSemaphoreGive(mutex);
+    // Arm on every contended read, including one after the completion event.
+    // Publish only after taking and releasing the result mutex, so an SSE
+    // receiver cannot consume its final wake while the same lock is held.
+    portENTER_CRITICAL(&status_mux);
+    if (jobs.delivery_waiting) {
+        jobs.delivery_waiting = false;
+        ++status.revision;
+    }
+    portEXIT_CRITICAL(&status_mux);
 }
 
 void get_status(Status &out) {
@@ -3690,8 +4252,6 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     if (!publication.mounted) return reject("no_sd");
     if (!publication.available) return reject("not_idle");
     if (request.revision && request.revision != publication.data_revision) return reject("stale_revision");
-    foreground_activity();
-    __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
     if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return reject("busy");
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
@@ -3700,6 +4260,7 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
         SdStorage::files_revision() == publication.files_revision;
     Job *slot = nullptr, *delivered = nullptr;
     size_t active = 0;
+    bool background_active = false, days_active = false;
     for (auto &job : jobs) {
         if (current_index && !job.recovered_index && !job.cancelled && !job.issue && job.state == JobState::Complete && job.code == 200 &&
             job.data_revision == publication.data_revision && job.request == request &&
@@ -3713,6 +4274,7 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
             job.completed_ms = millis();
             id = job.id;
             xSemaphoreGive(mutex);
+            foreground_activity();
             portENTER_CRITICAL(&status_mux);
             ++status.revision;
             portEXIT_CRITICAL(&status_mux);
@@ -3723,12 +4285,22 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
             if (job.consumers == UINT16_MAX) { xSemaphoreGive(mutex); return reject("busy"); }
             ++job.consumers;
             job.shared = true;
-            if (job.state == JobState::Queued) job.background = false;
+            const bool promote = job.state == JobState::Queued && job.background;
+            if (promote) {
+                job.background = false;
+                __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
+            }
             id = job.id;
             xSemaphoreGive(mutex);
+            foreground_activity();
+            if (promote) xSemaphoreGive(wake);
             return true;
         }
-        if (job.state == JobState::Queued || job.state == JobState::Running) ++active;
+        if (job.state == JobState::Queued || job.state == JobState::Running) {
+            ++active;
+            background_active |= job.background;
+            days_active |= job.request.action == Action::Days;
+        }
         if (reusable(job)) slot = &job;
         if (job.state == JobState::Complete && !job.readers && job.data_revision != publication.data_revision)
             slot = &job;
@@ -3738,14 +4310,22 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     // Retention is opportunistic: routine days->summary->series and repeated
     // zooms can reclaim delivered/unpinned slots without a browser delay timer.
     if (!slot) slot = delivered;
-    if (!slot || active >= SLOT_COUNT) { xSemaphoreGive(mutex); return reject("busy"); }
+    // A backfill and a foreground build must leave room for calendar discovery.
+    // Only one extra Days selector is admitted; normal work keeps its bound.
+    const bool calendar_slot = request.action == Action::Days && active == SLOT_COUNT &&
+        background_active && !days_active;
+    if (!slot || (active >= SLOT_COUNT && !calendar_slot)) { xSemaphoreGive(mutex); return reject("busy"); }
     reset_job(*slot);
     slot->request = request;
     slot->id = next_id++;
     if (!next_id) next_id = 1;
     slot->state = JobState::Queued;
+    slot->progress.check(millis());
+    admit_job(*slot);
+    __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
     id = slot->id;
     xSemaphoreGive(mutex);
+    foreground_activity();
     portENTER_CRITICAL(&status_mux);
     ++status.revision;
     portEXIT_CRITICAL(&status_mux);
@@ -3806,7 +4386,15 @@ StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
 
 int poll(uint32_t id, Result &out) {
     out.reset();
-    if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return 503;
+    if (!mutex) return 503;
+    if (xSemaphoreTake(mutex, 0) != pdTRUE) {
+        bool retained = false;
+        portENTER_CRITICAL(&status_mux);
+        for (size_t i = 0; i < jobs.count; ++i) retained |= id && jobs.retained_ids[i] == id;
+        if (retained) jobs.delivery_waiting = true;
+        portEXIT_CRITICAL(&status_mux);
+        return retained ? 202 : 410;
+    }
     int code = 410;
     for (auto &job : jobs) {
         if (job.id != id || job.state == JobState::Free) continue;
@@ -3827,6 +4415,7 @@ int poll(uint32_t id, Result &out) {
         if (job.deliveries < job.consumers) ++job.deliveries;
         job.delivered = true;
         out.id_ = job.id;
+        out.readers_ = &job.readers;
         out.data_ = job.body.c_str();
         out.length_ = job.body.length();
         break;
@@ -3837,16 +4426,18 @@ int poll(uint32_t id, Result &out) {
 
 void Result::reset() {
     if (!id_) return;
-    xSemaphoreTake(mutex, portMAX_DELAY);
-    for (auto &job : jobs) if (job.id == id_) {
-        if (job.readers) --job.readers;
-        if (reusable(job)) reset_job(job);
-        break;
-    }
-    xSemaphoreGive(mutex);
-    id_ = 0;
+    const uint32_t released = std::exchange(id_, 0);
+    auto *readers = std::exchange(readers_, nullptr);
     data_ = nullptr;
     length_ = 0;
+    readers->fetch_sub(1, std::memory_order_release);
+    if (xSemaphoreTake(mutex, 0) == pdTRUE) {
+        for (auto &job : jobs) if (job.id == released) {
+            if (reusable(job)) reset_job(job);
+            break;
+        }
+        xSemaphoreGive(mutex);
+    }
     // Collection may be asleep solely because this response pinned selectors.
     foreground_activity();
     if (wake) xSemaphoreGive(wake);
@@ -3874,6 +4465,6 @@ StorageBrowser::StartResult open_artifact(const char *, const char *, bool, Stor
     return StorageBrowser::StartResult::Unavailable;
 }
 int poll(uint32_t, Result &out) { out.reset(); return 422; }
-void Result::reset() { id_ = 0; data_ = nullptr; length_ = 0; }
+void Result::reset() { id_ = 0; readers_ = nullptr; data_ = nullptr; length_ = 0; }
 }  // namespace EdfReport
 #endif

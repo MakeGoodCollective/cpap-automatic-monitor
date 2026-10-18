@@ -16,6 +16,7 @@ constexpr size_t WRITE_CHUNK_BYTES = 4096;
 
 enum class Mode : uint8_t { Local, ToUsb, Usb, ToLocal };
 enum class Access : uint8_t { Background, ReadOnly, Exclusive };
+enum class IoEvent : uint8_t { Waiting, WaitingForReader, Complete };
 
 struct Status {
     bool supported;
@@ -89,11 +90,13 @@ bool acquire();
 // free slot for this caller after a miss, through all steps of its maintenance
 // pass. finish_maintenance releases an admitted pass; an ungranted reservation
 // remains for retry. cancel_acquire abandons it even before admission.
-// Existing sessions remain valid so cooperative workers can checkpoint first.
+// Background owners checkpoint; admitted readers finish before maintenance.
 bool try_acquire(bool reserve_next = false);
 void finish_maintenance();
 void cancel_acquire();
 bool maintenance_pending();
+// Auxiliary work is intentionally waiting for an admitted download to finish.
+bool waiting_for_readers();
 // Nonblocking admission hint for the reserving owner's existing work loop.
 // A true result still requires try_acquire; it does not take the card.
 bool maintenance_ready();
@@ -104,13 +107,41 @@ public:
     // One background session and two interactive readers may coexist. A read
     // root protects a download's file/subtree from mutation, not all SD work.
     // Exclusive access reserves admission until other sessions finish. Call
-    // end even after failed admission to abandon that reservation. Copies borrow
-    // the token; the owner ends it after its Readers/Writer. Recording revokes all.
+    // end even after failed admission to abandon its reservation/FIFO ticket.
+    // Background tickets expire after 1.5 s without begin. Copies borrow the
+    // token; the owner ends it after its Readers/Writer. Recording revokes all.
     bool begin(Access access = Access::Background, const char *read_root = nullptr);
     void end();
     bool valid() const;
-    // Cooperative checkpoint hint, not revocation; admitted I/O may still finish.
+    // Cooperative checkpoint hint for background work, not revocation. Admitted
+    // readers finish their whole transfer; recording and USB still revoke them.
+    // A waiting background peer requests handoff after a 100 ms grant. A pending
+    // maintenance reservation takes precedence even during that useful turn.
     bool yield_requested() const;
+    // Change the current protected file without releasing reader admission.
+    // Close the old Reader first. Null clears the scope for directory metadata.
+    // False while an existing Writer owns the new path; the caller may retry.
+    bool protect_read(const char *path);
+
+    // One-shot hint from the SD executor when a queued background turn can
+    // start. Only signal the owner's existing worker; no I/O or blocking here.
+    // begin still checks admission. The callback/context must live until end
+    // or the pending ticket expires. Set before begin; copies borrow the token.
+    using AdmissionNotify = void (*)(void *context);
+    void set_admission_notify(AdmissionNotify notify, void *context = nullptr) {
+        admission_notify_ = notify;
+        admission_context_ = context;
+    }
+
+    // Runs on the caller, never the executor. WaitingForReader is an intentional
+    // pause, unlike a queued/slow SD operation. Complete marks successful I/O.
+    // Only observe owner state; do not submit SD work here.
+    // The context must outlive this session's I/O, including live-handle close.
+    using IoObserver = void (*)(void *context, IoEvent event, const char *write_path);
+    void set_io_observer(IoObserver observer, void *context = nullptr) {
+        io_observer_ = observer;
+        io_context_ = context;
+    }
 
     // Blocking task API, not for HTTP/RX callbacks. The operation must finish
     // one bounded read/metadata step and must not retain File objects or do UART
@@ -139,6 +170,10 @@ public:
 private:
     uint32_t generation_ = 0;
     Access access_ = Access::Background;
+    AdmissionNotify admission_notify_ = nullptr;
+    void *admission_context_ = nullptr;
+    IoObserver io_observer_ = nullptr;
+    void *io_context_ = nullptr;
     friend class Reader;
     friend class Writer;
 };
@@ -159,6 +194,10 @@ public:
     bool next(Entry &entry, bool &end);
     // Absolute file offset through UINT32_MAX, including EOF; failure keeps offset.
     bool seek(uint64_t offset);
+    // One exact offset read, at most READ_CHUNK_BYTES, in one executor step.
+    // Success consumes the requested range. A short read returns false but
+    // consumes its actual bytes; rejected/failed seek leaves offset unchanged.
+    bool read_at(uint64_t offset, uint8_t *data, size_t length);
     size_t read(uint8_t *data, size_t length);
     void close();
     uint64_t size() const { return size_; }
@@ -171,6 +210,8 @@ private:
     uint64_t size_ = 0;
     int64_t modified_ = 0;
     uint64_t offset_ = 0;
+    // Stream position can differ from credited offset after a short read.
+    uint64_t physical_offset_ = UINT64_MAX;
 };
 
 // One output and two background inputs, plus one input per interactive reader.
@@ -178,6 +219,8 @@ private:
 // via Session::mutate. Revocation closes it before recorder/USB access begins.
 class Writer {
 public:
+    enum class Mode : uint8_t { Sequential, Readback };
+
     Writer() = default;
     ~Writer() { close(); }
     Writer(const Writer &) = delete;
@@ -187,8 +230,12 @@ public:
     // uncommitted tail, even at zero. Missing/short files fail without extension.
     // append_at must fit UINT32_MAX, and off_t when a tail needs truncating.
     bool open(const Session &session, const char *path, uint64_t append_at = 0,
-              bool truncate_tail = false);
+              bool truncate_tail = false, Mode mode = Mode::Sequential);
     bool write(const uint8_t *data, size_t length);
+    // Readback mode only: one exact <=4 KiB read from the credited private
+    // prefix, restoring the append position before returning. No durable sync.
+    // A failed restore closes the writer; a short read never credits bytes.
+    bool read_at(uint64_t offset, uint8_t *data, size_t length);
     // Make the completed prefix readable without closing the sequential writer.
     // Only private, unpublished build files may be read while still growing.
     bool flush(uint64_t expected_size);
@@ -200,6 +247,7 @@ private:
     Session session_;
     uint32_t handle_ = 0;
     uint64_t size_ = 0;
+    Mode mode_ = Mode::Sequential;
 };
 
 }  // namespace SdStorage
