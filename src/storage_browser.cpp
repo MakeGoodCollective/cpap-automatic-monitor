@@ -26,9 +26,19 @@ constexpr size_t INTERNAL_RING_BYTES = 4096;
 constexpr size_t INTERNAL_COPY_BYTES = 1024;
 static_assert(SdStorage::READ_CHUNK_BYTES <= UINT16_MAX, "ZIP stored block length");
 constexpr uint32_t CONSUMER_TIMEOUT_MS = 30000;
+constexpr unsigned MAX_ACTIVE_READS = 2;
+constexpr unsigned MAX_PENDING_READS = 4;
+class Job;
 std::atomic<unsigned> active_operations{0};
+std::shared_ptr<Job> pending_reads[MAX_PENDING_READS];
+unsigned pending_count = 0;
+bool exclusive_operation = false, dispatching = false;
+portMUX_TYPE admission_mux = portMUX_INITIALIZER_UNLOCKED;
 MutationStatus mutation = {};
 portMUX_TYPE mutation_mux = portMUX_INITIALIZER_UNLOCKED;
+
+void release_slot();
+void cancel_pending(Job *job);
 
 bool mutating(Kind kind) { return kind == Kind::Rename || kind == Kind::Delete; }
 
@@ -142,12 +152,21 @@ public:
         free(entries);
         free(ring);
         free(copy_buffer);
-        if (registered) active_operations.fetch_sub(1);
+        if (registered) release_slot();
     }
 
     bool failed() const override { return error.load(); }
     bool finished() const override { return done.load() && produced.load() == consumed.load(); }
-    void cancel() override { cancelled.store(true); }
+    void cancel() override {
+        cancelled.store(true);
+        cancel_pending(this);
+    }
+
+    void release_owner() {
+        const auto notify = released;
+        released = nullptr;
+        if (notify) notify();
+    }
 
     void report(log_level_t level, const char *result) const {
         Log::logf(CAT_STORAGE, level, "%s %s made=%u out=%u ms=%u path=%s\n",
@@ -595,7 +614,7 @@ void produce(void *context) {
             success ? "producer_done" : job->failure);
     job->close_input();
     job->session.end();
-    if (job->released) job->released();
+    job->release_owner();
     free(job->copy_buffer);
     job->copy_buffer = nullptr;
     job->error.store(!success);
@@ -603,64 +622,31 @@ void produce(void *context) {
     job.reset();
     vTaskDeleteWithCaps(nullptr);
 }
-}  // namespace
 
-StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active,
-                  Released released) {
-    if (!valid_request(request)) return StartResult::BadRequest;
-    if (!SdStorage::local_access_allowed() || !SdStorage::mounted()) return StartResult::Unavailable;
-    // Two readers may coexist, including a response outliving its producer.
-    // Mutations keep a single browser job until their exclusive lease finishes.
-    const unsigned limit = mutating(request.kind) ? 1 : 2;
-    unsigned active_count = active_operations.load();
-    for (;;) {
-        if (active_count >= limit) {
-            Log::logf(CAT_STORAGE, LOG_DEBUG, "%s storage_busy path=%s\n", kind_name(request.kind), request.path);
-            return StartResult::Busy;
-        }
-        if (active_operations.compare_exchange_weak(active_count, active_count + 1)) break;
-    }
-    void *memory = aircannect::Memory::alloc_large(sizeof(Job));
-    if (!memory) {
-        Log::logf(CAT_STORAGE, LOG_WARN, "%s job_no_memory path=%s\n", kind_name(request.kind), request.path);
-        active_operations.fetch_sub(1);
-        return StartResult::Unavailable;
-    }
-    auto job = std::shared_ptr<Job>(new(memory) Job, [](Job *value) {
-        value->~Job();
-        free(value);
-    });
-    job->registered = true;
-    job->request = request;
-    job->released = released;
-    active = job;
-    job->ready = std::move(ready);
-    if (!mutating(request.kind)) {
+const char *launch(const std::shared_ptr<Job> &job) {
+    if (job->cancelled.load()) return "cancelled";
+    if (!SdStorage::local_access_allowed() || !SdStorage::mounted() ||
+        !AirSenseState::local_background_allowed()) return "storage_unavailable";
+    if (!mutating(job->request.kind)) {
         job->capacity = RING_BYTES;
         job->ring = static_cast<uint8_t *>(aircannect::Memory::alloc_large(RING_BYTES, false));
         if (!job->ring) {
             job->capacity = INTERNAL_RING_BYTES;
             job->ring = static_cast<uint8_t *>(aircannect::Memory::alloc_large(INTERNAL_RING_BYTES));
         }
-        if (!job->ring) { job->report(LOG_WARN, "ring_no_memory"); return StartResult::Unavailable; }
+        if (!job->ring) return "ring_no_memory";
     }
-    if (request.kind == Kind::File || request.kind == Kind::Archive || request.kind == Kind::Immutable) {
+    if (job->request.kind == Kind::File || job->request.kind == Kind::Archive || job->request.kind == Kind::Immutable) {
         job->copy_capacity = SdStorage::READ_CHUNK_BYTES;
         job->copy_buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(job->copy_capacity, false));
         if (!job->copy_buffer) {
             job->copy_capacity = INTERNAL_COPY_BYTES;
             job->copy_buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(job->copy_capacity));
         }
-        if (!job->copy_buffer) { job->report(LOG_WARN, "copy_no_memory"); return StartResult::Unavailable; }
+        if (!job->copy_buffer) return "copy_no_memory";
     }
     auto *context = new(std::nothrow) std::shared_ptr<Job>(job);
-    if (!context) { job->report(LOG_WARN, "context_no_memory"); return StartResult::Unavailable; }
-    if (mutating(request.kind)) {
-        portENTER_CRITICAL(&mutation_mux);
-        mutation = {};
-        mutation.active = true;
-        portEXIT_CRITICAL(&mutation_mux);
-    }
+    if (!context) return "context_no_memory";
     BaseType_t created = pdFAIL;
     if (aircannect::Memory::psram_available())
         created = xTaskCreatePinnedToCoreWithCaps(produce, "sd_browser", 6144,
@@ -669,16 +655,133 @@ StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &
         created = xTaskCreatePinnedToCoreWithCaps(produce, "sd_browser", 6144,
             context, 1, nullptr, 0, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
-        job->report(LOG_WARN, "worker_unavailable");
         delete context;
-        if (mutating(request.kind)) {
-            portENTER_CRITICAL(&mutation_mux);
-            mutation.active = false;
-            strcpy(mutation.error, "worker_unavailable");
-            portEXIT_CRITICAL(&mutation_mux);
+        return "worker_unavailable";
+    }
+    return nullptr;
+}
+
+void activate(const std::shared_ptr<Job> &job) {
+    const char *error = launch(job);
+    if (!error) return;
+    if (mutating(job->request.kind)) {
+        portENTER_CRITICAL(&mutation_mux);
+        mutation.active = false;
+        snprintf(mutation.error, sizeof(mutation.error), "%s", error);
+        portEXIT_CRITICAL(&mutation_mux);
+    }
+    job->report(job->cancelled.load() || !strcmp(error, "storage_unavailable") ? LOG_DEBUG : LOG_WARN, error);
+    job->error.store(true);
+    job->done.store(true);
+    job->ready(503, error, nullptr, 0);
+    job->ready = nullptr;
+    job->release_owner();
+}
+
+void dispatch_pending() {
+    portENTER_CRITICAL(&admission_mux);
+    if (dispatching) {
+        portEXIT_CRITICAL(&admission_mux);
+        return;
+    }
+    dispatching = true;
+    portEXIT_CRITICAL(&admission_mux);
+    for (;;) {
+        std::shared_ptr<Job> job;
+        portENTER_CRITICAL(&admission_mux);
+        if (exclusive_operation || active_operations.load() >= MAX_ACTIVE_READS || !pending_count) {
+            dispatching = false;
+            portEXIT_CRITICAL(&admission_mux);
+            return;
         }
+        job = std::move(pending_reads[0]);
+        for (unsigned i = 1; i < pending_count; ++i)
+            pending_reads[i - 1] = std::move(pending_reads[i]);
+        --pending_count;
+        job->registered = true;
+        active_operations.fetch_add(1);
+        portEXIT_CRITICAL(&admission_mux);
+        activate(job);
+        // Destroy outside the lock. Failure may release this slot immediately;
+        // dispatching keeps that release from recursively draining the queue.
+    }
+}
+
+void release_slot() {
+    portENTER_CRITICAL(&admission_mux);
+    active_operations.fetch_sub(1);
+    exclusive_operation = false;
+    portEXIT_CRITICAL(&admission_mux);
+    dispatch_pending();
+}
+
+void cancel_pending(Job *target) {
+    std::shared_ptr<Job> job;
+    portENTER_CRITICAL(&admission_mux);
+    for (unsigned i = 0; i < pending_count; ++i) {
+        if (pending_reads[i].get() != target) continue;
+        job = std::move(pending_reads[i]);
+        for (unsigned j = i + 1; j < pending_count; ++j)
+            pending_reads[j - 1] = std::move(pending_reads[j]);
+        --pending_count;
+        break;
+    }
+    portEXIT_CRITICAL(&admission_mux);
+    if (!job) return; // An active producer handles its own cancellation.
+    job->ready = nullptr;
+    job->error.store(true);
+    job->done.store(true);
+    job->release_owner();
+}
+}  // namespace
+
+StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active,
+                  Released released) {
+    if (!valid_request(request)) return StartResult::BadRequest;
+    if (!SdStorage::local_access_allowed() || !SdStorage::mounted()) return StartResult::Unavailable;
+    void *memory = aircannect::Memory::alloc_large(sizeof(Job));
+    if (!memory) {
+        Log::logf(CAT_STORAGE, LOG_WARN, "%s job_no_memory path=%s\n", kind_name(request.kind), request.path);
         return StartResult::Unavailable;
     }
+    auto job = std::shared_ptr<Job>(new(memory) Job, [](Job *value) {
+        value->~Job();
+        free(value);
+    });
+    job->request = request;
+    job->ready = std::move(ready);
+    const bool exclusive = mutating(request.kind);
+    bool accepted = false, queued = false;
+    portENTER_CRITICAL(&admission_mux);
+    if (!pending_count && !exclusive_operation &&
+        active_operations.load() < (exclusive ? 1u : MAX_ACTIVE_READS)) {
+        active_operations.fetch_add(1);
+        job->registered = true;
+        exclusive_operation = exclusive;
+        accepted = true;
+    } else if (!exclusive && pending_count < MAX_PENDING_READS) {
+        pending_reads[pending_count++] = job;
+        accepted = queued = true;
+    }
+    // Publish release ownership before a concurrent slot release can promote
+    // this descriptor. Pending jobs hold no SD session.
+    if (accepted) job->released = released;
+    portEXIT_CRITICAL(&admission_mux);
+    if (!accepted) {
+        job->report(LOG_DEBUG, exclusive ? "storage_busy" : "read_queue_full");
+        return StartResult::Busy;
+    }
+    active = job;
+    if (exclusive) {
+        portENTER_CRITICAL(&mutation_mux);
+        mutation = {};
+        mutation.active = true;
+        portEXIT_CRITICAL(&mutation_mux);
+    }
+    if (queued) {
+        Log::logf(CAT_STORAGE, LOG_DEBUG, "%s queued path=%s\n", kind_name(request.kind), request.path);
+        dispatch_pending();
+    } else activate(job);
     return StartResult::Started;
 }
 
