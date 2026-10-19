@@ -122,6 +122,10 @@ void dispatch_command(const char *line, String &response) {
                 }
             }
             if (sd.error[0]) response += "error: " + String(sd.error) + "\n";
+            if (sd.format_result != SdStorage::FormatResult::None) {
+                response += "format: " + String(SdStorage::format_result_name(sd.format_result)) + '\n';
+                if (sd.format_error[0]) response += "format_error: " + String(sd.format_error) + '\n';
+            }
 #if AB_STORAGE_HAS_SDCARD
             StorageBrowser::MutationStatus status;
             StorageBrowser::mutation_status(status);

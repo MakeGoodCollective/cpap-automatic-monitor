@@ -17,6 +17,7 @@
 #include <freertos/semphr.h>
 #include <driver/sdmmc_host.h>
 #include <sdmmc_cmd.h>
+#include <esp_vfs_fat.h>
 #include <ff.h>
 #include <diskio_impl.h>
 #include <diskio_sdmmc.h>
@@ -44,6 +45,9 @@ static uint32_t file_mutation_revision = 0;
 namespace {
 bool init_started = false;
 bool formatting = false;
+TaskHandle_t mount_caller = nullptr;
+bool mount_driver_called = false;
+esp_err_t mount_result = ESP_OK;
 
 struct Request {
     enum Kind { Run, Acquire, TryAcquire, Release, Close, Begin, End, Mount, UsbIo } kind;
@@ -479,6 +483,24 @@ void close_handle(uint32_t handle, Session::IoObserver observer = nullptr, void 
 }
 }  // namespace
 
+extern "C" esp_err_t __real_esp_vfs_fat_sdmmc_mount(
+    const char *, const sdmmc_host_t *, const sdmmc_slot_config_t *,
+    const esp_vfs_fat_mount_config_t *, sdmmc_card_t **);
+
+// SD_MMC.begin() discards this result. Capture it only for the owning attempt;
+// do not redirect SDK logging or change mount behavior for any caller.
+extern "C" esp_err_t __wrap_esp_vfs_fat_sdmmc_mount(
+    const char *path, const sdmmc_host_t *host, const sdmmc_slot_config_t *slot,
+    const esp_vfs_fat_mount_config_t *config, sdmmc_card_t **card) {
+    const esp_err_t result = __real_esp_vfs_fat_sdmmc_mount(path, host, slot, config, card);
+    const TaskHandle_t caller = __atomic_load_n(&mount_caller, __ATOMIC_ACQUIRE);
+    if (caller && xTaskGetCurrentTaskHandle() == caller) {
+        mount_driver_called = true;
+        mount_result = result;
+    }
+    return result;
+}
+
 bool write_exact(fs::File &file, const uint8_t *data, size_t size) {
     return file && file.write(data, size) == size;
 }
@@ -595,10 +617,12 @@ bool factory_format() {
     }
     heap_caps_free(work);
 
-    char error[sizeof(status.error)] = {};
+    char error[sizeof(status.format_error)] = {};
     if (!success) snprintf(error, sizeof(error), "format %s failed (%d)", step, result);
     mount_error(error);
     portENTER_CRITICAL(&status_mux);
+    status.format_result = success ? FormatResult::Succeeded : FormatResult::Failed;
+    memcpy(status.format_error, error, sizeof(status.format_error));
     formatting = false;
     portEXIT_CRITICAL(&status_mux);
     Log::logf(CAT_STORAGE, success ? LOG_INFO : LOG_ERROR,
@@ -657,15 +681,26 @@ void mount_card() {
     }
 
     const bool one_bit = AB_SDMMC_WIDTH == 1;
-    if (!SD_MMC.begin("/sdcard", one_bit, false, AB_SDMMC_FREQ_KHZ, 8)) {
-        mount_error("mount failed");
-        Log::logf(CAT_STORAGE, LOG_ERROR, "mount failed\n");
-        return;
-    }
-    if (SD_MMC.cardType() == CARD_NONE) {
-        SD_MMC.end();
-        mount_error("no card");
-        Log::logf(CAT_STORAGE, LOG_WARN, "no card detected\n");
+    mount_driver_called = false;
+    mount_result = ESP_OK;
+    __atomic_store_n(&mount_caller, xTaskGetCurrentTaskHandle(), __ATOMIC_RELEASE);
+    const bool success = SD_MMC.begin("/sdcard", one_bit, false, AB_SDMMC_FREQ_KHZ, 8);
+    __atomic_store_n(&mount_caller, nullptr, __ATOMIC_RELEASE);
+    if (!success || SD_MMC.cardType() == CARD_NONE) {
+        if (success) SD_MMC.end();
+        char error[sizeof(status.error)];
+        if (mount_driver_called && mount_result != ESP_OK) {
+            snprintf(error, sizeof(error), "mount failed: %s (0x%x)",
+                     esp_err_to_name(mount_result), static_cast<unsigned>(mount_result));
+        } else if (success) {
+            snprintf(error, sizeof(error), "no card");
+        } else {
+            snprintf(error, sizeof(error), "mount failed: SDMMC %s",
+                     mount_driver_called ? "pin registration" : "pin/bus setup");
+        }
+        mount_error(error);
+        Log::logf(CAT_STORAGE, success && mount_result == ESP_OK ? LOG_WARN : LOG_ERROR,
+                  "%s\n", error);
         return;
     }
 
@@ -866,6 +901,14 @@ const char *state_name(const Status &value) {
     case Mode::Usb: return "usb";
     case Mode::ToLocal: return "usb_stopping";
     default: return value.mounted ? "mounted" : "unavailable";
+    }
+}
+
+const char *format_result_name(FormatResult result) {
+    switch (result) {
+    case FormatResult::Succeeded: return "succeeded";
+    case FormatResult::Failed: return "failed";
+    default: return "none";
     }
 }
 

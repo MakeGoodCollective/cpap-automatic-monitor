@@ -15,6 +15,7 @@ constexpr size_t READ_CHUNK_BYTES = 4096;
 constexpr size_t WRITE_CHUNK_BYTES = 4096;
 
 enum class Mode : uint8_t { Local, ToUsb, Usb, ToLocal };
+enum class FormatResult : uint8_t { None, Succeeded, Failed };
 enum class Access : uint8_t { Background, ReadOnly, Exclusive };
 enum class IoEvent : uint8_t { Waiting, WaitingForReader, Complete };
 
@@ -24,9 +25,12 @@ struct Status {
     uint64_t card_bytes;
     uint64_t total_bytes;
     uint64_t used_bytes;
-    char error[48];
+    char error[96];
     Mode mode = Mode::Local;
     bool usb_supported = false;
+    // Boot-time format outcome, independent of subsequent mount/USB errors.
+    FormatResult format_result = FormatResult::None;
+    char format_error[48] = {};
 };
 
 // Binary storage records use little-endian fields regardless of alignment.
@@ -67,6 +71,7 @@ fs::FS *filesystem();
 void refresh_usage();
 void get_status(Status &out);
 const char *state_name(const Status &status);
+const char *format_result_name(FormatResult result);
 
 // Admission only; the SD worker drains admitted I/O before changing media.
 // Disabling USB also works with a connected host; its unwritten cache is lost.

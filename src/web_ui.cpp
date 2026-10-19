@@ -414,6 +414,8 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
         jsonAddInt(json, "sd_used_mb", sd.used_bytes / (1024 * 1024));
         jsonAddBool(json, "sd_usb_supported", sd.usb_supported);
         jsonAddString(json, "sd_error", sd.error);
+        jsonAddString(json, "sd_format_result", SdStorage::format_result_name(sd.format_result));
+        jsonAddString(json, "sd_format_error", sd.format_error);
 #endif
     }
     if (fields & STATUS_OXI) {
@@ -513,7 +515,7 @@ static size_t buildStatusJson(char *out, size_t cap) {
 static const uint32_t STATUS_CACHE_TTL_MS = 500;
 // Includes bounded owner strings at the WebUI escape worst case (two bytes)
 // and uint32 owner revisions.
-static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 2432 : 1472;
+static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 2816 : 1472;
 static String status_cache;
 static uint32_t status_cache_built_at = 0;
 static uint32_t status_cache_config_revision = 0;
@@ -2611,7 +2613,9 @@ static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
         a.storage.supported != b.storage.supported ||
         a.storage.card_bytes != b.storage.card_bytes || a.storage.used_bytes != b.storage.used_bytes ||
         a.storage.usb_supported != b.storage.usb_supported ||
-        strcmp(a.storage.error, b.storage.error))
+        strcmp(a.storage.error, b.storage.error) ||
+        a.storage.format_result != b.storage.format_result ||
+        strcmp(a.storage.format_error, b.storage.format_error))
         fields |= STATUS_STORAGE;
     return fields;
 }
