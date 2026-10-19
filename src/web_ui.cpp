@@ -2029,6 +2029,7 @@ static String buildOtaStatus(const OtaManager::Status &status, bool full) {
     jsonAddUInt32(json, "revision", status.revision);
     jsonAddUInt32(json, "release_notes_id", status.release_notes_id);
     jsonAddBool(json, "version_comparable", status.version_comparable);
+    jsonAddBool(json, "release_installable", status.release_installable);
     if (status.state == OtaManager::State::Installing ||
         status.state == OtaManager::State::Rebooting)
         jsonAddInt(json, "progress", status.progress);

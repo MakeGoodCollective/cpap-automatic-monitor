@@ -342,8 +342,8 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .release-notes-header h2{font-size:17px;line-height:1.4;overflow-wrap:anywhere;min-width:0}
 .release-notes-header .btn{flex:none;min-height:44px}
 .release-notes-body{padding:16px;overflow:auto;min-height:0;line-height:1.6;font-size:14px;overflow-wrap:anywhere}
-.release-notes-body h1,.release-notes-body h2,.release-notes-body h3{font-size:18px;line-height:1.4;margin:20px 0 10px;color:var(--accent)}
-.release-notes-body h2{font-size:16px}.release-notes-body h3{font-size:14px}
+.release-notes-body :is(h1,h2,h3,h4,h5,h6){font-size:14px;line-height:1.4;margin:20px 0 10px;color:var(--accent)}
+.release-notes-body h1{font-size:18px}.release-notes-body h2{font-size:16px}
 .release-notes-body>:first-child{margin-top:0}
 .release-notes-body p,.release-notes-body ul,.release-notes-body pre{margin:10px 0}
 .release-notes-body ul{padding-left:22px}.release-notes-body li{margin:5px 0}
@@ -1582,9 +1582,6 @@ function showTab(id) {
   if (id === 'ota') {
     checkFlashReady();
     if (otaStatus) renderOtaStatus(otaStatus);
-    var ev = document.getElementById('espFwVer');
-    if (ev && lastStatus.version) uiText(ev, uiMessage('common.value', {value:{items:[lastStatus.version,
-      lastStatus.built ? uiClockMessage(lastStatus.built) : null].filter(Boolean),separator:' / '}}));
   }
 }
 
@@ -1666,10 +1663,12 @@ function renderStatus(d) {
     const duration = uiMessage(days ? 'duration.uptime' : 'duration.shortUptime', {days,hours:hrs,minutes:mins});
     uiText(document.getElementById('topUptime'), uiMessage('status.uptime', {duration}));
   }
-  if (d.version) {
-    document.getElementById('ver').textContent = d.version;
-    var vb = document.getElementById('verBuild');
-    if (vb && d.built) uiText(vb, uiClockMessage(d.built));
+  if (d.version !== undefined || d.built !== undefined) {
+    const version = lastStatus.version || '--';
+    const built = (lastStatus.built || '').replace(/^(\d{4}-\d\d-\d\d)T/, '$1 ');
+    uiText(document.getElementById('ver'), version);
+    uiText(document.getElementById('verBuild'), built);
+    uiText(document.getElementById('espFwVer'), [version, built].filter(Boolean).join(' / '));
   }
   if (d.target !== undefined) {
     uiText(document.getElementById('verBuild'), d.target ? uiMessage('status.buildTarget', {target:d.target}) : '', 'title');
@@ -4749,7 +4748,7 @@ function renderReleaseNotesMarkdown(container, markdown) {
       code = [];
       continue;
     }
-    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
       appendParagraph(container, paragraph);
       closeList();
@@ -4868,26 +4867,23 @@ function renderOtaNotice(d) {
 }
 
 function renderOtaStatus(d) {
-  var version = document.getElementById('espFwVer');
-  if (version && lastStatus.version) uiText(version, lastStatus.version);
-
   var latest = d.update_version || '--';
   if (d.state === 'disabled') latest = uiMessage('ota.checksDisabled');
   else if (d.state === 'checking') latest = uiMessage('ota.checking');
-  else if (d.state === 'current') latest = uiMessage('ota.currentVersion', {version:latest});
   else if (d.state === 'available') latest = uiMessage('ota.availableVersion', {version:latest});
   uiText(document.getElementById('espFwLatest'), latest);
+  var active = ['checking', 'installing', 'rebooting', 'busy'].includes(d.state);
+  const installable = d.release_installable === true;
   const versionHint = document.getElementById('otaVersionHint');
-  versionHint.hidden = d.state !== 'available' || d.version_comparable !== false;
+  versionHint.hidden = !installable || active || d.version_comparable !== false;
   uiText(versionHint, versionHint.hidden ? '' : uiMessage('ota.versionUncomparable', {version:d.update_version}));
 
-  var active = ['checking', 'installing', 'rebooting', 'busy'].includes(d.state);
   var check = document.getElementById('btnOtaCheck');
   check.disabled = d.state === 'disabled' || active || !!d.blocked;
   var install = document.getElementById('btnOtaInstall');
-  install.style.display = d.state === 'available' ? '' : 'none';
+  install.style.display = installable ? '' : 'none';
   uiText(install, d.update_version ? uiMessage('ota.installVersion', {version:d.update_version}) : uiMessage('ota.install'));
-  install.disabled = d.state !== 'available' || !!d.blocked;
+  install.disabled = !installable || active || !!d.blocked;
   const blocked = d.blocked ? uiMessage('ota.blockedReason', {reason:uiError(d.blocked)}) : '';
   uiText(check, blocked, 'title');
   uiText(install, blocked, 'title');

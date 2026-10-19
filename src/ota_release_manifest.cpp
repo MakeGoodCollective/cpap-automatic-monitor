@@ -344,4 +344,71 @@ bool resolve_artifact_url(const char *manifest_url, const char *artifact_url,
                     (size_t)(directory_end - manifest_url), artifact_url);
 }
 
+bool resolve_release_notes_url(const char *manifest_url, const Manifest &manifest,
+                               const char *target, char *resolved_url,
+                               size_t resolved_capacity) {
+    if (strnlen(manifest.release_notes_url, URL_MAX) == URL_MAX) return false;
+    if (manifest.release_notes_url[0]) {
+        return resolve_artifact_url(manifest_url, manifest.release_notes_url,
+                                    resolved_url, resolved_capacity);
+    }
+
+    static constexpr char GITHUB[] = "https://github.com/";
+    if (!target || !*target || strnlen(target, URL_MAX) == URL_MAX ||
+        !manifest_url || strnlen(manifest_url, URL_MAX) == URL_MAX ||
+        !valid_url_text(manifest_url) ||
+        strncasecmp(manifest_url, GITHUB, sizeof(GITHUB) - 1) != 0) return false;
+
+    const char *owner = manifest_url + sizeof(GITHUB) - 1;
+    const char *owner_end = strchr(owner, '/');
+    const char *repository_end = owner_end ? strchr(owner_end + 1, '/') : nullptr;
+    if (!owner_end || owner_end == owner || !repository_end ||
+        repository_end == owner_end + 1) return false;
+    for (const char *p = owner; p < owner_end; p++)
+        if (!isalnum((unsigned char)*p) && *p != '-') return false;
+    const char *repository = owner_end + 1;
+    if ((repository_end - repository == 1 && repository[0] == '.') ||
+        (repository_end - repository == 2 && !memcmp(repository, "..", 2))) return false;
+    for (const char *p = repository; p < repository_end; p++)
+        if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_' && *p != '.') return false;
+
+    // Only the historical bare firmware filename identifies a legacy notes tag.
+    const char *file = manifest.artifact.url;
+    size_t file_len = strnlen(file, URL_MAX);
+    size_t version_len = strnlen(manifest.version, VERSION_MAX);
+    ParsedVersion parsed;
+    if (file_len == URL_MAX || version_len == VERSION_MAX ||
+        !parse_semver(manifest.version, version_len, parsed) ||
+        strncmp(file, "airbridge-", 10) != 0) return false;
+    for (const char *p = file; *p; p++)
+        if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_' && *p != '.') return false;
+
+    const char *version = manifest.version;
+    if (*version == 'v' || *version == 'V') { version++; version_len--; }
+    const char *tag = file + 10;
+    const char *file_version = tag + (*tag == 'v' || *tag == 'V' ? 1 : 0);
+    if (strncmp(file_version, version, version_len) != 0 ||
+        file_version[version_len] != '-') return false;
+    size_t tag_len = (size_t)(file_version - tag) + version_len;
+    const char *file_target = tag + tag_len + 1;
+    if (file_len >= 5 && !strcmp(file + file_len - 5, ".zlib")) file_len -= 5;
+    if (file_len < 4 || memcmp(file + file_len - 4, ".bin", 4) != 0 ||
+        file_target >= file + file_len - 4) return false;
+    size_t target_len = (size_t)(file + file_len - 4 - file_target);
+    if (strlen(target) != target_len || memcmp(file_target, target, target_len) != 0) return false;
+
+    // Pin notes to the verified filename tag, never the moving latest release.
+    char path[VERSION_MAX + 64];
+    int prefix_len = snprintf(path, sizeof(path), "/releases/download/%.*s/",
+                              (int)tag_len, tag);
+    if (prefix_len < 0 || (size_t)prefix_len >= sizeof(path)) return false;
+    if (strcmp(repository_end, "/releases/latest/download/airbridge-release.json") != 0 &&
+        (strncmp(repository_end, path, (size_t)prefix_len) != 0 ||
+         strcmp(repository_end + prefix_len, "airbridge-release.json") != 0)) return false;
+    return join_url(path + prefix_len, sizeof(path) - (size_t)prefix_len,
+                    "", 0, "RELEASE_NOTES.md") &&
+           join_url(resolved_url, resolved_capacity, manifest_url,
+                    (size_t)(repository_end - manifest_url), path);
+}
+
 }  // namespace OtaRelease

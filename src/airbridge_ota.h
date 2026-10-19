@@ -21,6 +21,7 @@ namespace OtaManager {
         char update_version[48];
         char error[64];
         bool version_comparable;
+        bool release_installable;
         uint32_t release_notes_id;
     };
 

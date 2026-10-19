@@ -25,8 +25,8 @@ def build_date():
     if epoch:
         return datetime.datetime.fromtimestamp(
             int(epoch), datetime.timezone.utc,
-        ).strftime("%Y-%m-%dT%H:%M")
-    return datetime.datetime.now().strftime("%Y-%m-%dT%H:%M")
+        ).strftime("%Y-%m-%dT%H:%M:%S")
+    return datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def generate_header(project_dir, output_dir):

@@ -146,7 +146,7 @@ void finish_check(uint32_t generation, const OtaRelease::Manifest *manifest,
         snprintf(runtime.update_version, sizeof(runtime.update_version), "%s",
                  manifest->version);
     }
-    if (artifact && update_available && !error) available_artifact = *artifact;
+    if (artifact && !error) available_artifact = *artifact;
     if (error) set_error_locked(error);
     unlock(true);
     if (error) {
@@ -158,11 +158,12 @@ void finish_check(uint32_t generation, const OtaRelease::Manifest *manifest,
 }
 
 std::shared_ptr<ReleaseNotes> fetch_release_notes(const char *manifest_url,
-                                                const char *notes_url,
+                                                const OtaRelease::Manifest &manifest,
                                                 uint32_t &generation) {
-    if (!notes_url[0] || !operation_allowed(&generation)) return {};
+    if (!operation_allowed(&generation)) return {};
     char url[OtaRelease::URL_MAX];
-    if (!OtaRelease::resolve_artifact_url(manifest_url, notes_url, url, sizeof(url))) return {};
+    if (!OtaRelease::resolve_release_notes_url(manifest_url, manifest, AB_OTA_RELEASE_TARGET,
+                                               url, sizeof(url))) return {};
     std::shared_ptr<ReleaseNotes> notes;
     if (!lock()) return {};
     for (auto &slot : notes_slots) {
@@ -223,7 +224,7 @@ void check_task(void *argument) {
     const bool comparable = parsed && OtaRelease::is_newer(airbridge_version(), manifest.version, newer);
     // Unknown local versions permit an explicit install, never an automatic one.
     const bool available = parsed && (newer || !comparable);
-    auto notes = available ? fetch_release_notes(url, manifest.release_notes_url, generation) : nullptr;
+    auto notes = parsed ? fetch_release_notes(url, manifest, generation) : nullptr;
 
     // Both HTTP clients and the manifest buffer are gone before BLE allocates again.
     bool restored = OxiBle::restore_memory(BLE_PAUSE_TIMEOUT_MS);
@@ -259,9 +260,9 @@ void check_task(void *argument) {
     }
 
     const esp_partition_t *partition = esp_ota_get_next_update_partition(nullptr);
-    bool installable = available && partition && resolved.image_size <= partition->size;
+    bool installable = partition && resolved.image_size <= partition->size;
     finish_check(generation, &manifest, &resolved, available,
-                 available && !installable ? "artifact_too_large" : nullptr,
+                 !installable ? "artifact_too_large" : nullptr,
                  comparable, std::move(notes));
     vTaskDelete(nullptr);
 }
@@ -573,7 +574,8 @@ bool request_install(const char **error) {
         return false;
     }
     const char *rejected = start_blocked();
-    if (!rejected && (runtime.result != State::Available || !available_artifact.size))
+    if (!rejected && ((runtime.result != State::Available && runtime.result != State::Current) ||
+                     !available_artifact.size))
         rejected = "update_not_available";
     if (!rejected) {
         runtime.operation = OP_INSTALL;
@@ -648,6 +650,8 @@ bool get_status(Status &status) {
     status.last_check_age_ms = runtime.last_check_ms
         ? millis() - runtime.last_check_ms : 0;
     status.version_comparable = runtime.version_comparable;
+    status.release_installable = available_artifact.size &&
+        (runtime.result == State::Available || runtime.result == State::Current);
     status.release_notes_id = runtime.release_notes_id;
     snprintf(status.update_version, sizeof(status.update_version), "%s",
              runtime.update_version);
