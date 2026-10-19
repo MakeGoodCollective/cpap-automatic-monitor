@@ -2302,6 +2302,7 @@ bool days_json(const SdStorage::Session &session, Job &job) {
     bool period_comma = false;
     for (uint16_t period : PERIODS) {
         Request request; request.view = View::Period; request.period = period;
+        if (!count) break;
         char prefix[96]; uint8_t key[32];
         period_prefix(request, prefix);
         ReportArtifact::Document document;
@@ -2442,7 +2443,10 @@ bool cleanup_indexes(const SdStorage::Session &session) {
     bool end = false;
     if (!index_cleanup.discovered) {
         memset(index_cleanup.present, 0, sizeof(index_cleanup.present));
-        if (!directory.open(session, CACHE_DIR, true)) return false;
+        if (!directory.open(session, CACHE_DIR, true)) {
+            if (!session.run([](fs::FS &fs) { return !fs.exists(CACHE_DIR); })) return false;
+            end = true;
+        }
         while (!end) {
             if (cleanup_cancelled(context) || !directory.next(entry, end)) return false;
             if (end) break;
@@ -3583,6 +3587,10 @@ bool cleanup_artifacts(const SdStorage::Session &session) {
             for (const char *name : {"days", "periods"}) for (JsonObjectConst item : json[name].as<JsonArrayConst>()) {
                 const auto ref = !strcmp(name, "days") ? item["publication"].as<JsonObjectConst>() : item;
                 if (ref.isNull()) continue;
+                // Older empty-card backfill published the zero-day sentinel.
+                // That directory is outside GC's valid date range and remains
+                // untouched; its references must not block other days forever.
+                if (ref["day"] == "19700101") continue;
                 CleanupAnchor anchor; size_t decoded;
                 if (!catalog_day(ref["day"], anchor.day) ||
                     !aircannect::hex_decode(ref["digest"], 64, anchor.digest, 32, decoded)) return false;
@@ -3591,8 +3599,11 @@ bool cleanup_artifacts(const SdStorage::Session &session) {
             }
         }
         SdStorage::Reader directory;
-        if (!directory.open(session, CACHE_DIR, true)) return false;
         SdStorage::Reader::Entry entry; bool end = false;
+        if (!directory.open(session, CACHE_DIR, true)) {
+            if (!session.run([](fs::FS &fs) { return !fs.exists(CACHE_DIR); })) return false;
+            end = true;
+        }
         while (!end) {
             if (cleanup_cancelled(context) || !directory.next(entry, end)) return false;
             if (end) break;
@@ -3727,7 +3738,10 @@ bool enqueue_backfill(const SdStorage::Session &session) {
     uint16_t day = 0;
     for (size_t i = 0; i < index_count; ++i)
         if (selected(index[i], 1, backfill_before - (backfill_before != 0))) day = std::max(day, index[i].day);
-    if (!day) backfill_before = 0;
+    if (!day) {
+        backfill_before = 0;
+        if (!last_day(Request{})) backfill_period = sizeof(PERIODS) / sizeof(PERIODS[0]);
+    }
     if (!day && backfill_period >= sizeof(PERIODS) / sizeof(PERIODS[0])) return false;
     if (!dataset(session)) return false;
     Request request; request.action = Action::Prepare; request.day = day;
