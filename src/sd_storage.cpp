@@ -16,6 +16,7 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <driver/sdmmc_host.h>
+#include <driver/sdmmc_defs.h>
 #include <sdmmc_cmd.h>
 #include <esp_vfs_fat.h>
 #include <ff.h>
@@ -48,6 +49,21 @@ bool formatting = false;
 TaskHandle_t mount_caller = nullptr;
 bool mount_driver_called = false;
 esp_err_t mount_result = ESP_OK;
+sdmmc_card_t *mount_card_info = nullptr;
+
+// Caller holds status_mux. Only copy initialization results, never query the bus.
+void set_bus_status(const sdmmc_card_t *card) {
+    status.bus_active = card != nullptr;
+    // IDF narrows log_bus_width during initialization; get_bus_width is the slot limit.
+    status.bus_width = card && (card->log_bus_width == 0 ||
+        card->log_bus_width == 2 || card->log_bus_width == 3)
+        ? (1u << card->log_bus_width) : 0;
+    status.bus_clock_khz = card && card->real_freq_khz > 0 ? card->real_freq_khz : 0;
+    status.bus_clock_limit_khz = AB_SDMMC_FREQ_KHZ;
+    status.card_type = !card ? CardType::Unknown : card->is_mmc ? CardType::Mmc :
+        card->is_sdio ? CardType::Sdio :
+        (card->ocr & SD_OCR_SDHC_CAP) ? CardType::Sdhc : CardType::Sd;
+}
 
 struct Request {
     enum Kind { Run, Acquire, TryAcquire, Release, Close, Begin, End, Mount, UsbIo } kind;
@@ -487,8 +503,8 @@ extern "C" esp_err_t __real_esp_vfs_fat_sdmmc_mount(
     const char *, const sdmmc_host_t *, const sdmmc_slot_config_t *,
     const esp_vfs_fat_mount_config_t *, sdmmc_card_t **);
 
-// SD_MMC.begin() discards this result. Capture it only for the owning attempt;
-// do not redirect SDK logging or change mount behavior for any caller.
+// SD_MMC.begin() discards the result and hides the card. Capture both only for
+// the owning attempt; the card is read only after begin succeeds, then forgotten.
 extern "C" esp_err_t __wrap_esp_vfs_fat_sdmmc_mount(
     const char *path, const sdmmc_host_t *host, const sdmmc_slot_config_t *slot,
     const esp_vfs_fat_mount_config_t *config, sdmmc_card_t **card) {
@@ -497,6 +513,7 @@ extern "C" esp_err_t __wrap_esp_vfs_fat_sdmmc_mount(
     if (caller && xTaskGetCurrentTaskHandle() == caller) {
         mount_driver_called = true;
         mount_result = result;
+        mount_card_info = result == ESP_OK && card ? *card : nullptr;
     }
     return result;
 }
@@ -638,6 +655,7 @@ void init() {
     portENTER_CRITICAL(&status_mux);
     const bool busy = formatting;
     if (!busy) init_started = true;
+    status.bus_clock_limit_khz = AB_SDMMC_FREQ_KHZ;
     portEXIT_CRITICAL(&status_mux);
     if (busy) {
         Log::logf(CAT_STORAGE, LOG_WARN, "mount deferred during factory format\n");
@@ -665,6 +683,11 @@ namespace {
 void mount_card() {
     if (mounted()) return;
 
+    portENTER_CRITICAL(&status_mux);
+    set_bus_status(nullptr);
+    portEXIT_CRITICAL(&status_mux);
+    mount_card_info = nullptr;
+
     bool pins_ok;
     if (AB_SDMMC_WIDTH == 1) {
         pins_ok = SD_MMC.setPins(AB_SDMMC_CLK_GPIO, AB_SDMMC_CMD_GPIO,
@@ -687,6 +710,7 @@ void mount_card() {
     const bool success = SD_MMC.begin("/sdcard", one_bit, false, AB_SDMMC_FREQ_KHZ, 8);
     __atomic_store_n(&mount_caller, nullptr, __ATOMIC_RELEASE);
     if (!success || SD_MMC.cardType() == CARD_NONE) {
+        mount_card_info = nullptr;
         if (success) SD_MMC.end();
         char error[sizeof(status.error)];
         if (mount_driver_called && mount_result != ESP_OK) {
@@ -712,13 +736,22 @@ void mount_card() {
     status.total_bytes = total_bytes;
     status.used_bytes = used_bytes;
     status.error[0] = 0;
+    set_bus_status(mount_card_info);
     // Also covers a USB round trip missed by consumers observing mounted=true.
     __atomic_add_fetch(&file_mutation_revision, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&status.mounted, true, __ATOMIC_RELEASE);
     portEXIT_CRITICAL(&status_mux);
+    mount_card_info = nullptr;
+    Status published;
+    get_status(published);
+    char width[12] = "unavailable", frequency[24] = "unavailable";
+    if (published.bus_width) snprintf(width, sizeof(width), "%u", published.bus_width);
+    if (published.bus_clock_khz)
+        snprintf(frequency, sizeof(frequency), "%ukHz", published.bus_clock_khz);
     Log::logf(CAT_STORAGE, LOG_INFO,
-              "mounted width=%u freq=%ukHz size=%lluMB\n",
-              AB_SDMMC_WIDTH, AB_SDMMC_FREQ_KHZ,
+              "mounted width=%s freq=%s limit=%ukHz type=%s size=%lluMiB\n",
+              width, frequency, published.bus_clock_limit_khz,
+              card_type_name(published.card_type),
               static_cast<unsigned long long>(card_bytes / (1024 * 1024)));
 }
 
@@ -735,7 +768,10 @@ void advance_usb() {
             __atomic_store_n(&status.mode, Mode::Local, __ATOMIC_RELEASE);
             return;
         }
+        portENTER_CRITICAL(&status_mux);
+        set_bus_status(nullptr);
         __atomic_store_n(&status.mounted, false, __ATOMIC_RELEASE);
+        portEXIT_CRITICAL(&status_mux);
         SD_MMC.end();
         sdmmc_host_t host = SDMMC_HOST_DEFAULT();
         sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
@@ -747,7 +783,10 @@ void advance_usb() {
         if (result == ESP_OK && (usb_card.csd.sector_size != 512 || !usb_card.csd.capacity))
             result = ESP_ERR_NOT_SUPPORTED;
         if (result == ESP_OK) {
+            portENTER_CRITICAL(&status_mux);
+            set_bus_status(&usb_card);
             __atomic_store_n(&status.mode, Mode::Usb, __ATOMIC_RELEASE);
+            portEXIT_CRITICAL(&status_mux);
             result = UsbStorage::expose(usb_card.csd.capacity);
         }
         if (result == ESP_OK) {
@@ -766,6 +805,9 @@ void advance_usb() {
         // Keep admission closed after failure until request_usb(false) retries.
         if (failed) return;
         if (__atomic_load_n(&usb_io_pending, __ATOMIC_ACQUIRE)) return;
+        portENTER_CRITICAL(&status_mux);
+        set_bus_status(nullptr);
+        portEXIT_CRITICAL(&status_mux);
         const esp_err_t stopped = UsbStorage::stop();
         if (stopped != ESP_OK) {
             mount_error("USB shutdown failed");
@@ -909,6 +951,16 @@ const char *format_result_name(FormatResult result) {
     case FormatResult::Succeeded: return "succeeded";
     case FormatResult::Failed: return "failed";
     default: return "none";
+    }
+}
+
+const char *card_type_name(CardType type) {
+    switch (type) {
+    case CardType::Sd: return "SD";
+    case CardType::Sdhc: return "SDHC";
+    case CardType::Mmc: return "MMC";
+    case CardType::Sdio: return "SDIO";
+    default: return "unknown";
     }
 }
 

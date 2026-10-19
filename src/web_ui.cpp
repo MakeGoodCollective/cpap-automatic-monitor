@@ -410,6 +410,11 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
         const auto &sd = status.storage;
         jsonAddString(json, "sd", SdStorage::state_name(sd));
 #if AB_STORAGE_HAS_SDCARD
+        jsonAddBool(json, "sd_bus_active", sd.bus_active);
+        jsonAddInt(json, "sd_bus_width", sd.bus_width);
+        jsonAddUInt32(json, "sd_bus_clock_khz", sd.bus_clock_khz);
+        jsonAddUInt32(json, "sd_bus_clock_limit_khz", sd.bus_clock_limit_khz);
+        jsonAddString(json, "sd_card_type", SdStorage::card_type_name(sd.card_type));
         jsonAddInt(json, "sd_total_mb", sd.card_bytes / (1024 * 1024));
         jsonAddInt(json, "sd_used_mb", sd.used_bytes / (1024 * 1024));
         jsonAddBool(json, "sd_usb_supported", sd.usb_supported);
@@ -515,7 +520,7 @@ static size_t buildStatusJson(char *out, size_t cap) {
 static const uint32_t STATUS_CACHE_TTL_MS = 500;
 // Includes bounded owner strings at the WebUI escape worst case (two bytes)
 // and uint32 owner revisions.
-static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 2816 : 1472;
+static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 3008 : 1472;
 static String status_cache;
 static uint32_t status_cache_built_at = 0;
 static uint32_t status_cache_config_revision = 0;
@@ -2656,6 +2661,11 @@ static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
     if (a.clinical_revision != b.clinical_revision) fields |= STATUS_CLINICAL;
     if (a.storage.mode != b.storage.mode || a.storage.mounted != b.storage.mounted ||
         a.storage.supported != b.storage.supported ||
+        a.storage.bus_active != b.storage.bus_active ||
+        a.storage.bus_width != b.storage.bus_width ||
+        a.storage.bus_clock_khz != b.storage.bus_clock_khz ||
+        a.storage.bus_clock_limit_khz != b.storage.bus_clock_limit_khz ||
+        a.storage.card_type != b.storage.card_type ||
         a.storage.card_bytes != b.storage.card_bytes || a.storage.used_bytes != b.storage.used_bytes ||
         a.storage.usb_supported != b.storage.usb_supported ||
         strcmp(a.storage.error, b.storage.error) ||

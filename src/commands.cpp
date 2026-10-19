@@ -109,6 +109,15 @@ void dispatch_command(const char *line, String &response) {
             response = "state: ";
             response += SdStorage::state_name(sd);
             response += '\n';
+            if (sd.supported) {
+                response += "bus: SDMMC\nbus_width: ";
+                response += sd.bus_width ? String(sd.bus_width) + " bit\n" : "unavailable\n";
+                response += "bus_clock: ";
+                response += sd.bus_clock_khz ? String(sd.bus_clock_khz) + " kHz\n" : "unavailable\n";
+                response += "bus_clock_limit: ";
+                response += sd.bus_clock_limit_khz ? String(sd.bus_clock_limit_khz) + " kHz\n" : "unavailable\n";
+                response += "card_type: " + String(SdStorage::card_type_name(sd.card_type)) + '\n';
+            }
             if (sd.mounted) {
                 if (sd.total_bytes && sd.used_bytes <= sd.total_bytes) {
                     response += "capacity: " +

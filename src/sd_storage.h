@@ -16,6 +16,7 @@ constexpr size_t WRITE_CHUNK_BYTES = 4096;
 
 enum class Mode : uint8_t { Local, ToUsb, Usb, ToLocal };
 enum class FormatResult : uint8_t { None, Succeeded, Failed };
+enum class CardType : uint8_t { Unknown, Sd, Sdhc, Mmc, Sdio };
 enum class Access : uint8_t { Background, ReadOnly, Exclusive };
 enum class IoEvent : uint8_t { Waiting, WaitingForReader, Complete };
 
@@ -31,6 +32,13 @@ struct Status {
     // Boot-time format outcome, independent of subsequent mount/USB errors.
     FormatResult format_result = FormatResult::None;
     char format_error[48] = {};
+    // Valid only for the initialized local or USB connection; zero means unknown.
+    bool bus_active = false;
+    uint8_t bus_width = 0;
+    uint32_t bus_clock_khz = 0;
+    // Configured limit remains available while the connection is inactive.
+    uint32_t bus_clock_limit_khz = 0;
+    CardType card_type = CardType::Unknown;
 };
 
 // Binary storage records use little-endian fields regardless of alignment.
@@ -72,6 +80,7 @@ void refresh_usage();
 void get_status(Status &out);
 const char *state_name(const Status &status);
 const char *format_result_name(FormatResult result);
+const char *card_type_name(CardType type);
 
 // Admission only; the SD worker drains admitted I/O before changing media.
 // Disabling USB also works with a connected host; its unwritten cache is lost.
