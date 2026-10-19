@@ -1,0 +1,163 @@
+AirBridge follow-up to the four AirCANnect SPI SD patches through 2b8a8442.
+Local safety fixes: reject uncertain CMD6 retries, validate every mounted
+capacity, clean up failed mounts, and require accepted single-write tokens.
+Data-response values follow the SanDisk SD Card Product Manual, section 5.18.6.
+
+--- a/sd_diskio.cpp
++++ b/sd_diskio.cpp
+@@ -186,6 +186,10 @@
+     if (token > 1) {
+       SdStorage::spi_io_fault("command", token);
+     }
++    if (cmd == SEND_SWITCH_FUNC && (arg & 0x80000000U) && (token & 0x80)) {
++      // A lost switch reply must not cause another potentially state-changing CMD6.
++      break;
++    }
+     if (token == 0xFF) {
+       log_w("no token received");
+       sdDeselectCard(pdrv);
+@@ -338,9 +342,10 @@
+       char token = sdWriteBytes(pdrv, buffer, 0xFE);
+       sdDeselectCard(pdrv);
+ 
++      // SD data-response tokens: CRC rejection may retry; only 0x05 accepts.
++      if (token == 0x0B) {
+-      if (token == 0x0A) {
+         continue;
++      } else if (token != 0x05) {
+-      } else if (token == 0x0C) {
+         return false;
+       }
+ 
+@@ -531,8 +536,12 @@
+     return card->status;
+   }
+ 
++  // Keep a fatal switch result on this handle; the owner latches across handles.
++  if (!card->init_retryable) {
++    return card->status;
++  }
++
+   card->init_error = "card_init_failed";
+-  card->init_retryable = true;
+ 
+   // Lock the SPI bus and set it to a low frequency (400kHz) for initialization
+   // Low frequency is required during initialization for reliable communication
+@@ -678,8 +687,10 @@
+     sdDeselectCard(pdrv);
+ 
+     if (!switched || (status[16] & 0x0F) != 1) {
++      const uint8_t selected_function = status[16] & 0x0F;
++      if ((response & 0x80) || (response == 0 && !switched)
++          || (switched && selected_function != 0 && selected_function != 0x0F)) {
++        // A lost R1, unreadable status or reserved function leaves the mode unknown.
+-      if (response == 0 && !switched) {
+-        // A lost/corrupt switch status leaves the selected function uncertain.
+         card->init_error = "high_speed_status_failed_power_cycle";
+         card->init_retryable = false;
+       } else if (response == 4 || (switched && (status[16] & 0x0F) == 0x0F)) {
+@@ -889,27 +900,34 @@
+   const char *selected_reason = NULL;
+   FRESULT res;
+ 
++  // The first mount and a post-format remount must pass the same validation.
++  auto mount_checked = [&]() -> FRESULT {
+-  for (;;) {
+-    const uint32_t attempt_hz = card->frequency;
+     actual_hz = 0;
++    FRESULT result = f_mount(fs, drv, 1);
++    if (card->status & STA_NOINIT) {
++      return result == FR_OK ? FR_NOT_READY : result;
++    }
+-    res = f_mount(fs, drv, 1);
+ 
++    AcquireSPI lock(card);
++    actual_hz = spiClockDivToFrequency(card->spi->bus(), card->spi->getClockDivider());
++    if (result == FR_OK) {
++      card->sectors = sdGetSectorsCount(pdrv);
++      if (!card->sectors || (card->status & STA_NOINIT)) result = FR_DISK_ERR;
+-    if (!(card->status & STA_NOINIT)) {
+-      AcquireSPI lock(card);
+-      actual_hz = spiClockDivToFrequency(card->spi->bus(), card->spi->getClockDivider());
+-      if (res == FR_OK) {
+-        card->sectors = sdGetSectorsCount(pdrv);
+-        if (!card->sectors) res = FR_DISK_ERR;
+-      }
+     }
++    return result;
++  };
+ 
++  for (;;) {
++    const uint32_t attempt_hz = card->frequency;
++    res = mount_checked();
++
+     if (res == FR_OK) break;
+ 
+     const char *reason = card->init_error ? card->init_error
+                          : res == FR_DISK_ERR ? "mount_read_failed"
+                          : res == FR_NOT_READY ? "card_not_ready" : "filesystem_mount_failed";
+ 
++    SdStorage::spi_init_event(requested_hz, attempt_hz, actual_hz, false, reason, !card->init_retryable);
+-    SdStorage::spi_init_event(requested_hz, attempt_hz, actual_hz, false, reason);
+ 
+     const uint32_t effective_hz = actual_hz ? actual_hz : card->frequency;
+     const uint32_t next_hz = effective_hz > 20000000 ? 20000000
+@@ -927,34 +945,36 @@
+     selected_reason = reason;
+   }
+ 
++  if (res == FR_NO_FILESYSTEM && format_if_empty) {
++    BYTE *work = (BYTE *)malloc(sizeof(BYTE) * FF_MAX_SS);
++    const char *reason = "format_alloc_failed";
++    res = FR_NOT_ENOUGH_CORE;
++    if (work) {
+-  if (res != FR_OK) {
+-    log_e("f_mount failed: %s", fferr2str[res]);
+-    if (res == 13 && format_if_empty) {
+-      BYTE *work = (BYTE *)malloc(sizeof(BYTE) * FF_MAX_SS);
+-      if (!work) {
+-        log_e("alloc for f_mkfs failed");
+-        return false;
+-      }
+-      //FRESULT f_mkfs (const TCHAR* path, const MKFS_PARM* opt, void* work, UINT len);
+       const MKFS_PARM opt = {(BYTE)FM_ANY, 0, 0, 0, 0};
+       res = f_mkfs(drv, &opt, work, sizeof(BYTE) * FF_MAX_SS);
+       free(work);
++      reason = "format_failed";
++      if (res == FR_OK) {
++        res = mount_checked();
++        reason = card->init_error ? card->init_error
++                 : res == FR_DISK_ERR ? "mount_read_failed"
++                 : res == FR_NOT_READY ? "card_not_ready" : "filesystem_mount_failed";
+-      if (res != FR_OK) {
+-        log_e("f_mkfs failed: %s", fferr2str[res]);
+-        esp_vfs_fat_unregister_path(path);
+-        return false;
+       }
++    }
++    if (res != FR_OK) {
++      SdStorage::spi_init_event(requested_hz, card->frequency, actual_hz, false, reason, !card->init_retryable);
+-      res = f_mount(fs, drv, 1);
+-      if (res != FR_OK) {
+-        log_e("f_mount failed: %s", fferr2str[res]);
+-        esp_vfs_fat_unregister_path(path);
+-        return false;
+-      }
+-    } else {
+-      esp_vfs_fat_unregister_path(path);
+-      return false;
+     }
+   }
++
++  if (res != FR_OK) {
++    log_e("f_mount failed: %s", fferr2str[res]);
++    // Detach FatFs before unregistering the VFS-owned FATFS, even after format.
++    f_mount(NULL, drv, 0);
++    esp_vfs_fat_unregister_path(path);
++    card->status |= STA_NOINIT;
++    card->sectors = 0;
++    return false;
++  }
+   if (!selected_reason) {
+     selected_reason = actual_hz < requested_hz ? "clock_limit" : "requested";
+   }

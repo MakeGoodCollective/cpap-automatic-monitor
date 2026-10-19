@@ -410,6 +410,7 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
         const auto &sd = status.storage;
         jsonAddString(json, "sd", SdStorage::state_name(sd));
 #if AB_STORAGE_HAS_SDCARD
+        jsonAddString(json, "sd_bus", SdStorage::bus_name(sd.bus));
         jsonAddBool(json, "sd_bus_active", sd.bus_active);
         jsonAddInt(json, "sd_bus_width", sd.bus_width);
         jsonAddUInt32(json, "sd_bus_clock_khz", sd.bus_clock_khz);
@@ -421,6 +422,21 @@ static void appendStatusFields(Output &json, const DeviceStatus::Snapshot &statu
         jsonAddString(json, "sd_error", sd.error);
         jsonAddString(json, "sd_format_result", SdStorage::format_result_name(sd.format_result));
         jsonAddString(json, "sd_format_error", sd.format_error);
+        const auto &error = sd.spi_error;
+        jsonAddBool(json, "sd_spi_error", error.valid);
+        if (error.valid) {
+            jsonAddBool(json, "sd_spi_write", error.write);
+            jsonAddInt(json, "sd_spi_drive", error.drive);
+            jsonAddInt(json, "sd_spi_command", error.command);
+            jsonAddUInt32(json, "sd_spi_argument", error.argument);
+            jsonAddUInt32(json, "sd_spi_sector", error.sector);
+            jsonAddUInt32(json, "sd_spi_count", error.count);
+            jsonAddUInt32(json, "sd_spi_occurred_ms", error.occurred_ms);
+            jsonAddUInt32(json, "sd_spi_elapsed_ms", error.elapsed_ms);
+            jsonAddInt(json, "sd_spi_response", error.response);
+            jsonAddInt(json, "sd_spi_disk_result", error.disk_result);
+            jsonAddString(json, "sd_spi_phase", error.phase);
+        }
 #endif
     }
     if (fields & STATUS_OXI) {
@@ -519,8 +535,8 @@ static size_t buildStatusJson(char *out, size_t cap) {
 
 static const uint32_t STATUS_CACHE_TTL_MS = 500;
 // Includes bounded owner strings at the WebUI escape worst case (two bytes)
-// and uint32 owner revisions.
-static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 3008 : 1472;
+// and uint32 owner revisions/SPI diagnostics.
+static const size_t STATUS_JSON_MAX = AB_STORAGE_HAS_SDCARD ? 3328 : 1472;
 static String status_cache;
 static uint32_t status_cache_built_at = 0;
 static uint32_t status_cache_config_revision = 0;
@@ -2659,8 +2675,12 @@ static uint8_t statusChanges(const DeviceStatus::Snapshot &a,
         a.report_available != b.report_available)
         fields |= STATUS_REPORT;
     if (a.clinical_revision != b.clinical_revision) fields |= STATUS_CLINICAL;
+    // AirCANnect first-error semantics: the owner retains one immutable fault
+    // until reboot, so only its publication transition can change.
     if (a.storage.mode != b.storage.mode || a.storage.mounted != b.storage.mounted ||
         a.storage.supported != b.storage.supported ||
+        a.storage.bus != b.storage.bus ||
+        a.storage.spi_error.valid != b.storage.spi_error.valid ||
         a.storage.bus_active != b.storage.bus_active ||
         a.storage.bus_width != b.storage.bus_width ||
         a.storage.bus_clock_khz != b.storage.bus_clock_khz ||

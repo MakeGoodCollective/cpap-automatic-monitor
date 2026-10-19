@@ -18,6 +18,34 @@
 #define AB_STORAGE_SDMMC_ENABLED 0
 #endif
 
+#ifndef AB_STORAGE_SPI_SD_ENABLED
+#define AB_STORAGE_SPI_SD_ENABLED 0
+#endif
+
+#if AB_STORAGE_SDMMC_ENABLED && AB_STORAGE_SPI_SD_ENABLED
+#error "Select only one SD bus"
+#endif
+
+#ifndef AB_SPI_SD_CS_GPIO
+#define AB_SPI_SD_CS_GPIO -1
+#endif
+
+#ifndef AB_SPI_SD_SCK_GPIO
+#define AB_SPI_SD_SCK_GPIO -1
+#endif
+
+#ifndef AB_SPI_SD_MISO_GPIO
+#define AB_SPI_SD_MISO_GPIO -1
+#endif
+
+#ifndef AB_SPI_SD_MOSI_GPIO
+#define AB_SPI_SD_MOSI_GPIO -1
+#endif
+
+#ifndef AB_SPI_SD_FREQ_HZ
+#define AB_SPI_SD_FREQ_HZ 40000000
+#endif
+
 #ifndef AB_SDMMC_WIDTH
 #define AB_SDMMC_WIDTH 4
 #endif
@@ -51,7 +79,7 @@
 #endif
 
 #ifndef AB_STORAGE_HAS_SDCARD
-#define AB_STORAGE_HAS_SDCARD (AB_STORAGE_SDMMC_ENABLED != 0)
+#define AB_STORAGE_HAS_SDCARD (AB_STORAGE_SDMMC_ENABLED != 0 || AB_STORAGE_SPI_SD_ENABLED != 0)
 #endif
 
 #ifndef AB_USB_MSC_ENABLED
@@ -72,7 +100,13 @@
 #define DEFAULT_HOSTNAME    "airbridge"
 
 #ifndef AB_OTA_RELEASE_TARGET
-#if defined(AB_BOARD_WAVESHARE_ESP32_S3_GEEK)
+#if AB_STORAGE_SPI_SD_ENABLED
+#if defined(AB_BOARD_XIAO_ESP32S3_PLUS)
+#define AB_OTA_RELEASE_TARGET "xiao-esp32s3-plus-spi-sd"
+#else
+#error "SPI SD boards must define their own AB_OTA_RELEASE_TARGET"
+#endif
+#elif defined(AB_BOARD_WAVESHARE_ESP32_S3_GEEK)
 #define AB_OTA_RELEASE_TARGET "waveshare-esp32-s3-geek"
 #elif defined(AB_BOARD_WROOM_S3)
 #define AB_OTA_RELEASE_TARGET "wroom-s3-n16r8-sdmmc4"

@@ -17,8 +17,24 @@ constexpr size_t WRITE_CHUNK_BYTES = 4096;
 enum class Mode : uint8_t { Local, ToUsb, Usb, ToLocal };
 enum class FormatResult : uint8_t { None, Succeeded, Failed };
 enum class CardType : uint8_t { Unknown, Sd, Sdhc, Mmc, Sdio };
+enum class Bus : uint8_t { None, Sdmmc, Spi };
 enum class Access : uint8_t { Background, ReadOnly, Exclusive };
 enum class IoEvent : uint8_t { Waiting, WaitingForReader, Complete };
+
+struct SpiError {
+    bool valid = false;
+    bool write = false;
+    uint8_t drive = 0;
+    uint8_t command = 0xff;
+    uint32_t argument = 0;
+    uint32_t sector = 0;
+    uint32_t count = 0;
+    uint32_t occurred_ms = 0;
+    uint32_t elapsed_ms = 0;
+    int response = -1;
+    int disk_result = 0;
+    char phase[16] = {};
+};
 
 struct Status {
     bool supported;
@@ -39,6 +55,9 @@ struct Status {
     // Configured limit remains available while the connection is inactive.
     uint32_t bus_clock_limit_khz = 0;
     CardType card_type = CardType::Unknown;
+    Bus bus = Bus::None;
+    // First SPI fault is retained until reboot, even if a retry recovered it.
+    SpiError spi_error;
 };
 
 // Binary storage records use little-endian fields regardless of alignment.
@@ -81,6 +100,7 @@ void get_status(Status &out);
 const char *state_name(const Status &status);
 const char *format_result_name(FormatResult result);
 const char *card_type_name(CardType type);
+const char *bus_name(Bus bus);
 
 // Admission only; the SD worker drains admitted I/O before changing media.
 // Disabling USB also works with a connected host; its unwritten cache is lost.

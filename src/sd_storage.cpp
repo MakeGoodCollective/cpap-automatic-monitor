@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <algorithm>
+#include <errno.h>
 #include <string.h>
 
 #include "board.h"
@@ -11,17 +12,24 @@
 #if AB_STORAGE_HAS_SDCARD
 #include <limits>
 #include <unistd.h>
-#include <SD_MMC.h>
 #include <FS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
+#if AB_STORAGE_SPI_SD_ENABLED
+#include "sd_spi_card.h"
+#include "sd_spi_hooks.h"
+#else
+#include <SD_MMC.h>
 #include <driver/sdmmc_host.h>
 #include <driver/sdmmc_defs.h>
 #include <sdmmc_cmd.h>
+#endif
 #include <esp_vfs_fat.h>
 #include <ff.h>
 #include <diskio_impl.h>
+#if !AB_STORAGE_SPI_SD_ENABLED
 #include <diskio_sdmmc.h>
+#endif
 #include <esp_heap_caps.h>
 #include "memory_manager.h"
 #include "uart_arbiter.h"
@@ -46,13 +54,51 @@ static uint32_t file_mutation_revision = 0;
 namespace {
 bool init_started = false;
 bool formatting = false;
+#if AB_STORAGE_SPI_SD_ENABLED
+SdSpi::Card storage_card;
+uint32_t spi_mount_clock_khz = 0;
+char spi_mount_error[96] = {};
+bool spi_power_cycle_required = false;
+SpiError pending_spi;
+uint32_t spi_started_ms = 0;
+uint8_t spi_command = 0xff;
+uint32_t spi_argument = 0;
+bool spi_active = false;
+#else
+auto &storage_card = SD_MMC;
 TaskHandle_t mount_caller = nullptr;
 bool mount_driver_called = false;
 esp_err_t mount_result = ESP_OK;
 sdmmc_card_t *mount_card_info = nullptr;
+#endif
 
 // Caller holds status_mux. Only copy initialization results, never query the bus.
+void clear_bus_status() {
+    status.bus_active = false;
+    status.bus_width = 0;
+    status.bus_clock_khz = 0;
+    status.card_type = CardType::Unknown;
+#if AB_STORAGE_SPI_SD_ENABLED
+    status.bus = Bus::Spi;
+    status.bus_clock_limit_khz = AB_SPI_SD_FREQ_HZ / 1000;
+#else
+    status.bus = Bus::Sdmmc;
+    status.bus_clock_limit_khz = AB_SDMMC_FREQ_KHZ;
+#endif
+}
+
+#if AB_STORAGE_SPI_SD_ENABLED
+void set_spi_bus_status(uint32_t clock_khz, sdcard_type_t type) {
+    clear_bus_status();
+    status.bus_active = type != CARD_NONE;
+    status.bus_width = status.bus_active ? 1 : 0;
+    status.bus_clock_khz = clock_khz;
+    status.card_type = type == CARD_SDHC ? CardType::Sdhc : type == CARD_SD ? CardType::Sd :
+        type == CARD_MMC ? CardType::Mmc : CardType::Unknown;
+}
+#else
 void set_bus_status(const sdmmc_card_t *card) {
+    clear_bus_status();
     status.bus_active = card != nullptr;
     // IDF narrows log_bus_width during initialization; get_bus_width is the slot limit.
     status.bus_width = card && (card->log_bus_width == 0 ||
@@ -64,6 +110,7 @@ void set_bus_status(const sdmmc_card_t *card) {
         card->is_sdio ? CardType::Sdio :
         (card->ocr & SD_OCR_SDHC_CAP) ? CardType::Sdhc : CardType::Sd;
 }
+#endif
 
 struct Request {
     enum Kind { Run, Acquire, TryAcquire, Release, Close, Begin, End, Mount, UsbIo } kind;
@@ -126,7 +173,11 @@ bool maintenance_granted = false;
 TaskHandle_t worker = nullptr;
 TaskHandle_t direct_owner = nullptr;
 #if AB_USB_MSC_ENABLED
+#if AB_STORAGE_SPI_SD_ENABLED
+uint32_t usb_sectors = 0;
+#else
 sdmmc_card_t usb_card = {};
+#endif
 bool usb_host_started = false;
 bool usb_io_pending = false;
 struct {
@@ -143,6 +194,7 @@ void wake_worker() {
     if (worker) xTaskNotifyGive(worker);
 }
 
+#if !AB_STORAGE_SPI_SD_ENABLED
 void configure_host(sdmmc_host_t &host, sdmmc_slot_config_t &slot) {
     host.flags = AB_SDMMC_WIDTH == 1 ? SDMMC_HOST_FLAG_1BIT : SDMMC_HOST_FLAG_4BIT;
     host.max_freq_khz = AB_SDMMC_FREQ_KHZ;
@@ -154,6 +206,7 @@ void configure_host(sdmmc_host_t &host, sdmmc_slot_config_t &slot) {
     slot.d2 = static_cast<gpio_num_t>(AB_SDMMC_WIDTH == 1 ? -1 : AB_SDMMC_D2_GPIO);
     slot.d3 = static_cast<gpio_num_t>(AB_SDMMC_WIDTH == 1 ? -1 : AB_SDMMC_D3_GPIO);
 }
+#endif
 
 struct OpenFile {
     fs::File file;
@@ -290,11 +343,19 @@ void process_request(Request &value) {
 #if AB_USB_MSC_ENABLED
     } else if (request->kind == Request::UsbIo) {
         // Already-admitted writes finish even if the host ejects/disconnects meanwhile.
+#if AB_STORAGE_SPI_SD_ENABLED
+        const bool valid = usb_host_started && usb_io.size && !(usb_io.size % 512) &&
+            uint64_t(usb_io.sector) + usb_io.size / 512 <= usb_sectors;
+        const esp_err_t result = !valid ? ESP_ERR_INVALID_STATE : usb_io.write
+            ? storage_card.write_sectors(usb_io.buffer, usb_io.sector, usb_io.size / 512)
+            : storage_card.read_sectors(usb_io.buffer, usb_io.sector, usb_io.size / 512);
+#else
         const bool valid = usb_host_started && usb_io.size && !(usb_io.size % 512) &&
             uint64_t(usb_io.sector) + usb_io.size / 512 <= usb_card.csd.capacity;
         const esp_err_t result = !valid ? ESP_ERR_INVALID_STATE : usb_io.write
             ? sdmmc_write_sectors(&usb_card, usb_io.buffer, usb_io.sector, usb_io.size / 512)
             : sdmmc_read_sectors(&usb_card, usb_io.buffer, usb_io.sector, usb_io.size / 512);
+#endif
         if (result != ESP_OK)
             Log::logf(CAT_STORAGE, LOG_WARN, "USB %s sector=%lu bytes=%u failed: %s\n",
                       usb_io.write ? "write" : "read", (unsigned long)usb_io.sector,
@@ -391,7 +452,7 @@ void process_request(Request &value) {
             request->success = true;
         }
     } else if (!direct_owner && background_allowed(request->generation) && mounted()) {
-        request->success = request->operation(SD_MMC, request->context);
+        request->success = request->operation(storage_card, request->context);
     }
 }
 
@@ -499,6 +560,7 @@ void close_handle(uint32_t handle, Session::IoObserver observer = nullptr, void 
 }
 }  // namespace
 
+#if !AB_STORAGE_SPI_SD_ENABLED
 extern "C" esp_err_t __real_esp_vfs_fat_sdmmc_mount(
     const char *, const sdmmc_host_t *, const sdmmc_slot_config_t *,
     const esp_vfs_fat_mount_config_t *, sdmmc_card_t **);
@@ -517,6 +579,68 @@ extern "C" esp_err_t __wrap_esp_vfs_fat_sdmmc_mount(
     }
     return result;
 }
+#else
+// The storage lease serializes disk operations; only completed faults are published.
+void spi_io_begin(uint8_t drive, uint32_t sector, uint32_t count, bool write) {
+    portENTER_CRITICAL(&status_mux);
+    spi_active = !status.spi_error.valid;
+    portEXIT_CRITICAL(&status_mux);
+    if (!spi_active) return;
+    pending_spi = {};
+    pending_spi.drive = drive;
+    pending_spi.sector = sector;
+    pending_spi.count = count;
+    pending_spi.write = write;
+    spi_command = 0xff;
+    spi_argument = 0;
+    spi_started_ms = millis();
+}
+
+void spi_io_command(uint8_t command, uint32_t argument) {
+    if (!spi_active) return;
+    spi_command = command;
+    spi_argument = argument;
+}
+
+void spi_io_fault(const char *phase, int response) {
+    if (!spi_active || pending_spi.valid) return;
+    const int saved_errno = errno;
+    pending_spi.valid = true;
+    pending_spi.occurred_ms = millis();
+    pending_spi.command = spi_command;
+    pending_spi.argument = spi_argument;
+    pending_spi.response = response;
+    snprintf(pending_spi.phase, sizeof(pending_spi.phase), "%s", phase);
+    errno = saved_errno;
+}
+
+void spi_io_end(int disk_result) {
+    if (!spi_active) return;
+    if (disk_result != 0) spi_io_fault("disk_result", disk_result);
+    if (pending_spi.valid) {
+        pending_spi.disk_result = disk_result;
+        pending_spi.elapsed_ms = millis() - spi_started_ms;
+        portENTER_CRITICAL(&status_mux);
+        status.spi_error = pending_spi;
+        portEXIT_CRITICAL(&status_mux);
+    }
+    spi_active = false;
+}
+
+void spi_init_event(uint32_t requested_hz, uint32_t attempt_hz,
+                    uint32_t actual_hz, bool selected, const char *reason,
+                    bool power_cycle_required) {
+    const int saved_errno = errno;
+    spi_power_cycle_required |= power_cycle_required;
+    spi_mount_clock_khz = selected ? actual_hz / 1000 : 0;
+    snprintf(spi_mount_error, sizeof(spi_mount_error), "%s", selected ? "" : reason);
+    Log::logf(CAT_STORAGE, selected ? LOG_INFO : LOG_WARN,
+        "SPI SD init requested_hz=%lu attempt_hz=%lu actual_hz=%lu result=%s reason=%s\n",
+        (unsigned long)requested_hz, (unsigned long)attempt_hz, (unsigned long)actual_hz,
+        selected ? "selected" : "failed", reason);
+    errno = saved_errno;
+}
+#endif
 
 bool write_exact(fs::File &file, const uint8_t *data, size_t size) {
     return file && file.write(data, size) == size;
@@ -546,11 +670,14 @@ bool factory_format() {
 
     constexpr size_t work_bytes = 4096;
     static_assert(FF_MAX_SS <= work_bytes, "SD format work buffer too small");
+#if !AB_STORAGE_SPI_SD_ENABLED
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
     configure_host(host, slot);
 
     sdmmc_card_t card = {};
+#endif
+    uint32_t sectors = 0;
     BYTE pdrv = FF_DRV_NOT_USED;
     PARTITION previous_partition = {};
     void *work = nullptr;
@@ -559,6 +686,7 @@ bool factory_format() {
     const char *step = "host state";
     int result = ESP_OK;
     const bool formatted = [&]() {
+#if !AB_STORAGE_SPI_SD_ENABLED
         sdmmc_host_state_t host_state = {};
         result = sdmmc_host_get_state(&host_state);
         if (result != ESP_OK) return false;
@@ -566,11 +694,30 @@ bool factory_format() {
             result = ESP_ERR_INVALID_STATE;
             return false;
         }
+#endif
 
         // DMA-capable internal memory avoids card-sized allocation and bounce I/O.
         step = "buffer";
         work = heap_caps_malloc(work_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         if (!work) { result = ESP_ERR_NO_MEM; return false; }
+#if AB_STORAGE_SPI_SD_ENABLED
+        step = "SPI init";
+        if (spi_power_cycle_required) { result = ESP_ERR_INVALID_STATE; return false; }
+        if (!storage_card.begin_raw()) { result = ESP_FAIL; return false; }
+        host_started = true;
+        pdrv = storage_card.drive();
+        step = "card type";
+        if (storage_card.cardType() != CARD_SD && storage_card.cardType() != CARD_SDHC) {
+            result = ESP_ERR_NOT_SUPPORTED;
+            return false;
+        }
+        step = "card geometry";
+        sectors = storage_card.numSectors();
+        if (storage_card.sectorSize() != 512 || sectors < 2) {
+            result = ESP_ERR_NOT_SUPPORTED;
+            return false;
+        }
+#else
         step = "drive";
         result = ff_diskio_get_drive(&pdrv);
         if (result != ESP_OK) return false;
@@ -597,6 +744,8 @@ bool factory_format() {
         }
 
         ff_diskio_register_sdmmc(pdrv, &card);
+        sectors = card.csd.capacity;
+#endif
         disk_registered = true;
         previous_partition = VolToPart[pdrv];
         VolToPart[pdrv] = {pdrv, 1};
@@ -606,11 +755,17 @@ bool factory_format() {
         result = f_fdisk(pdrv, partitions, work);
         if (result != FR_OK) return false;
         // f_fdisk writes only the MBR; invalidate old GPT headers without a full erase.
-        memset(work, 0, card.csd.sector_size);
+        memset(work, 0, 512);
         step = "GPT headers";
+#if AB_STORAGE_SPI_SD_ENABLED
+        result = storage_card.write_sectors(static_cast<const uint8_t *>(work), 1, 1);
+        if (result != ESP_OK) return false;
+        result = storage_card.write_sectors(static_cast<const uint8_t *>(work), sectors - 1, 1);
+#else
         result = sdmmc_write_sectors(&card, work, 1, 1);
         if (result != ESP_OK) return false;
-        result = sdmmc_write_sectors(&card, work, card.csd.capacity - 1, 1);
+        result = sdmmc_write_sectors(&card, work, sectors - 1, 1);
+#endif
         if (result != ESP_OK) return false;
         // Force partition 1 of the new table, never an old detected volume or SFD.
         const MKFS_PARM options = {FM_FAT32, 2, 0, 0, 0};
@@ -621,11 +776,17 @@ bool factory_format() {
 
     if (disk_registered) {
         VolToPart[pdrv] = previous_partition;
+#if !AB_STORAGE_SPI_SD_ENABLED
         ff_diskio_unregister(pdrv);
+#endif
     }
     bool success = formatted;
     if (host_started) {
+#if AB_STORAGE_SPI_SD_ENABLED
+        const esp_err_t shutdown = storage_card.end_raw();
+#else
         const esp_err_t shutdown = sdmmc_host_deinit();
+#endif
         if (shutdown != ESP_OK) {
             Log::logf(CAT_STORAGE, LOG_ERROR, "format host shutdown failed (%d)\n", shutdown);
             if (success) { step = "host shutdown"; result = shutdown; }
@@ -655,7 +816,7 @@ void init() {
     portENTER_CRITICAL(&status_mux);
     const bool busy = formatting;
     if (!busy) init_started = true;
-    status.bus_clock_limit_khz = AB_SDMMC_FREQ_KHZ;
+    if (!status.bus_active) clear_bus_status();
     portEXIT_CRITICAL(&status_mux);
     if (busy) {
         Log::logf(CAT_STORAGE, LOG_WARN, "mount deferred during factory format\n");
@@ -684,8 +845,28 @@ void mount_card() {
     if (mounted()) return;
 
     portENTER_CRITICAL(&status_mux);
-    set_bus_status(nullptr);
+    clear_bus_status();
     portEXIT_CRITICAL(&status_mux);
+#if AB_STORAGE_SPI_SD_ENABLED
+    // The driver object is freed after failed mount; uncertainty survives it.
+    if (spi_power_cycle_required) {
+        mount_error("mount failed: SPI card power cycle required");
+        return;
+    }
+    spi_mount_clock_khz = 0;
+    spi_mount_error[0] = 0;
+    const bool success = storage_card.begin();
+    if (!success || storage_card.cardType() == CARD_NONE) {
+        storage_card.end();
+        char error[sizeof(status.error)];
+        snprintf(error, sizeof(error), "mount failed: SPI %.70s",
+                 spi_mount_error[0] ? spi_mount_error : "pin/bus/card setup");
+        mount_error(error);
+        Log::logf(CAT_STORAGE, LOG_ERROR, "%s\n", error);
+        return;
+    }
+    const sdcard_type_t type = storage_card.cardType();
+#else
     mount_card_info = nullptr;
 
     bool pins_ok;
@@ -727,21 +908,28 @@ void mount_card() {
                   "%s\n", error);
         return;
     }
+#endif
 
-    const uint64_t card_bytes = SD_MMC.cardSize();
-    const uint64_t total_bytes = SD_MMC.totalBytes();
-    const uint64_t used_bytes = SD_MMC.usedBytes();
+    const uint64_t card_bytes = storage_card.cardSize();
+    const uint64_t total_bytes = storage_card.totalBytes();
+    const uint64_t used_bytes = storage_card.usedBytes();
     portENTER_CRITICAL(&status_mux);
     status.card_bytes = card_bytes;
     status.total_bytes = total_bytes;
     status.used_bytes = used_bytes;
     status.error[0] = 0;
+#if AB_STORAGE_SPI_SD_ENABLED
+    set_spi_bus_status(spi_mount_clock_khz, type);
+#else
     set_bus_status(mount_card_info);
+#endif
     // Also covers a USB round trip missed by consumers observing mounted=true.
     __atomic_add_fetch(&file_mutation_revision, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&status.mounted, true, __ATOMIC_RELEASE);
     portEXIT_CRITICAL(&status_mux);
+#if !AB_STORAGE_SPI_SD_ENABLED
     mount_card_info = nullptr;
+#endif
     Status published;
     get_status(published);
     char width[12] = "unavailable", frequency[24] = "unavailable";
@@ -749,8 +937,8 @@ void mount_card() {
     if (published.bus_clock_khz)
         snprintf(frequency, sizeof(frequency), "%ukHz", published.bus_clock_khz);
     Log::logf(CAT_STORAGE, LOG_INFO,
-              "mounted width=%s freq=%s limit=%ukHz type=%s size=%lluMiB\n",
-              width, frequency, published.bus_clock_limit_khz,
+              "mounted bus=%s width=%s freq=%s limit=%ukHz type=%s size=%lluMiB\n",
+              bus_name(published.bus), width, frequency, published.bus_clock_limit_khz,
               card_type_name(published.card_type),
               static_cast<unsigned long long>(card_bytes / (1024 * 1024)));
 }
@@ -769,10 +957,20 @@ void advance_usb() {
             return;
         }
         portENTER_CRITICAL(&status_mux);
-        set_bus_status(nullptr);
+        clear_bus_status();
         __atomic_store_n(&status.mounted, false, __ATOMIC_RELEASE);
         portEXIT_CRITICAL(&status_mux);
-        SD_MMC.end();
+        storage_card.end();
+#if AB_STORAGE_SPI_SD_ENABLED
+        esp_err_t result = spi_power_cycle_required ? ESP_ERR_INVALID_STATE :
+            storage_card.begin_raw() ? ESP_OK : ESP_FAIL;
+        usb_host_started = result == ESP_OK;
+        usb_sectors = result == ESP_OK ? storage_card.numSectors() : 0;
+        if (result == ESP_OK && (storage_card.sectorSize() != 512 || !usb_sectors))
+            result = ESP_ERR_NOT_SUPPORTED;
+        const uint32_t clock_khz = result == ESP_OK ? storage_card.frequency_khz() : 0;
+        const auto type = result == ESP_OK ? storage_card.cardType() : CARD_NONE;
+#else
         sdmmc_host_t host = SDMMC_HOST_DEFAULT();
         sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
         configure_host(host, slot);
@@ -782,12 +980,21 @@ void advance_usb() {
         if (result == ESP_OK) result = sdmmc_card_init(&host, &usb_card);
         if (result == ESP_OK && (usb_card.csd.sector_size != 512 || !usb_card.csd.capacity))
             result = ESP_ERR_NOT_SUPPORTED;
+#endif
         if (result == ESP_OK) {
             portENTER_CRITICAL(&status_mux);
+#if AB_STORAGE_SPI_SD_ENABLED
+            set_spi_bus_status(clock_khz, type);
+#else
             set_bus_status(&usb_card);
+#endif
             __atomic_store_n(&status.mode, Mode::Usb, __ATOMIC_RELEASE);
             portEXIT_CRITICAL(&status_mux);
+#if AB_STORAGE_SPI_SD_ENABLED
+            result = UsbStorage::expose(usb_sectors);
+#else
             result = UsbStorage::expose(usb_card.csd.capacity);
+#endif
         }
         if (result == ESP_OK) {
             Log::logf(CAT_STORAGE, LOG_INFO, "SD shared over USB; local recording paused\n");
@@ -806,7 +1013,7 @@ void advance_usb() {
         if (failed) return;
         if (__atomic_load_n(&usb_io_pending, __ATOMIC_ACQUIRE)) return;
         portENTER_CRITICAL(&status_mux);
-        set_bus_status(nullptr);
+        clear_bus_status();
         portEXIT_CRITICAL(&status_mux);
         const esp_err_t stopped = UsbStorage::stop();
         if (stopped != ESP_OK) {
@@ -815,13 +1022,20 @@ void advance_usb() {
             return;
         }
         if (usb_host_started) {
+#if AB_STORAGE_SPI_SD_ENABLED
+            const esp_err_t result = storage_card.end_raw();
+#else
             const esp_err_t result = sdmmc_host_deinit();
+#endif
             if (result != ESP_OK) {
                 mount_error("USB card shutdown failed");
                 Log::logf(CAT_STORAGE, LOG_ERROR, "USB card shutdown failed: %s\n", esp_err_to_name(result));
                 return;
             }
             usb_host_started = false;
+#if AB_STORAGE_SPI_SD_ENABLED
+            usb_sectors = 0;
+#endif
         }
         mount_card();
         if (!mounted()) {
@@ -912,7 +1126,7 @@ bool mounted() {
 
 fs::FS *filesystem() {
 #if AB_STORAGE_HAS_SDCARD
-    return mounted() ? &SD_MMC : nullptr;
+    return mounted() ? &storage_card : nullptr;
 #else
     return nullptr;
 #endif
@@ -921,8 +1135,8 @@ fs::FS *filesystem() {
 void refresh_usage() {
 #if AB_STORAGE_HAS_SDCARD
     if (!mounted()) return;
-    const uint64_t total_bytes = SD_MMC.totalBytes();
-    const uint64_t used_bytes = SD_MMC.usedBytes();
+    const uint64_t total_bytes = storage_card.totalBytes();
+    const uint64_t used_bytes = storage_card.usedBytes();
     portENTER_CRITICAL(&status_mux);
     status.total_bytes = total_bytes;
     status.used_bytes = used_bytes;
@@ -961,6 +1175,14 @@ const char *card_type_name(CardType type) {
     case CardType::Mmc: return "MMC";
     case CardType::Sdio: return "SDIO";
     default: return "unknown";
+    }
+}
+
+const char *bus_name(Bus bus) {
+    switch (bus) {
+    case Bus::Sdmmc: return "SDMMC";
+    case Bus::Spi: return "SPI";
+    default: return "none";
     }
 }
 

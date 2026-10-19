@@ -110,13 +110,28 @@ void dispatch_command(const char *line, String &response) {
             response += SdStorage::state_name(sd);
             response += '\n';
             if (sd.supported) {
-                response += "bus: SDMMC\nbus_width: ";
+                response += "bus: " + String(SdStorage::bus_name(sd.bus)) + "\nbus_width: ";
                 response += sd.bus_width ? String(sd.bus_width) + " bit\n" : "unavailable\n";
                 response += "bus_clock: ";
                 response += sd.bus_clock_khz ? String(sd.bus_clock_khz) + " kHz\n" : "unavailable\n";
                 response += "bus_clock_limit: ";
                 response += sd.bus_clock_limit_khz ? String(sd.bus_clock_limit_khz) + " kHz\n" : "unavailable\n";
                 response += "card_type: " + String(SdStorage::card_type_name(sd.card_type)) + '\n';
+                if (sd.spi_error.valid) {
+                    const auto &error = sd.spi_error;
+                    char detail[288];
+                    snprintf(detail, sizeof(detail),
+                             "spi_first_error: %s drive=%u sector=%lu count=%lu "
+                             "CMD%u arg=0x%08lX phase=%.15s response=%d "
+                             "result=%d (%s) occurred=%lu ms elapsed=%lu ms\n",
+                             error.write ? "write" : "read", unsigned(error.drive),
+                             (unsigned long)error.sector, (unsigned long)error.count,
+                             unsigned(error.command), (unsigned long)error.argument,
+                             error.phase, error.response, error.disk_result,
+                             error.disk_result == 0 ? "recovered" : "failed",
+                             (unsigned long)error.occurred_ms, (unsigned long)error.elapsed_ms);
+                    response += detail;
+                }
             }
             if (sd.mounted) {
                 if (sd.total_bytes && sd.used_bytes <= sd.total_bytes) {
