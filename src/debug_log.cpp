@@ -1,6 +1,7 @@
 #include "debug_log.h"
 #include "memory_manager.h"
 #include "build_info.h"
+#include "board.h"
 #include "wifi_setup.h"
 #include "usb_storage.h"
 #include <esp_system.h>
@@ -80,9 +81,9 @@ static SyslogRecord boot_record() {
     SyslogRecord record = {};
     record.cat = CAT_GENERAL;
     record.level = LOG_INFO;
-    snprintf(record.text, sizeof(record.text), "[BOOT] %s build=%s reset=%s(%u)",
-             airbridge_version(), airbridge_build_date(), Log::reset_reason_name(),
-             (unsigned)esp_reset_reason());
+    snprintf(record.text, sizeof(record.text), "[BOOT] %s build=%s target=%s reset=%s(%u)",
+             airbridge_version(), airbridge_build_date(), AB_OTA_RELEASE_TARGET,
+             Log::reset_reason_name(), (unsigned)esp_reset_reason());
     return record;
 }
 
