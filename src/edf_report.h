@@ -46,7 +46,9 @@ StorageBrowser::StartResult open_artifact(const char *day, const char *digest,
     std::weak_ptr<StorageBrowser::Transfer> &active);
 
 // Two work jobs, plus one Days slot when background work fills admission.
-// Identical requests coalesce; result retention is bounded and prefers PSRAM.
+// Identical active requests coalesce without waiting for the work mutex.
+// Completed Reindex requests never coalesce; other result reuse is bounded
+// and prefers PSRAM.
 // Admission and polling do no SD work. Completion changes status.revision only; source
 // invalidation also changes status.data_revision. JSON carries both revisions.
 bool submit(const Request &request, uint32_t &id, const char **error = nullptr);

@@ -475,8 +475,8 @@ struct JobPool {
     Job fallback[SLOT_COUNT + 1];
     Job *data = fallback;
     size_t count = SLOT_COUNT + 1;
-    // Admission/removal publishes these IDs under status_mux. Contended reads
-    // can validate a token without touching a Job being reset under mutex.
+    // status_mux protects published lifetimes, active state transitions and
+    // joins. Remove the ID before destroying buffers under the work mutex.
     uint32_t retained_ids[RETAINED_SLOTS] = {};
     bool delivery_waiting = false;
     Job *begin() { return data; }
@@ -682,9 +682,9 @@ void admit_job(Job &job) {
     job.admitted_ms = millis();
     portENTER_CRITICAL(&status_mux);
     jobs.retained_ids[&job - jobs.data] = job.id;
-    portEXIT_CRITICAL(&status_mux);
     if (!job.background && job.request.action == Action::Days)
         __atomic_add_fetch(&days_epoch, 1, __ATOMIC_RELEASE);
+    portEXIT_CRITICAL(&status_mux);
 }
 
 // Caller holds mutex. Undelivered results get the existing delivery grace;
@@ -2334,6 +2334,36 @@ void foreground_activity() {
     portEXIT_CRITICAL(&status_mux);
 }
 
+bool join_active(const Request &request, uint32_t &id, bool &full) {
+    uint32_t accepted = 0;
+    bool promote = false;
+    full = false;
+    portENTER_CRITICAL(&status_mux);
+    for (size_t i = 0; i < jobs.count; ++i) {
+        // Unpublished slots may be allocating or destroying their Job.
+        if (!jobs.retained_ids[i]) continue;
+        auto &job = jobs.data[i];
+        if ((job.state != JobState::Queued && job.state != JobState::Running) ||
+            job.cancelled || !(job.request == request)) continue;
+        if (job.consumers == UINT16_MAX) { full = true; break; }
+        ++job.consumers;
+        job.shared = true;
+        promote = job.state == JobState::Queued && job.background;
+        if (promote) {
+            job.background = false;
+            __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
+        }
+        accepted = job.id;
+        break;
+    }
+    portEXIT_CRITICAL(&status_mux);
+    if (!accepted) return false;
+    id = accepted;
+    foreground_activity();
+    if (promote) xSemaphoreGive(wake);
+    return true;
+}
+
 bool cleanup_cancelled(void *context) {
     return __atomic_load_n(&artifact_reads, __ATOMIC_ACQUIRE) || foreground_wait() ||
         aborted(nullptr, *static_cast<const SdStorage::Session *>(context));
@@ -3680,7 +3710,9 @@ void defer_job(Job *job, const char *reason) {
     if (job->cancelled) reset_job(*job);
     else {
         job->wait_reason = reason;
+        portENTER_CRITICAL(&status_mux);
         job->state = JobState::Queued;
+        portEXIT_CRITICAL(&status_mux);
     }
     xSemaphoreGive(mutex);
     observe_report_jobs(true);
@@ -3802,8 +3834,12 @@ bool work_once() {
     observe_report_jobs(true);
     Job *foreground = nullptr, *days = nullptr, *backfill = nullptr;
     xSemaphoreTake(mutex, portMAX_DELAY);
-    for (auto &candidate : jobs) {
+    for (auto &candidate : jobs)
         if (candidate.state != JobState::Free && reusable(candidate)) reset_job(candidate);
+    // Scheduling and queued promotion must agree before a job starts running.
+    // Buffer destruction above stays outside this short admission boundary.
+    portENTER_CRITICAL(&status_mux);
+    for (auto &candidate : jobs) {
         if (candidate.state != JobState::Queued) continue;
         Job *&oldest = candidate.background ? backfill :
             candidate.request.action == Action::Days ? days : foreground;
@@ -3832,6 +3868,7 @@ bool work_once() {
         job->days_epoch = __atomic_load_n(&days_epoch, __ATOMIC_ACQUIRE);
         job->storage_yielded = false;
     }
+    portEXIT_CRITICAL(&status_mux);
     xSemaphoreGive(mutex);
     const char *blocked = !AirSenseState::local_background_allowed() ? "not_idle" :
         !SdStorage::local_access_allowed() ? "usb_storage" : !SdStorage::mounted() ? "no_sd" : nullptr;
@@ -3934,8 +3971,10 @@ bool work_once() {
                 xSemaphoreTake(mutex, portMAX_DELAY);
                 job->data_revision = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
                 error_body(*job, job->cancelled ? 410 : 503, job->cancelled ? "cancelled" : "index_unavailable");
-                job->state = JobState::Complete;
                 job->completed_ms = millis();
+                portENTER_CRITICAL(&status_mux);
+                job->state = JobState::Complete;
+                portEXIT_CRITICAL(&status_mux);
                 log_result(*job);
                 timing.log();
                 xSemaphoreGive(mutex);
@@ -4000,7 +4039,6 @@ bool work_once() {
         return more || (cleaning && index_cleanup_pending()) || (collecting && artifact_cleanup_pending());
     }
     xSemaphoreTake(mutex, portMAX_DELAY);
-    job->state = JobState::Running;
     const uint32_t current_data = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
     if (job->data_revision != current_data) {
         clear_assembly(*job);
@@ -4098,10 +4136,12 @@ bool work_once() {
             job->body.~Payload();
             new (&job->body) Payload;
         }
-        job->state = JobState::Queued;
-        if (job->consumers) job->background = false;
         job->code = 0;
         job->wait_reason = interrupted ? "not_idle" : changed ? "data_changed" : "storage_yield";
+        portENTER_CRITICAL(&status_mux);
+        if (job->consumers) job->background = false;
+        job->state = JobState::Queued;
+        portEXIT_CRITICAL(&status_mux);
         xSemaphoreGive(mutex);
         publish(interrupted ? State::Blocked : State::Building, interrupted ? "not_idle" : "");
         return yielded;
@@ -4109,10 +4149,12 @@ bool work_once() {
     if (success && !job->cancelled) report_progress(*job, {UINT64_MAX, 0}, false);
     job->build.reset();
     clear_assembly(*job);
-    job->state = JobState::Complete;
     job->completed_ms = millis();
     job->cache_generation = __atomic_load_n(&cache_generation, __ATOMIC_ACQUIRE);
     job->artifact_revision = status.artifact_revision;
+    portENTER_CRITICAL(&status_mux);
+    job->state = JobState::Complete;
+    portEXIT_CRITICAL(&status_mux);
     log_result(*job);
     timing.log();
     xSemaphoreGive(mutex);
@@ -4252,7 +4294,16 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     if (!publication.mounted) return reject("no_sd");
     if (!publication.available) return reject("not_idle");
     if (request.revision && request.revision != publication.data_revision) return reject("stale_revision");
-    if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return reject("busy");
+    const bool locked = mutex && xSemaphoreTake(mutex, 0) == pdTRUE;
+    bool full = false;
+    if (join_active(request, id, full)) {
+        if (locked) xSemaphoreGive(mutex);
+        return true;
+    }
+    if (!locked || full) {
+        if (locked) xSemaphoreGive(mutex);
+        return reject("busy");
+    }
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
     const bool current_index = catalog.ready &&
@@ -4262,7 +4313,8 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     size_t active = 0;
     bool background_active = false, days_active = false;
     for (auto &job : jobs) {
-        if (current_index && !job.recovered_index && !job.cancelled && !job.issue && job.state == JobState::Complete && job.code == 200 &&
+        if (request.action != Action::Reindex && current_index &&
+            !job.recovered_index && !job.cancelled && !job.issue && job.state == JobState::Complete && job.code == 200 &&
             job.data_revision == publication.data_revision && job.request == request &&
             (request.action != Action::Days || job.artifact_revision == publication.artifact_revision) &&
             ((request.action != Action::Summary && request.action != Action::History && request.action != Action::Days) ||
@@ -4280,25 +4332,11 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
             portEXIT_CRITICAL(&status_mux);
             return true;
         }
-        if (!job.cancelled && (job.state == JobState::Queued || job.state == JobState::Running) &&
-            job.request == request) {
-            if (job.consumers == UINT16_MAX) { xSemaphoreGive(mutex); return reject("busy"); }
-            ++job.consumers;
-            job.shared = true;
-            const bool promote = job.state == JobState::Queued && job.background;
-            if (promote) {
-                job.background = false;
-                __atomic_add_fetch(&foreground_epoch, 1, __ATOMIC_RELEASE);
-            }
-            id = job.id;
-            xSemaphoreGive(mutex);
-            foreground_activity();
-            if (promote) xSemaphoreGive(wake);
-            return true;
-        }
         if (job.state == JobState::Queued || job.state == JobState::Running) {
             ++active;
+            portENTER_CRITICAL(&status_mux);
             background_active |= job.background;
+            portEXIT_CRITICAL(&status_mux);
             days_active |= job.request.action == Action::Days;
         }
         if (reusable(job)) slot = &job;
@@ -4352,8 +4390,12 @@ bool preparation_pending(uint32_t id) {
 void cancel(uint32_t id) {
     if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return;
     for (auto &job : jobs) {
-        if (job.id != id || job.shared || job.readers) continue;
-        __atomic_store_n(&job.cancelled, true, __ATOMIC_RELEASE);
+        if (job.id != id) continue;
+        portENTER_CRITICAL(&status_mux);
+        const bool sole = !job.shared && !job.readers;
+        if (sole) __atomic_store_n(&job.cancelled, true, __ATOMIC_RELEASE);
+        portEXIT_CRITICAL(&status_mux);
+        if (!sole) break;
         if (job.state == JobState::Queued || job.state == JobState::Complete) reset_job(job);
         break;
     }
