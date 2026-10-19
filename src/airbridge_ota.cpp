@@ -376,7 +376,7 @@ const char *manual_start_blocked() {
     if (!runtime.initialized) return "ota_unavailable";
     if (runtime.operation != OP_NONE || runtime.reboot_pending) return "ota_busy";
     if (!SdStorage::local_access_allowed()) return "usb_storage_active";
-    if (!AirSenseState::system_idle()) return "device_not_idle";
+    if (!AirSenseState::esp_update_allowed()) return "device_not_idle";
     if (ResmedOta::is_active()) return "resmed_ota_active";
     if (!background_work_idle()) return "background_work_active";
     return nullptr;
@@ -390,11 +390,11 @@ const char *start_blocked() {
 
 struct BlockedInputs {
     uint32_t network;
-    bool initialized, ota_busy, device_idle, resmed_active, background_idle, storage_local;
+    bool initialized, ota_busy, esp_update_allowed, resmed_active, background_idle, storage_local;
 
     bool operator==(const BlockedInputs &other) const {
         return network == other.network && initialized == other.initialized &&
-            ota_busy == other.ota_busy && device_idle == other.device_idle &&
+            ota_busy == other.ota_busy && esp_update_allowed == other.esp_update_allowed &&
             resmed_active == other.resmed_active && background_idle == other.background_idle &&
             storage_local == other.storage_local;
     }
@@ -406,7 +406,7 @@ const char *cached_start_blocked() {
     static bool observed = false;
     const BlockedInputs inputs = {WiFiSetup::revision(), runtime.initialized,
         runtime.operation != OP_NONE || runtime.reboot_pending,
-        AirSenseState::system_idle(), ResmedOta::is_active(), background_work_idle(),
+        AirSenseState::esp_update_allowed(), ResmedOta::is_active(), background_work_idle(),
         SdStorage::local_access_allowed()};
     if (!observed || !(inputs == previous)) {
         last_upload_blocked = manual_start_blocked();
@@ -714,7 +714,7 @@ const OtaImage::Status &image_status() { return image_writer.status(); }
 
 bool begin_resmed_flash() {
     if (!lock()) return false;
-    const bool allowed = !manual_start_blocked();
+    const bool allowed = AirSenseState::system_idle() && !manual_start_blocked();
     if (allowed) {
         runtime.operation = OP_RESMED;
         runtime.resmed_claimed_at_ms = millis();

@@ -30,6 +30,8 @@ int mop();
 bool present_recently();
 
 bool system_idle();
+// Local firmware updates do not require a responsive or attached AirSense.
+bool esp_update_allowed();
 bool device_standby();
 bool local_background_allowed();
 

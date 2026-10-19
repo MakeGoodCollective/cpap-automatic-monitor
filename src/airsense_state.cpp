@@ -245,6 +245,11 @@ bool present_recently() {
 
 bool system_idle() { return Arbiter::get_state() == SYS_IDLE; }
 
+bool esp_update_allowed() {
+    const auto state = Arbiter::get_state();
+    return state == SYS_IDLE || state == SYS_ERROR;
+}
+
 bool device_standby() { return system_idle() && rop() == 0; }
 
 bool local_background_allowed() {
