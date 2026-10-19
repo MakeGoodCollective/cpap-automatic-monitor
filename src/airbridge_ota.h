@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <memory>
 #include "ota_image_writer.h"
 
 namespace OtaManager {
@@ -19,6 +20,18 @@ namespace OtaManager {
         uint32_t last_check_age_ms;
         char update_version[48];
         char error[64];
+        bool version_comparable;
+        uint32_t release_notes_id;
+    };
+
+    struct ReleaseNotes {
+        ReleaseNotes() = default;
+        ~ReleaseNotes();
+        ReleaseNotes(const ReleaseNotes &) = delete;
+        ReleaseNotes &operator=(const ReleaseNotes &) = delete;
+        uint32_t id = 0;
+        uint8_t *text = nullptr;
+        size_t size = 0;
     };
 
     void init();
@@ -34,6 +47,8 @@ namespace OtaManager {
     uint32_t revision();
     bool get_status(Status &status);
     const char *state_name(State state);
+    // Pins the exact published description; never fetches or reads storage.
+    std::shared_ptr<const ReleaseNotes> release_notes(uint32_t id);
 
     bool begin_manual_upload(const char **error = nullptr);
     void end_manual_upload(bool success, const char *error = nullptr);

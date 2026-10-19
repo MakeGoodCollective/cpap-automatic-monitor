@@ -28,6 +28,6 @@ bool stream(const char *url, size_t expected_size,
 // On success the caller owns buffer and releases it with heap_caps_free.
 bool fetch(const char *url, uint8_t *&buffer, size_t capacity, size_t &length,
            Error &error, ContinueCallback continue_callback = nullptr,
-           void *callback_ctx = nullptr);
+           void *callback_ctx = nullptr, size_t internal_fallback_limit = SIZE_MAX);
 
 }  // namespace OtaUrl

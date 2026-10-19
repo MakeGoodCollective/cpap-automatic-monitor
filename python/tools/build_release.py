@@ -151,6 +151,7 @@ def write_release_manifest(
         "schema": MANIFEST_SCHEMA,
         "product": "airbridge",
         "version": manifest_version(version),
+        "release_notes_url": f"airbridge-{filename_component(version)}-RELEASE_NOTES.md",
         "targets": targets,
     }
     path = output_dir / MANIFEST_FILENAME

@@ -26,6 +26,8 @@ namespace OtaManager {
 namespace {
 
 static constexpr size_t MANIFEST_MAX_BYTES = 4 * 1024;
+static constexpr size_t RELEASE_NOTES_MAX_BYTES = 32 * 1024;
+static constexpr size_t RELEASE_NOTES_INTERNAL_BYTES = 4 * 1024;
 static constexpr uint32_t INITIAL_CHECK_DELAY_MS = 60 * 1000;
 static constexpr uint32_t CHECK_INTERVAL_MS = 24UL * 60 * 60 * 1000;
 static constexpr uint32_t RETRY_INTERVAL_MS = 60UL * 60 * 1000;
@@ -58,6 +60,8 @@ struct RuntimeStatus {
     Operation operation = OP_NONE;
     char update_version[OtaRelease::VERSION_MAX] = {};
     char error[64] = {};
+    bool version_comparable = true;
+    uint32_t release_notes_id = 0;
 };
 
 static RuntimeStatus runtime;
@@ -68,6 +72,11 @@ static SemaphoreHandle_t mutex = nullptr;
 static char work_url[OtaRelease::URL_MAX] = {};
 static OtaRelease::Artifact available_artifact;
 static OtaImage::Writer image_writer;
+static uint32_t check_generation = 0;
+static uint32_t notes_generation = 0;
+static std::shared_ptr<const ReleaseNotes> published_notes;
+// A slow HTTP reader may retain one older publication, never unbounded history.
+static std::weak_ptr<const ReleaseNotes> notes_slots[2];
 
 bool lock(TickType_t timeout = portMAX_DELAY) {
     return !mutex || xSemaphoreTakeRecursive(mutex, timeout) == pdTRUE;
@@ -99,20 +108,27 @@ const char *reboot_image_blocked() {
     return running->address != boot->address ? "different_boot_image_selected" : nullptr;
 }
 
-bool operation_allowed() {
+bool operation_allowed(void *context) {
     if (!lock(pdMS_TO_TICKS(50))) return false;
-    bool allowed = runtime.operation == OP_CHECK;
+    bool allowed = runtime.operation == OP_CHECK &&
+                   *static_cast<uint32_t *>(context) == check_generation;
     unlock();
     return allowed;
 }
 
-void finish_check(const OtaRelease::Manifest *manifest,
+void finish_check(uint32_t generation, const OtaRelease::Manifest *manifest,
                   const OtaRelease::Artifact *artifact,
                   bool update_available,
-                  const char *error) {
+                  const char *error, bool version_comparable = true,
+                  std::shared_ptr<const ReleaseNotes> notes = {}) {
     if (!lock()) return;
     if (runtime.operation != OP_CHECK) {
         unlock();
+        return;
+    }
+    if (generation != check_generation) {
+        runtime.operation = OP_NONE;
+        unlock(true);
         return;
     }
     runtime.result = update_available ? State::Available : State::Current;
@@ -123,6 +139,9 @@ void finish_check(const OtaRelease::Manifest *manifest,
     available_artifact = {};
     runtime.update_version[0] = '\0';
     runtime.error[0] = '\0';
+    runtime.version_comparable = version_comparable;
+    published_notes = !error ? std::move(notes) : nullptr;
+    runtime.release_notes_id = published_notes ? published_notes->id : 0;
     if (manifest) {
         snprintf(runtime.update_version, sizeof(runtime.update_version), "%s",
                  manifest->version);
@@ -138,25 +157,61 @@ void finish_check(const OtaRelease::Manifest *manifest,
     }
 }
 
-void check_task(void *) {
+std::shared_ptr<ReleaseNotes> fetch_release_notes(const char *manifest_url,
+                                                const char *notes_url,
+                                                uint32_t &generation) {
+    if (!notes_url[0] || !operation_allowed(&generation)) return {};
+    char url[OtaRelease::URL_MAX];
+    if (!OtaRelease::resolve_artifact_url(manifest_url, notes_url, url, sizeof(url))) return {};
+    std::shared_ptr<ReleaseNotes> notes;
+    if (!lock()) return {};
+    for (auto &slot : notes_slots) {
+        if (!slot.expired()) continue;
+        notes.reset(new(std::nothrow) ReleaseNotes);
+        if (notes) {
+            if (++notes_generation == 0) ++notes_generation;
+            notes->id = notes_generation;
+            slot = notes;
+        }
+        break;
+    }
+    unlock();
+    if (!notes) return {};
+
+    OtaUrl::Error error;
+    if (!OtaUrl::fetch(url, notes->text, RELEASE_NOTES_MAX_BYTES, notes->size,
+                       error, operation_allowed, &generation, RELEASE_NOTES_INTERNAL_BYTES)) {
+        Log::logf(CAT_OTA, LOG_DEBUG, "Release notes unavailable: %s\n", error.code);
+        return {};
+    }
+    return notes;
+}
+
+void check_task(void *argument) {
+    uint32_t generation = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(argument));
     char url[sizeof(work_url)] = {};
     if (lock()) {
         snprintf(url, sizeof(url), "%s", work_url);
         unlock();
+    }
+    if (!operation_allowed(&generation)) {
+        finish_check(generation, nullptr, nullptr, false, nullptr);
+        vTaskDelete(nullptr);
+        return;
     }
 
     uint8_t *buffer = nullptr;
     size_t length = 0;
     OtaUrl::Error transport_error;
     if (!OxiBle::release_memory(BLE_PAUSE_TIMEOUT_MS)) {
-        finish_check(nullptr, nullptr, false, "ble_memory_busy");
+        finish_check(generation, nullptr, nullptr, false, "ble_memory_busy");
         vTaskDelete(nullptr);
         return;
     }
 
     bool fetched = OtaUrl::fetch(url, buffer, MANIFEST_MAX_BYTES, length,
                                 transport_error,
-                                [](void *) { return operation_allowed(); }, nullptr);
+                                operation_allowed, &generation);
     OtaRelease::Manifest manifest;
     char manifest_error[OtaRelease::ERROR_MAX] = {};
     bool parsed = fetched && OtaRelease::parse_manifest(
@@ -164,10 +219,21 @@ void check_task(void *) {
         manifest, manifest_error);
     heap_caps_free(buffer);
 
-    // TLS and the manifest buffer are gone before BLE allocates again.
+    bool newer = false;
+    const bool comparable = parsed && OtaRelease::is_newer(airbridge_version(), manifest.version, newer);
+    // Unknown local versions permit an explicit install, never an automatic one.
+    const bool available = parsed && (newer || !comparable);
+    auto notes = available ? fetch_release_notes(url, manifest.release_notes_url, generation) : nullptr;
+
+    // Both HTTP clients and the manifest buffer are gone before BLE allocates again.
     bool restored = OxiBle::restore_memory(BLE_PAUSE_TIMEOUT_MS);
+    if (!restored && notes) {
+        notes.reset();
+        restored = OxiBle::restore_memory(BLE_PAUSE_TIMEOUT_MS);
+    }
     if (!fetched || !restored) {
-        finish_check(nullptr, nullptr, false,
+        notes.reset();
+        finish_check(generation, nullptr, nullptr, false,
                      !restored ? "ble_restore_failed" :
                      transport_error.code[0] ? transport_error.code
                                              : "manifest_fetch_failed");
@@ -176,15 +242,8 @@ void check_task(void *) {
     }
 
     if (!parsed) {
-        finish_check(nullptr, nullptr, false, manifest_error);
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    bool newer = false;
-    if (!OtaRelease::is_newer(airbridge_version(), manifest.version, newer)) {
-        finish_check(&manifest, nullptr, false,
-                     "current_version_invalid");
+        notes.reset();
+        finish_check(generation, nullptr, nullptr, false, manifest_error);
         vTaskDelete(nullptr);
         return;
     }
@@ -192,16 +251,18 @@ void check_task(void *) {
     OtaRelease::Artifact resolved = manifest.artifact;
     if (!OtaRelease::resolve_artifact_url(
             url, manifest.artifact.url, resolved.url, sizeof(resolved.url))) {
-        finish_check(&manifest, nullptr, false,
+        notes.reset();
+        finish_check(generation, &manifest, nullptr, false,
                      "artifact_url_invalid");
         vTaskDelete(nullptr);
         return;
     }
 
     const esp_partition_t *partition = esp_ota_get_next_update_partition(nullptr);
-    bool installable = newer && partition && resolved.image_size <= partition->size;
-    finish_check(&manifest, &resolved, newer,
-                 newer && !installable ? "artifact_too_large" : nullptr);
+    bool installable = available && partition && resolved.image_size <= partition->size;
+    finish_check(generation, &manifest, &resolved, available,
+                 available && !installable ? "artifact_too_large" : nullptr,
+                 comparable, std::move(notes));
     vTaskDelete(nullptr);
 }
 
@@ -300,9 +361,9 @@ void install_task(void *) {
     vTaskDelete(nullptr);
 }
 
-bool start_worker(TaskFunction_t function, const char *name) {
+bool start_worker(TaskFunction_t function, const char *name, void *argument = nullptr) {
     BaseType_t result = xTaskCreatePinnedToCore(
-        function, name, TASK_STACK_BYTES, nullptr, 1, nullptr, 0);
+        function, name, TASK_STACK_BYTES, argument, 1, nullptr, 0);
     return result == pdPASS;
 }
 
@@ -360,6 +421,15 @@ const char *cached_start_blocked() {
 }
 
 }  // namespace
+
+ReleaseNotes::~ReleaseNotes() { heap_caps_free(text); }
+
+std::shared_ptr<const ReleaseNotes> release_notes(uint32_t id) {
+    if (!id || !lock(pdMS_TO_TICKS(50))) return {};
+    auto result = published_notes && published_notes->id == id ? published_notes : nullptr;
+    unlock();
+    return result;
+}
 
 void init() {
     auto &cfg = Config::get();
@@ -480,8 +550,9 @@ bool request_check(const char **error) {
         snprintf(work_url, sizeof(work_url), "%s", cfg.update_url.c_str());
         runtime.operation = OP_CHECK;
         runtime.error[0] = '\0';
+        const uint32_t generation = ++check_generation;
         unlock(true);
-        if (start_worker(check_task, "ota_check")) return true;
+        if (start_worker(check_task, "ota_check", reinterpret_cast<void *>(uintptr_t(generation)))) return true;
         if (lock()) {
             runtime.operation = OP_NONE;
             set_error_locked("update_task_alloc_failed");
@@ -529,11 +600,15 @@ bool request_install(const char **error) {
 void config_changed() {
     auto &cfg = Config::get();
     if (!lock()) return;
-    if (runtime.operation == OP_CHECK) runtime.operation = OP_NONE;
+    // Keep the worker's lease until it exits; invalidation cancels its fetch.
+    ++check_generation;
     runtime.enabled = runtime.initialized && cfg.update_url.length() > 0;
     runtime.result = State::Idle;
     runtime.update_version[0] = '\0';
     runtime.error[0] = '\0';
+    runtime.version_comparable = true;
+    published_notes.reset();
+    runtime.release_notes_id = 0;
     available_artifact = {};
     runtime.next_check_ms = millis() + INITIAL_CHECK_DELAY_MS;
     unlock(true);
@@ -572,6 +647,8 @@ bool get_status(Status &status) {
     status.progress = progress_percent(runtime.bytes, runtime.total_size);
     status.last_check_age_ms = runtime.last_check_ms
         ? millis() - runtime.last_check_ms : 0;
+    status.version_comparable = runtime.version_comparable;
+    status.release_notes_id = runtime.release_notes_id;
     snprintf(status.update_version, sizeof(status.update_version), "%s",
              runtime.update_version);
     if (status.state == State::Error)

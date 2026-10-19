@@ -45,6 +45,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .sidebar .brand{padding:20px 16px;border-bottom:1px solid var(--border)}
 .sidebar .brand h1{font-size:24px;font-weight:700;color:var(--accent);letter-spacing:0.5px}
 .sidebar .brand small{font-size:11px;color:var(--text-dim);display:block;margin-top:2px}
+.update-notice{display:block;margin-top:9px;color:var(--orange);font-size:12px;font-weight:600;line-height:1.4;text-decoration:none;overflow-wrap:anywhere}
+.update-notice:hover{color:var(--text);text-decoration:underline}
+.update-notice:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .sidebar nav{flex:1;padding:8px 0}
 .nav-item{display:flex;align-items:center;gap:12px;padding:10px 20px;color:var(--text-dim);text-decoration:none;font-size:16px;cursor:pointer;border-left:3px solid transparent;transition:all 0.15s}
 .nav-item:hover{color:var(--text);background:var(--hover)}
@@ -327,6 +330,26 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .bottom-nav .bnav-item .icon{width:22px;height:22px}
 .bottom-nav .bnav-item .icon svg{width:21px;height:21px}
 .bottom-nav .bnav-item.active{color:var(--accent)}
+#otaNavMobile .icon{position:relative}
+.update-badge{position:absolute;top:-2px;right:-4px;width:10px;height:10px;border:2px solid var(--surface);border-radius:50%;background:var(--orange)}
+
+/* Release notes */
+#otaVersionHint{font-size:13px;line-height:1.5;color:var(--text-dim);margin:12px 0;overflow-wrap:anywhere}
+.release-notes-dialog{margin:auto;width:min(720px,calc(100vw - 24px));max-height:calc(100vh - 24px);max-height:calc(100dvh - 24px);padding:0;border:1px solid var(--border);border-radius:12px;background:var(--card);color:var(--text);overflow:hidden}
+.release-notes-dialog[open]{display:flex;flex-direction:column}
+.release-notes-dialog::backdrop{background:var(--shadow)}
+.release-notes-header{display:flex;align-items:center;gap:12px;justify-content:space-between;padding:16px;border-bottom:1px solid var(--border);flex:none}
+.release-notes-header h2{font-size:17px;line-height:1.4;overflow-wrap:anywhere;min-width:0}
+.release-notes-header .btn{flex:none;min-height:44px}
+.release-notes-body{padding:16px;overflow:auto;min-height:0;line-height:1.6;font-size:14px;overflow-wrap:anywhere}
+.release-notes-body h1,.release-notes-body h2,.release-notes-body h3{font-size:18px;line-height:1.4;margin:20px 0 10px;color:var(--accent)}
+.release-notes-body h2{font-size:16px}.release-notes-body h3{font-size:14px}
+.release-notes-body>:first-child{margin-top:0}
+.release-notes-body p,.release-notes-body ul,.release-notes-body pre{margin:10px 0}
+.release-notes-body ul{padding-left:22px}.release-notes-body li{margin:5px 0}
+.release-notes-body code{font:12px 'SF Mono',Consolas,monospace;background:var(--surface);border-radius:4px;padding:2px 4px}
+.release-notes-body pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;background:var(--surface);border-radius:6px}
+.release-notes-body pre code{padding:0}
 
 /* Responsive */
 @media(pointer:coarse){
@@ -382,6 +405,7 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
       <h1>AirBridge</h1>
       <small id="ver"></small>
       <small id="verBuild" style="color:var(--text-faint)"></small>
+      <a id="otaUpdateNotice" class="update-notice" href="#ota" data-tab="ota" hidden></a>
     </div>
     <nav>
       <a class="nav-item active" data-tab="status"><span class="icon"><svg aria-hidden="true"><use href="#icon-dashboard"/></svg></span> <span data-i18n="nav.dashboard"></span></a>
@@ -751,9 +775,11 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
             <label><span data-i18n="ota.latest"></span></label>
             <span class="value" id="espFwLatest">--</span>
           </div>
+          <p id="otaVersionHint" hidden></p>
           <div class="btn-row" style="margin-bottom:14px">
             <button class="btn" id="btnOtaCheck" onclick="otaCheckRelease()"><span data-i18n="ota.check"></span></button>
             <button class="btn btn-accent" id="btnOtaInstall" onclick="otaInstallRelease()" style="display:none"><span data-i18n="ota.install"></span></button>
+            <button class="btn" id="btnOtaNotes" onclick="otaShowReleaseNotes()" hidden><span data-i18n="ota.whatsNew"></span></button>
           </div>
           <div class="progress" id="otaReleaseProgress"><div class="bar" id="otaReleaseBar" style="background:var(--accent)"></div></div>
           <div class="msg" id="otaReleaseMsg"></div>
@@ -845,11 +871,19 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
   <a class="bnav-item" data-tab="console"><span class="icon"><svg aria-hidden="true"><use href="#icon-console"/></svg></span>CLI</a>
   <a class="bnav-item" data-tab="storage" hidden><span class="icon"><svg aria-hidden="true"><use href="#icon-storage"/></svg></span><span data-i18n="nav.storage"></span></a>
   <a class="bnav-item" data-tab="device"><span class="icon"><svg aria-hidden="true"><use href="#icon-config"/></svg></span><span data-i18n="nav.config"></span></a>
-  <a class="bnav-item" data-tab="ota"><span class="icon"><svg aria-hidden="true"><use href="#icon-ota"/></svg></span>OTA</a>
+  <a class="bnav-item" id="otaNavMobile" data-tab="ota" href="#ota" data-i18n-aria-label="nav.ota"><span class="icon"><svg aria-hidden="true"><use href="#icon-ota"/></svg><span id="otaUpdateBadge" class="update-badge" aria-hidden="true" hidden></span></span>OTA</a>
 </nav>
 
 <!-- Toast container -->
 <div class="toast-container" id="toastContainer"></div>
+
+<dialog id="otaReleaseNotesDialog" class="release-notes-dialog" aria-labelledby="otaReleaseNotesTitle">
+  <div class="release-notes-header">
+    <h2 id="otaReleaseNotesTitle"></h2>
+    <button class="btn" type="button" onclick="closeOtaNotes()" autofocus><span data-i18n="ota.closeNotes"></span></button>
+  </div>
+  <div id="otaReleaseNotesText" class="release-notes-body" aria-live="polite" aria-busy="false" tabindex="0"></div>
+</dialog>
 
 <script>
 const UI_CATALOGS = /* UI_CATALOGS */ {};
@@ -1172,6 +1206,7 @@ function initSSE() {
     exportsFresh = false;
     renderExports();
     if (otaWatch) showMsg(document.getElementById('otaReleaseMsg'), uiMessage('ota.connectionLost'), 'err', 0);
+    if (otaNotes) closeOtaNotes();
     var li = document.getElementById('liveIndicator');
     if (li) li.style.background = 'var(--text-faint)';
   };
@@ -1180,6 +1215,8 @@ function initSSE() {
     wifiSerial++;
     otaSerial++;
     otaStatus = null;
+    renderOtaNotice(null);
+    updateOtaNotes(null);
     exportsSnapshot = null;
     bleLoadedRevision = null;
     reportReconnect();
@@ -1552,8 +1589,8 @@ function showTab(id) {
 }
 
 // Wire up nav clicks
-document.querySelectorAll('.nav-item, .bnav-item').forEach(n => {
-  n.addEventListener('click', () => showTab(n.dataset.tab));
+document.querySelectorAll('.nav-item, .bnav-item, .update-notice').forEach(n => {
+  n.addEventListener('click', e => { e.preventDefault(); showTab(n.dataset.tab); });
   if (n.dataset.tab === 'storage') n.addEventListener('click', () => loadStorage());
 });
 
@@ -4660,6 +4697,175 @@ document.getElementById('cmdInput').addEventListener('keydown', e => {
 
 let otaStatusTimer = null;
 let otaStatus = null, otaWatch = null, otaSerial = 0;
+let otaNotes = null;
+
+function appendReleaseNotesInline(parent, value) {
+  const token = /(\*\*[^*]+\*\*|\x60[^\x60]+\x60)/g;
+  let offset = 0, match;
+  while ((match = token.exec(value)) !== null) {
+    parent.append(document.createTextNode(value.slice(offset, match.index)));
+    const element = document.createElement(match[0][0] === '`' ? 'code' : 'strong');
+    const trim = match[0][0] === '`' ? 1 : 2;
+    element.textContent = match[0].slice(trim, -trim);
+    parent.append(element);
+    offset = token.lastIndex;
+  }
+  parent.append(document.createTextNode(value.slice(offset)));
+}
+
+function renderReleaseNotesMarkdown(container, markdown) {
+  uiText(container, '');
+  const lines = markdown.replace(/\r\n?/g, '\n').split('\n');
+  let paragraph = [], list = null, listItem = null, listParagraph = [], code = null;
+  const appendParagraph = (parent, values) => {
+    if (!values.length) return;
+    const element = document.createElement('p');
+    appendReleaseNotesInline(element, values.join(' '));
+    parent.append(element);
+    values.length = 0;
+  };
+  const closeList = () => {
+    if (listItem) appendParagraph(listItem, listParagraph);
+    list = null;
+    listItem = null;
+  };
+  const appendCode = () => {
+    const pre = document.createElement('pre');
+    const element = document.createElement('code');
+    element.textContent = code.join('\n');
+    pre.append(element);
+    container.append(pre);
+    code = null;
+  };
+  for (const line of lines) {
+    if (code !== null) {
+      if (line.startsWith('```')) appendCode();
+      else code.push(line);
+      continue;
+    }
+    if (line.startsWith('```')) {
+      appendParagraph(container, paragraph);
+      closeList();
+      code = [];
+      continue;
+    }
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      appendParagraph(container, paragraph);
+      closeList();
+      const element = document.createElement('h' + heading[1].length);
+      appendReleaseNotesInline(element, heading[2]);
+      container.append(element);
+      continue;
+    }
+    const item = line.match(/^-\s+(.+)$/);
+    if (item) {
+      appendParagraph(container, paragraph);
+      if (listItem) appendParagraph(listItem, listParagraph);
+      if (!list) {
+        list = document.createElement('ul');
+        container.append(list);
+      }
+      listItem = document.createElement('li');
+      appendReleaseNotesInline(listItem, item[1]);
+      list.append(listItem);
+      continue;
+    }
+    if (listItem && /^\s{2,}\S/.test(line)) {
+      listParagraph.push(line.trim());
+      continue;
+    }
+    if (!line.trim()) {
+      appendParagraph(container, paragraph);
+      if (listItem) appendParagraph(listItem, listParagraph);
+      continue;
+    }
+    closeList();
+    paragraph.push(line.trim());
+  }
+  appendParagraph(container, paragraph);
+  closeList();
+  if (code !== null) appendCode();
+  if (!container.childNodes.length) uiText(container, uiMessage('ota.notesEmpty'));
+}
+
+function closeOtaNotes() {
+  otaNotes?.controller.abort();
+  otaNotes = null;
+  const dialog = document.getElementById('otaReleaseNotesDialog');
+  if (dialog.open) dialog.close();
+  const text = document.getElementById('otaReleaseNotesText');
+  text.setAttribute('aria-busy', 'false');
+  uiText(text, '');
+}
+
+function updateOtaNotes(d) {
+  document.getElementById('btnOtaNotes').hidden = !(d?.release_notes_id > 0 && d.update_version);
+  if (otaNotes && (d?.release_notes_id !== otaNotes.id || d.update_version !== otaNotes.version)) closeOtaNotes();
+}
+
+document.getElementById('otaReleaseNotesDialog').addEventListener('cancel', event => {
+  event.preventDefault();
+  closeOtaNotes();
+});
+document.getElementById('otaReleaseNotesDialog').addEventListener('close', event => {
+  // A queued close event may belong to the previous opening of this dialog.
+  if (!event.target.open) closeOtaNotes();
+});
+
+async function otaShowReleaseNotes() {
+  if (!otaStatus?.release_notes_id || !otaStatus.update_version) return;
+  const dialog = document.getElementById('otaReleaseNotesDialog');
+  if (dialog.open) return;
+  const request = {id:otaStatus.release_notes_id, version:otaStatus.update_version, controller:new AbortController()};
+  otaNotes = request;
+  uiText(document.getElementById('otaReleaseNotesTitle'), uiMessage('ota.notesTitle', {version:request.version}));
+  const text = document.getElementById('otaReleaseNotesText');
+  uiText(text, uiMessage('ota.notesLoading'));
+  text.setAttribute('aria-busy', 'true');
+  dialog.showModal();
+  let reader = null;
+  try {
+    const response = await api('/api/ota/release-notes?id=' + request.id,
+      {cache:'no-store', signal:request.controller.signal});
+    reader = response?.body?.getReader() || null;
+    if (otaNotes !== request) return;
+    if (response?.status === 404) throw uiFailure('ota.notesUnavailable');
+    if (!response?.ok || !reader) throw uiFailure('ota.notesFailed');
+    const limit = 32768;
+    if (Number(response.headers.get('Content-Length')) > limit) throw uiFailure('ota.notesTooLarge');
+    const decoder = new TextDecoder();
+    let bytes = 0, markdown = '';
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (otaNotes !== request) return;
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > limit) throw uiFailure('ota.notesTooLarge');
+      markdown += decoder.decode(value, {stream:true});
+    }
+    markdown += decoder.decode();
+    renderReleaseNotesMarkdown(text, markdown);
+  } catch(error) {
+    if (otaNotes === request) uiText(text, error.ui || uiMessage('ota.notesFailed'));
+  } finally {
+    if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+    if (otaNotes === request) text.setAttribute('aria-busy', 'false');
+  }
+}
+
+function renderOtaNotice(d) {
+  const available = d?.state === 'available';
+  const params = {version:d?.update_version || '--'};
+  const message = available ? uiMessage('ota.availableVersion', params) : '';
+  const notice = document.getElementById('otaUpdateNotice');
+  notice.hidden = !available;
+  uiText(notice, message);
+  document.getElementById('otaUpdateBadge').hidden = !available;
+  const mobile = document.getElementById('otaNavMobile');
+  uiText(mobile, available ? uiMessage('ota.availableNavigation', params) : uiMessage('nav.ota'), 'aria-label');
+  uiText(mobile, message, 'title');
+}
 
 function renderOtaStatus(d) {
   var version = document.getElementById('espFwVer');
@@ -4671,6 +4877,9 @@ function renderOtaStatus(d) {
   else if (d.state === 'current') latest = uiMessage('ota.currentVersion', {version:latest});
   else if (d.state === 'available') latest = uiMessage('ota.availableVersion', {version:latest});
   uiText(document.getElementById('espFwLatest'), latest);
+  const versionHint = document.getElementById('otaVersionHint');
+  versionHint.hidden = d.state !== 'available' || d.version_comparable !== false;
+  uiText(versionHint, versionHint.hidden ? '' : uiMessage('ota.versionUncomparable', {version:d.update_version}));
 
   var active = ['checking', 'installing', 'rebooting', 'busy'].includes(d.state);
   var check = document.getElementById('btnOtaCheck');
@@ -4701,6 +4910,8 @@ function renderOtaStatus(d) {
 function applyOtaStatus(d) {
   if (otaStatus && d.revision <= otaStatus.revision) { finishOtaObservation(); return; }
   otaStatus = d;
+  renderOtaNotice(d);
+  updateOtaNotes(d);
   if (document.getElementById('p-ota').classList.contains('active')) renderOtaStatus(d);
   finishOtaObservation();
 }

@@ -17,6 +17,7 @@ struct Artifact {
 
 struct Manifest {
     char version[VERSION_MAX] = {};
+    char release_notes_url[URL_MAX] = {};
     Artifact artifact;
 };
 

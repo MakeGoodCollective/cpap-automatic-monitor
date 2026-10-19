@@ -2027,6 +2027,8 @@ static String buildOtaStatus(const OtaManager::Status &status, bool full) {
     json.reserve(full ? 512 : 96);
     jsonAddString(json, "state", OtaManager::state_name(status.state), false);
     jsonAddUInt32(json, "revision", status.revision);
+    jsonAddUInt32(json, "release_notes_id", status.release_notes_id);
+    jsonAddBool(json, "version_comparable", status.version_comparable);
     if (status.state == OtaManager::State::Installing ||
         status.state == OtaManager::State::Rebooting)
         jsonAddInt(json, "progress", status.progress);
@@ -2079,6 +2081,47 @@ static void publishWifi() {
 static void handleOtaStatus(AsyncWebServerRequest *request) {
     if (!checkAuth(request)) return;
     sendOtaStatus(request, 200);
+}
+
+class ReleaseNotesResponse : public BufferedResponse {
+public:
+    explicit ReleaseNotesResponse(std::shared_ptr<const OtaManager::ReleaseNotes> notes)
+        : notes_(std::move(notes)) {
+        begin(200, notes_->size, "text/markdown; charset=utf-8");
+        addHeader("Cache-Control", "no-store");
+        addHeader("X-Content-Type-Options", "nosniff");
+    }
+
+    bool _sourceValid() const override { return bool(notes_); }
+
+protected:
+    size_t readBody(size_t offset, char *out, size_t capacity) override {
+        if (offset >= notes_->size) return 0;
+        const size_t count = min(capacity, notes_->size - offset);
+        memcpy(out, notes_->text + offset, count);
+        return count;
+    }
+
+private:
+    std::shared_ptr<const OtaManager::ReleaseNotes> notes_;
+};
+
+static void handleOtaReleaseNotes(AsyncWebServerRequest *request) {
+    if (!checkAuth(request)) return;
+    uint32_t id = 0;
+    if (!request->hasParam("id") ||
+        !aircannect::parse_uint32_decimal(request->getParam("id")->value().c_str(), id) || !id) {
+        request->send(400, "text/plain", "invalid release notes id");
+        return;
+    }
+    auto notes = OtaManager::release_notes(id);
+    if (!notes) {
+        request->send(404, "text/plain", "release notes unavailable");
+        return;
+    }
+    auto response = new(std::nothrow) ReleaseNotesResponse(std::move(notes));
+    if (!response) request->send(503, "text/plain", "release notes response unavailable");
+    else request->send(response);
 }
 
 static void handleOtaRequest(AsyncWebServerRequest *request, bool install) {
@@ -2577,7 +2620,8 @@ void WebUI::init(uint16_t port) {
     http->on("/api/wifi", HTTP_GET, handleWifiGet);
     http->on("/api/wifi", HTTP_POST, handleWifiPost, NULL, handleJsonBody);
     http->on("/api/esp32/upload", HTTP_POST, handleEspOtaDone, handleEspOtaChunk);
-    http->on("/api/ota", HTTP_GET, handleOtaStatus);
+    http->on(AsyncURIMatcher::exact("/api/ota"), HTTP_GET, handleOtaStatus);
+    http->on(AsyncURIMatcher::exact("/api/ota/release-notes"), HTTP_GET, handleOtaReleaseNotes);
     http->on("/api/ota/check", HTTP_POST, handleOtaCheck);
     http->on("/api/ota/install", HTTP_POST, handleOtaInstall);
     http->on("/api/reboot", HTTP_POST, handleReboot);

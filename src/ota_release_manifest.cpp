@@ -215,6 +215,7 @@ bool parse_manifest(char *json, size_t json_len, const char *target,
     filter["schema"] = true;
     filter["product"] = true;
     filter["version"] = true;
+    filter["release_notes_url"] = true;
     for (const char *encoding : {"raw", "zlib"}) {
         JsonObject artifact_filter = filter["targets"][target][encoding].to<JsonObject>();
         artifact_filter["url"] = true;
@@ -273,6 +274,17 @@ bool parse_manifest(char *json, size_t json_len, const char *target,
         image_size == 0 || image_size > SIZE_MAX) {
         set_error(error, "manifest_artifact_invalid");
         return false;
+    }
+
+    // Optional notes must not invalidate an otherwise usable firmware release.
+    JsonString notes = root["release_notes_url"].as<JsonString>();
+    const char *notes_url = notes.c_str();
+    if (valid_url_text(notes_url) &&
+        notes.size() < sizeof(manifest.release_notes_url) &&
+        notes.size() == strlen(notes_url) &&
+        !(notes_url[0] == '/' && notes_url[1] == '/')) {
+        snprintf(manifest.release_notes_url, sizeof(manifest.release_notes_url),
+                 "%s", notes_url);
     }
 
     snprintf(manifest.version, sizeof(manifest.version), "%s", version);

@@ -37,6 +37,7 @@ struct FetchContext {
     size_t capacity = 0;
     size_t offset = 0;
     size_t expected_size = 0;
+    size_t internal_fallback_limit = SIZE_MAX;
     bool size_checked = false;
     ContinueCallback continue_callback = nullptr;
     void *callback_ctx = nullptr;
@@ -165,7 +166,8 @@ esp_err_t fetch_event(esp_http_client_event_t *event) {
             return ESP_FAIL;
         }
         ctx.expected_size = (size_t)length;
-        ctx.buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(ctx.expected_size));
+        ctx.buffer = static_cast<uint8_t *>(aircannect::Memory::alloc_large(
+            ctx.expected_size, ctx.expected_size <= ctx.internal_fallback_limit));
         if (!ctx.buffer) {
             set_error(*ctx.error, "manifest_alloc_failed");
             return ESP_FAIL;
@@ -230,7 +232,7 @@ bool stream(const char *url, size_t expected_size,
 
 bool fetch(const char *url, uint8_t *&buffer, size_t capacity, size_t &length,
            Error &error, ContinueCallback continue_callback,
-           void *callback_ctx) {
+           void *callback_ctx, size_t internal_fallback_limit) {
     length = 0;
     buffer = nullptr;
     error = {};
@@ -241,6 +243,7 @@ bool fetch(const char *url, uint8_t *&buffer, size_t capacity, size_t &length,
 
     FetchContext context;
     context.capacity = capacity;
+    context.internal_fallback_limit = internal_fallback_limit;
     context.continue_callback = continue_callback;
     context.callback_ctx = callback_ctx;
     context.error = &error;

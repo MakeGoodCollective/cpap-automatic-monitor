@@ -68,6 +68,8 @@ jobs:
           python3 python/tools/build_release_notes.py \
             "$GITHUB_REF_NAME" \
             --output dist/RELEASE_NOTES.md
+          notes_asset="$(python3 -c 'import json; print(json.load(open("dist/airbridge-release.json"))["release_notes_url"])')"
+          cp dist/RELEASE_NOTES.md "dist/$notes_asset"
 
       - name: Publish GitHub release
         env:
@@ -80,6 +82,7 @@ jobs:
             dist/airbridge-*.elf
             dist/airbridge-release.json
             dist/RELEASE_NOTES.md
+            dist/airbridge-*-RELEASE_NOTES.md
             dist/SHA256SUMS
           )
 
