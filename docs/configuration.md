@@ -180,7 +180,7 @@ All commands are prefixed with `$`. Anything without `$` is sent to the AirSense
 | `$LOG category level` | Set log level (ERROR/WARN/INFO/DEBUG) |
 | `$TRANSPARENT` | Raw UART passthrough (60s idle timeout) |
 | `$FRAMED` | Switch to framed UART mode |
-| `$VERSION` | Firmware version |
+| `$VERSION` | Firmware version, build time and target |
 | `$REBOOT` | Restart device |
 
 Log categories: `GENERAL`, `OXI`, `TCP`, `WIFI`, `OTA`, `WEB`, `ARB`, `HEALTH`,
