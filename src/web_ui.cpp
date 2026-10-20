@@ -2137,6 +2137,7 @@ protected:
                     pending_ += ",\"modified\":";
                     pending_ += modified;
                     jsonAddBool(pending_, "bootloader", entry.bootloader);
+                    jsonAddBool(pending_, "directory", entry.directory);
                     pending_ += '}';
                 } else { pending_ = "]}"; done_ = true; }
             }

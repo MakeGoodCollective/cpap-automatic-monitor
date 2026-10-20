@@ -50,6 +50,8 @@ void init();
 // bootloader explicitly selects the 16KiB canonical recovery destination. It
 // requires a supported matching BID and valid CRC, not exact dump-build bytes;
 // the caller must obtain the user's patched-bootloader intent/consent.
+// Ordinary repository filenames may include a path relative to the repository
+// root. Staging and explicit bootloader uploads accept a basename only.
 Result begin_upload(Destination destination, const char *filename, size_t size,
                     uint32_t &id, bool bootloader = false);
 Result submit_chunk(uint32_t id, size_t index, const uint8_t *data,

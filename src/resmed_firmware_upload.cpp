@@ -14,6 +14,7 @@
 #include <freertos/task.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <utility>
 #if AB_STORAGE_HAS_SDCARD
 #include <FS.h>
@@ -292,7 +293,21 @@ Result begin_upload(Destination destination, const char *filename, size_t size, 
     id = 0;
     if (!mutex) return Result::Unavailable;
     if (destination != Destination::Repository && destination != Destination::Staging) return Result::Unsupported;
-    if (!ResmedFirmwareRepository::valid_filename(filename)) return Result::InvalidName;
+    char path[ResmedFirmwareRepository::MAX_PATH];
+    if (destination == Destination::Repository && !bootloader) {
+        const int length = snprintf(path, sizeof(path), "%s/%s",
+                                    ResmedFirmwareRepository::ROOT, filename ? filename : "");
+        if (length < 0 || size_t(length) >= sizeof(path) ||
+            !ResmedFirmwareRepository::valid_path(path) ||
+            !strncasecmp(filename, "bootloaders/", 12))
+            return Result::InvalidName;
+    } else {
+        if (!ResmedFirmwareRepository::valid_filename(filename)) return Result::InvalidName;
+        const int length = destination == Destination::Repository
+            ? snprintf(path, sizeof(path), "%s/%s", ResmedFirmwareRepository::ROOT, filename)
+            : snprintf(path, sizeof(path), "%s", filename);
+        if (length < 0 || size_t(length) >= sizeof(path)) return Result::InvalidName;
+    }
     if (size > MAX_IMAGE_BYTES) return Result::InvalidSize;
     if (bootloader && (destination != Destination::Repository || (size && size != 0x4000)))
         return Result::InvalidSize;
@@ -335,9 +350,7 @@ Result begin_upload(Destination destination, const char *filename, size_t size, 
     status.cancel_allowed = true;
     status.size = size;
     status.bootloader = bootloader;
-    if (destination == Destination::Repository)
-        snprintf(status.path, sizeof(status.path), "%s/%s", ResmedFirmwareRepository::ROOT, filename);
-    else snprintf(status.path, sizeof(status.path), "%s", filename);
+    snprintf(status.path, sizeof(status.path), "%s", path);
     active = true;
     final_received = sealed = claimed = false;
     partition = nullptr;

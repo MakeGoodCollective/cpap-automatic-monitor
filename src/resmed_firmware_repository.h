@@ -17,6 +17,7 @@ struct EntryView {
     uint64_t size = 0;
     int64_t modified = 0;
     bool bootloader = false;
+    bool directory = false;
 };
 
 class Snapshot {
@@ -39,6 +40,7 @@ private:
         uint32_t path;
         uint32_t next;
         bool bootloader;
+        bool directory;
     };
     void *packed_ = nullptr;
     size_t count_ = 0;
@@ -70,8 +72,9 @@ std::shared_ptr<const Snapshot> snapshot();
 // result is paired with not-ready status; never join two independent reads.
 std::shared_ptr<const Snapshot> snapshot(Status &out);
 
-// Exact absolute identities: direct root files or bootloaders/<BID>/patched.bin.
-// No traversal, hidden files, .part files, or arbitrary subtrees.
+// Exact absolute file identities within ROOT, including ordinary subdirectories.
+// The bootloaders subtree permits only <BID>/patched.bin.
+// No traversal, hidden components or .part files.
 bool valid_filename(const char *filename);
 bool valid_path(const char *path);
 bool bootloader_path(const char *bid, char *out, size_t capacity);

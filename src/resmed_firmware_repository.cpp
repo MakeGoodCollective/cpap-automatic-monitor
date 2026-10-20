@@ -84,7 +84,8 @@ struct Builder {
 
     void truncate() { if (result) result->truncated_ = true; }
 
-    bool append(const char *path, uint64_t size, int64_t modified, bool bootloader) {
+    bool append(const char *path, uint64_t size, int64_t modified, bool bootloader,
+                bool directory = false) {
         if (!result) return false;
         if (result->count_ == MAX_ENTRIES) { result->truncated_ = true; return true; }
         const size_t bytes = (sizeof(Snapshot::Entry) + strlen(path) + 1 + 7) & ~size_t(7);
@@ -105,6 +106,7 @@ struct Builder {
         entry->path = used + sizeof(Snapshot::Entry);
         entry->next = used + bytes;
         entry->bootloader = bootloader;
+        entry->directory = directory;
         strcpy(reinterpret_cast<char *>(data + entry->path), path);
         used += bytes;
         ++result->count_;
@@ -136,13 +138,14 @@ bool Snapshot::entry(size_t index, EntryView &out) const {
     out.size = entry->size;
     out.modified = entry->modified;
     out.bootloader = entry->bootloader;
+    out.directory = entry->directory;
     return true;
 }
 
 bool Snapshot::contains(const char *path) const {
     EntryView view;
     for (size_t i = 0; path && entry(i, view); ++i)
-        if (!strcmp(path, view.path)) return true;
+        if (!view.directory && !strcmp(path, view.path)) return true;
     return false;
 }
 
@@ -233,6 +236,10 @@ const char *scan(Builder &builder, uint32_t files, SdStorage::Session &session) 
                     continue;
                 }
                 if (item.directory) {
+                    if (!builder.append(path, 0, item.modified, false, true)) {
+                        error = "catalog_no_memory";
+                        break;
+                    }
                     if (!pending.add(path)) { error = "catalog_no_memory"; break; }
                     continue;
                 }
