@@ -212,7 +212,7 @@ void dispatch_command(const char *line, String &response) {
             path.length() >= sizeof(request.path) ||
             (rename ? name.isEmpty() || name.length() >= 256 : !name.isEmpty()) ||
             !extra.isEmpty()) {
-            response = "ERR: usage: $STORAGE RENAME /path new_name | RM /path | STATUS | FORMAT CONFIRM\n";
+            response = "ERR: usage: $STORAGE RENAME /path destination | RM /path | STATUS | FORMAT CONFIRM\n";
             return;
         }
         request.kind = rename ? StorageBrowser::Kind::Rename : StorageBrowser::Kind::Delete;
@@ -799,7 +799,7 @@ void dispatch_command(const char *line, String &response) {
         response += "; REPAIR requires engine support\n";
         response +=
 #if AB_STORAGE_HAS_SDCARD
-                   "  STORAGE RENAME path name  Rename a file or folder\n"
+                   "  STORAGE RENAME path target  Rename/move; creates missing folders\n"
                    "  STORAGE RM path     Delete a file or folder recursively\n"
 #endif
                    "  STORAGE STATUS      SD state, space and last file operation\n"

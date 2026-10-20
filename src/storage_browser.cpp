@@ -8,6 +8,7 @@
 #include <atomic>
 #include <new>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include "crc.h"
 #include "json_util.h"
@@ -84,7 +85,20 @@ bool rename_target(const Request &request, char (&out)[256]) {
     if (!slash || !slash[1]) return false;
     if (slash == parent) slash[1] = 0;
     else *slash = 0;
-    return child_path(parent, request.selection, strlen(request.selection), out);
+    const char *name = request.selection;
+    const int written = name[0] == '/'
+        ? snprintf(out, sizeof(out), "%s", name)
+        : snprintf(out, sizeof(out), "%s%s%s", parent, strcmp(parent, "/") ? "/" : "", name);
+    if (written <= 0 || size_t(written) >= sizeof(out) || !valid_path(out) || !out[1])
+        return false;
+    for (const char *p = out + 1; *p; ++p) {
+        if (strchr("\\:*?\"<>|", *p)) return false;
+        if ((!p[1] || p[1] == '/') && (*p == '.' || *p == ' ')) return false;
+    }
+    // FAT paths are case-insensitive: moving a directory into itself is invalid.
+    const size_t source_length = strlen(request.path);
+    return strncasecmp(out, request.path, source_length) ||
+           (out[source_length] && out[source_length] != '/');
 }
 
 bool valid_request(const Request &request) {
@@ -365,10 +379,17 @@ const char *mutate(Job &job, uint32_t &changed) {
         char destination[256];
         if (!rename_target(job.request, destination)) return "invalid_name";
         const char *error = "storage_busy";
-        const bool renamed = job.session.mutate(job.request.path, destination, [&](fs::FS &fs) {
+        auto check = [&](fs::FS &fs) {
             if (job.cancelled.load()) { error = "cancelled"; return false; }
             if (!fs.exists(job.request.path)) { error = "not_found"; return false; }
             if (fs.exists(destination)) { error = "destination_exists"; return false; }
+            return true;
+        };
+        if (!job.session.run(check)) return error;
+        if (!job.session.ensure_parent(destination))
+            return job.session.valid() ? "directory_failed" : "cancelled";
+        const bool renamed = job.session.mutate(job.request.path, destination, [&](fs::FS &fs) {
+            if (!check(fs)) return false;
             error = "rename_failed";
             if (!fs.rename(job.request.path, destination)) return false;
             SdStorage::notify_files_changed();

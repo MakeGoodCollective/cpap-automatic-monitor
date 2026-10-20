@@ -13,7 +13,7 @@ enum class StartResult { Started, BadRequest, Busy, Unavailable };
 struct Request {
     Kind kind;
     char path[256];
-    char selection[2048]; // Child names separated by newlines, or new name for Rename.
+    char selection[2048]; // Child names separated by newlines, or destination for Rename.
     uint32_t offset;
     struct Range { uint32_t first = 0, last = 0; } ranges[8];
     uint8_t range_count = 0;
