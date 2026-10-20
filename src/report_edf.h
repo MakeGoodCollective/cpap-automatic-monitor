@@ -45,12 +45,18 @@ struct Sample {
     bool valid = false;
 };
 
+struct RawSample {
+    int16_t raw = 0;
+    bool valid = false;
+};
+
 // Borrowed view into one complete raw record. No I/O or decoded sample array;
 // valid until the caller reuses the record buffer. Uses read_samples' validity.
 struct RecordSamples {
     const Signal *signal = nullptr, *pressure = nullptr;
     const uint8_t *data = nullptr, *paired = nullptr;
     Sample operator[](size_t slot) const;  // slot < signal->samples_per_record
+    RawSample raw(size_t slot) const;  // Same bounds/validity, no physical conversion.
 };
 
 enum class EventKind : uint8_t {

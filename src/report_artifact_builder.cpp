@@ -962,7 +962,7 @@ bool Producer::record(const ReportEdf::Header &header, const uint8_t *data, size
             auto *encoded = w.input + (whole_record ? w.offsets[w.record_channel] : 0);
             memset(encoded + count * 2, 0, mask);
             for (size_t n = 0; n < count; ++n) {
-                const auto sample = samples[n];
+                const auto sample = samples.raw(n);
                 SdStorage::put_le16(encoded + n * 2, uint16_t(sample.raw));
                 if (sample.valid) encoded[count * 2 + n / 8] |= 1u << (n % 8);
             }
@@ -978,7 +978,7 @@ bool Producer::record(const ReportEdf::Header &header, const uint8_t *data, size
             if (!w.active()) return false;
             const size_t take = std::min<size_t>(count - w.record_sample, sizeof(w.input) / 2);
             for (size_t n = 0; n < take; ++n)
-                SdStorage::put_le16(w.input + n * 2, uint16_t(samples[w.record_sample + n].raw));
+                SdStorage::put_le16(w.input + n * 2, uint16_t(samples.raw(w.record_sample + n).raw));
             if (!w.writer.write(w.input, take * 2)) {
                 w.writer.close(); w.writer_open = false;
                 return w.fail("spool_write");
@@ -988,7 +988,7 @@ bool Producer::record(const ReportEdf::Header &header, const uint8_t *data, size
         }
         if (!w.active()) return false;
         memset(w.input, 0, mask);
-        for (size_t n = 0; n < count; ++n) if (samples[n].valid) w.input[n / 8] |= 1u << (n % 8);
+        for (size_t n = 0; n < count; ++n) if (samples.raw(n).valid) w.input[n / 8] |= 1u << (n % 8);
         if (!w.writer.write(w.input, mask)) {
             w.writer.close(); w.writer_open = false;
             return w.fail("spool_write");

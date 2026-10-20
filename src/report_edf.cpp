@@ -82,19 +82,24 @@ const Signal *paired_pressure(const Header &header, const Signal &signal) {
         ? &header.signals[index] : nullptr;
 }
 
-Sample decode_sample(const Signal &signal, const uint8_t *bytes,
-                     const Signal *pressure, const uint8_t *paired) {
+RawSample decode_raw_sample(const Signal &signal, const uint8_t *bytes,
+                           const Signal *pressure, const uint8_t *paired) {
     // Decode explicitly; no host endian/alignment dependency.
     const uint16_t bits = bytes[0] | (uint16_t(bytes[1]) << 8);
-    Sample value;
+    RawSample value;
     value.raw = static_cast<int16_t>(bits < 32768 ? bits : int32_t(bits) - 65536);
     value.valid = signal.valid(value.raw);
     if (pressure) {
         const uint16_t p = paired[0] | (uint16_t(paired[1]) << 8);
         value.valid &= pressure->valid(static_cast<int16_t>(p < 32768 ? p : int32_t(p) - 65536));
     }
-    value.value = value.valid ? signal.physical(value.raw) : 0;
     return value;
+}
+
+Sample decode_sample(const Signal &signal, const uint8_t *bytes,
+                     const Signal *pressure, const uint8_t *paired) {
+    const auto value = decode_raw_sample(signal, bytes, pressure, paired);
+    return {value.raw, value.valid ? signal.physical(value.raw) : 0, value.valid};
 }
 
 bool record_has_valid(const Reader &reader, const Header &header, size_t signal,
@@ -285,6 +290,10 @@ bool read_samples(const Reader &reader, const Header &header, size_t index,
 
 Sample RecordSamples::operator[](size_t slot) const {
     return decode_sample(*signal, data + slot * 2, pressure, paired ? paired + slot * 2 : nullptr);
+}
+
+RawSample RecordSamples::raw(size_t slot) const {
+    return decode_raw_sample(*signal, data + slot * 2, pressure, paired ? paired + slot * 2 : nullptr);
 }
 
 bool record_samples(const Header &header, const uint8_t *record, size_t bytes,
