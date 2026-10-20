@@ -292,10 +292,12 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .firmware-toolbar .btn{white-space:nowrap}
 .firmware-section-title{margin:22px 0 12px;color:var(--blue);font-size:12px;font-weight:500;text-transform:uppercase}
 .firmware-messages{display:block;width:100%;height:150px;resize:vertical;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);padding:10px 12px;margin:8px 0 4px;font:12px/1.6 monospace}
+.firmware-card{font-size:14px}
 .firmware-card .row{gap:16px}
 .firmware-card .row>label{flex:1}
 .firmware-card .value{min-width:0;max-width:70%;text-align:right;overflow-wrap:anywhere}
-.firmware-card input[type=file],.firmware-card input[type=url]{max-width:100%;width:300px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font-size:12px}
+.firmware-card input[type=file],.firmware-card input[type=url]{max-width:100%;width:300px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font-size:inherit}
+.firmware-card .btn{font-size:inherit}
 .firmware-card .btn-group{justify-content:flex-start;margin-top:12px}
 #firmwareEntries .storage-row{grid-template-columns:minmax(0,1fr) auto}
 @media(max-width:768px){
