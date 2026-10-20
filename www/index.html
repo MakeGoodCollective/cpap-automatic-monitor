@@ -1241,7 +1241,7 @@ function initSSE() {
   if (evtSrc) evtSrc.close();
   evtSrc = new EventSource('/events');
   evtSrc.addEventListener('status', e => {
-    try { updateStatusFromPush(JSON.parse(e.data)); } catch(ex) {}
+    try { updateStatusFromPush(JSON.parse(e.data)); } catch(ex) { console.error('SSE status:', ex); }
   });
   evtSrc.addEventListener('exports', e => {
     try {
