@@ -35,6 +35,7 @@
 #include "uart_arbiter.h"
 #include "airsense_state.h"
 #include "airbridge_ota.h"
+#include "resmed_ota.h"
 #endif
 
 namespace SdStorage {
@@ -141,6 +142,7 @@ unsigned interactive_streak = 0;
 uint32_t generation = 1;
 struct Lease {
     uint32_t generation = 0;
+    Access access = Access::Background;
     char read_root[256] = {};
 };
 // Slot zero is the sole background/exclusive owner; the other slots are readers.
@@ -287,10 +289,17 @@ bool background_allowed() {
         AirSenseState::local_background_allowed();
 }
 
+bool firmware_allowed() {
+    const auto state = Arbiter::get_state();
+    return local_access_allowed() && !__atomic_load_n(&recorder_waiting, __ATOMIC_ACQUIRE) &&
+        ResmedOta::is_active() && (state == SYS_IDLE || state == SYS_OTA_AIRSENSE);
+}
+
 bool background_allowed(uint32_t expected) {
-    if (!expected || !background_allowed()) return false;
+    if (!expected) return false;
     for (const Lease &session : sessions)
-        if (expected == __atomic_load_n(&session.generation, __ATOMIC_ACQUIRE)) return true;
+        if (expected == __atomic_load_n(&session.generation, __ATOMIC_ACQUIRE))
+            return session.access == Access::Firmware ? firmware_allowed() : background_allowed();
     return false;
 }
 
@@ -366,11 +375,11 @@ void process_request(Request &value) {
 #endif
     } else if (request->kind == Request::Begin) {
         refresh_background_waiters();
-        if (!mounted() || !background_allowed()) return;
+        if (!mounted() || !(request->access == Access::Firmware ? firmware_allowed() : background_allowed())) return;
         const bool background_turn = request->access == Access::Background &&
             request_background_turn(*request);
         if (maintenance_pending()) return;
-        if (request->access == Access::Exclusive) {
+        if (request->access == Access::Exclusive || request->access == Access::Firmware) {
             if (!exclusive_waiter) {
                 if (protected_background || (background_resume_pending &&
                     uint32_t(millis() - background_resume_at) < BACKGROUND_RESUME_MS)) return;
@@ -403,11 +412,12 @@ void process_request(Request &value) {
         } else if (!sessions[0].generation) slot = &sessions[0];
         if (!slot) return;
         if (request->path && strlen(request->path) >= sizeof(slot->read_root)) return;
-        if (request->access != Access::Exclusive) {
+        if (request->access != Access::Exclusive && request->access != Access::Firmware) {
             if (++generation == 0) ++generation;
             request->generation = generation;
         }
         snprintf(slot->read_root, sizeof(slot->read_root), "%s", request->path ? request->path : "");
+        slot->access = request->access;
         __atomic_store_n(&slot->generation, request->generation, __ATOMIC_RELEASE);
         __atomic_add_fetch(&active_sessions, 1, __ATOMIC_RELEASE);
         if (request->access == Access::Background) {
@@ -1405,6 +1415,39 @@ bool Session::mutate(const char *path, const char *destination,
     request.observer_context = io_context_;
     return dispatch(request, false);
 #else
+    return false;
+#endif
+}
+
+bool Session::ensure_parent(const char *path) const {
+#if AB_STORAGE_HAS_SDCARD
+    char parent[256];
+    if (!path || path[0] != '/' || strlen(path) >= sizeof(parent)) return false;
+    strcpy(parent, path);
+    char *end = strrchr(parent, '/');
+    if (!end[1]) return false;
+    if (end == parent) return valid();
+    *end = 0;
+    for (char *p = parent + 1;; ++p) {
+        if (*p && *p != '/') continue;
+        const char saved = *p;
+        *p = 0;
+        const bool ok = mutate(parent, [&](fs::FS &fs) {
+            if (fs.exists(parent)) {
+                fs::File directory = fs.open(parent);
+                return directory && directory.isDirectory();
+            }
+            if (!fs.mkdir(parent)) return false;
+            notify_files_changed();
+            return true;
+        });
+        *p = saved;
+        if (!ok) return false;
+        if (!saved) break;
+    }
+    return valid();
+#else
+    (void)path;
     return false;
 #endif
 }

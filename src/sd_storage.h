@@ -18,7 +18,9 @@ enum class Mode : uint8_t { Local, ToUsb, Usb, ToLocal };
 enum class FormatResult : uint8_t { None, Succeeded, Failed };
 enum class CardType : uint8_t { Unknown, Sd, Sdhc, Mmc, Sdio };
 enum class Bus : uint8_t { None, Sdmmc, Spi };
-enum class Access : uint8_t { Background, ReadOnly, Exclusive };
+// Firmware is exclusive and remains valid under the ResMed owner's OTA claim.
+// Only ResmedOta may request it; ordinary sessions still stop during raw UART.
+enum class Access : uint8_t { Background, ReadOnly, Exclusive, Firmware };
 enum class IoEvent : uint8_t { Waiting, WaitingForReader, Complete };
 
 struct SpiError {
@@ -200,6 +202,11 @@ public:
     template <typename F> bool mutate(const char *path, F &&operation) const {
         return mutate(path, nullptr, operation);
     }
+
+    // Create missing parents of a validated absolute file path (<256 bytes).
+    // One directory per executor step. Existing parents must be directories.
+    // Failure may leave empty parents; each creation publishes a file revision.
+    bool ensure_parent(const char *path) const;
 
 private:
     uint32_t generation_ = 0;

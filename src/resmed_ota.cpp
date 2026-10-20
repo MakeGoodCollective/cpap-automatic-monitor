@@ -1,693 +1,738 @@
 #include "resmed_ota.h"
-#include "uart_arbiter.h"
-#include "qframe.h"
-#include "crc.h"
-#include "debug_log.h"
-#include "app_config.h"
-#include "live_stream.h"
-#include "custom_settings.h"
+
+#include "airbridge_ota.h"
 #include "airsense_state.h"
-#include <esp_partition.h>
+#include "custom_settings.h"
+#include "debug_log.h"
+#include "live_stream.h"
+#include "memory_manager.h"
+#include "qframe.h"
+#include "resmed_firmware_repository.h"
+#include "resmed_firmware_upload.h"
+#include "sd_storage.h"
+#include "uart_arbiter.h"
+
+#include <atomic>
+#include <stdarg.h>
 #include <esp_ota_ops.h>
+#include <freertos/task.h>
 
-#define FLASH_TASK_STACK    8192
-#define FLASH_TASK_PRIO     3
+namespace ResmedOta {
+namespace {
 
-#define CHUNK_SIZE          250
-#define BID_OFFSET_SX577    0x3F80  // BID string offset within BLX
+namespace Image = ResmedFirmwareImage;
+constexpr size_t BLX_BYTES = 16 * 1024;
+constexpr size_t SOURCE_CHUNK = 4096;
+constexpr size_t UART_CHUNK = 250;
+constexpr size_t INTERNAL_RESERVE = 32 * 1024;
+constexpr uint32_t FLASH_TASK_STACK = 8192;
 
-const esp_partition_t* ResmedOta::get_staging_partition() {
-    // try dedicated resmed partition (backwards compatibility)
-    const esp_partition_t *p = esp_partition_find_first(
-        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "resmed");
-    if (p) return p;
+portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
+Status published;
+std::atomic<bool> active{false};
+std::atomic<bool> cancel_requested{false};
+bool programming = false;  // Protected by status_mux, like published.
 
-    // or use inactive OTA app slot
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    return esp_ota_get_next_update_partition(running);
+struct Work {
+    InstallRequest request;
+    Source source = Source::None;
+    ResmedFirmwareUpload::Source staged;
+};
+Work work;
+
+void phase(const char *name) {
+    portENTER_CRITICAL(&status_mux);
+    snprintf(published.phase, sizeof(published.phase), "%s", name);
+    ++published.revision;
+    portEXIT_CRITICAL(&status_mux);
 }
 
-
-static bool verify_block_crc(const esp_partition_t *part, size_t offset, size_t size) {
-    uint8_t buf[128];
-    uint16_t crc = 0xFFFF;
-    size_t remaining = size;
-    size_t pos = 0;
-    while (remaining > 0) {
-        size_t chunk = (remaining > sizeof(buf)) ? sizeof(buf) : remaining;
-        if (esp_partition_read(part, offset + pos, buf, chunk) != ESP_OK) return false;
-        crc = crc16_ccitt(buf, chunk, crc);
-        pos += chunk;
-        remaining -= chunk;
+bool fail(const char *format, ...) {
+    char message[128];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    portENTER_CRITICAL(&status_mux);
+    if (!published.error[0]) {
+        memcpy(published.error, message, sizeof(message));
+        ++published.revision;
     }
-    return crc == 0;
+    portEXIT_CRITICAL(&status_mux);
+    return false;
 }
 
-static bool check_bytes(const esp_partition_t *part, size_t offset,
-                        const uint8_t *expected, size_t len) {
-    uint8_t buf[16];
-    if (len > sizeof(buf)) return false;
-    if (esp_partition_read(part, offset, buf, len) != ESP_OK) return false;
-    return memcmp(buf, expected, len) == 0;
+bool cancelled() {
+    portENTER_CRITICAL(&status_mux);
+    const bool result = cancel_requested.load() && !programming;
+    portEXIT_CRITICAL(&status_mux);
+    return result;
 }
 
-fw_verify_result_t ResmedOta::verify_image(const esp_partition_t *part, size_t fw_size) {
-    fw_verify_result_t r = {};
+bool begin_programming() {
+    portENTER_CRITICAL(&status_mux);
+    const bool allowed = programming || !cancel_requested.load();
+    if (allowed && !programming) {
+        programming = true;
+        published.cancel_allowed = false;
+        ++published.revision;
+    }
+    portEXIT_CRITICAL(&status_mux);
+    return allowed;
+}
 
-    // Block layout for SX577-0200
-    const size_t BLX_OFF = 0x00000, BLX_SIZE = 0x04000;
-    const size_t CCX_OFF = 0x04000, CCX_SIZE = 0x3C000;
-    const size_t CDX_OFF = 0x40000, CDX_SIZE = 0xC0000;
+uint8_t *allocate_buffer(size_t size) {
+    void *buffer = aircannect::Memory::alloc_large(size, false);
+    if (!buffer) {
+        // Fixed workload bounds, with headroom for normal UART/BLE operation.
+        const auto memory = aircannect::Memory::status();
+        if (size <= BLX_BYTES && memory.heap_free >= size + INTERNAL_RESERVE &&
+            memory.heap_max_alloc >= size)
+            buffer = aircannect::Memory::alloc_large(size, true);
+    }
+    return static_cast<uint8_t *>(buffer);
+}
 
-    r.has_blx = (fw_size >= BLX_OFF + BLX_SIZE);
-    r.has_ccx = (fw_size >= CCX_OFF + CCX_SIZE);
-    r.has_cdx = (fw_size >= CDX_OFF + CDX_SIZE);
+struct Input {
+    SdStorage::Session session;
+    SdStorage::Reader file;
+    const esp_partition_t *partition = nullptr;
+    uint64_t size = 0;
+    uint8_t *blx = nullptr;
+    uint8_t *scratch = nullptr;
 
-    // BID check
-    if (r.has_blx) {
-        memset(r.bid, 0, sizeof(r.bid));
-        esp_partition_read(part, BID_OFFSET_SX577, r.bid, sizeof(r.bid) - 1);
-        for (int i = 0; i < (int)sizeof(r.bid) - 1; i++) {
-            if (r.bid[i] < 0x20 || r.bid[i] > 0x7E) { r.bid[i] = '\0'; break; }
-        }
-        r.bid_ok = (strncmp(r.bid, "SX577-0200", 10) == 0);
+    ~Input() {
+        file.close();
+        session.end();
+        aircannect::Memory::free(blx);
+        aircannect::Memory::free(scratch);
     }
 
-    // Block CRCs
-    if (r.has_blx) r.blx_crc_ok = verify_block_crc(part, BLX_OFF, BLX_SIZE);
-    if (r.has_ccx) r.ccx_crc_ok = verify_block_crc(part, CCX_OFF, CCX_SIZE);
-    if (r.has_cdx) r.cdx_crc_ok = verify_block_crc(part, CDX_OFF, CDX_SIZE);
-
-    // Bootloader patch detection
-    r.blx_patch = BLX_PATCH_NONE;
-    if (r.has_blx) {
-        // old airbreak method. breaks serial flashing
-        const uint8_t patch_a[] = {0xC0, 0x46};
-        if (check_bytes(part, 0xF0, patch_a, sizeof(patch_a))) {
-            r.blx_patch = BLX_PATCH_A_DANGEROUS;
-        }
-
-        // Method B: skip verification, but allow bootloader to run
-        const uint8_t patch_b1[] = {0x01, 0x20, 0xC0, 0x46};
-        const uint8_t patch_b2[] = {0x00, 0x20, 0xC0, 0x46};
-        if (check_bytes(part, 0x310E, patch_b1, sizeof(patch_b1)) &&
-            check_bytes(part, 0x313E, patch_b2, sizeof(patch_b2)) &&
-            check_bytes(part, 0x3130, patch_b2, sizeof(patch_b2))) {
-            r.blx_patch = BLX_PATCH_B_SAFE;
-        }
+    bool read_source(uint64_t offset, uint8_t *out, size_t length) {
+        if (offset > size || length > size - offset || length > SOURCE_CHUNK) return false;
+        if (partition)
+            return esp_partition_read(partition, offset, out, length) == ESP_OK;
+        return session.valid() && file.read_at(offset, out, length);
     }
 
-    return r;
-}
+    static bool read(void *context, uint64_t offset, uint8_t *out, size_t length) {
+        auto &input = *static_cast<Input *>(context);
+        if (offset > input.size || length > input.size - offset) return false;
+        if (input.blx && offset < BLX_BYTES) {
+            const size_t count = min(length, BLX_BYTES - static_cast<size_t>(offset));
+            memcpy(out, input.blx + offset, count);
+            offset += count;
+            out += count;
+            length -= count;
+        }
+        return !length || input.read_source(offset, out, length);
+    }
 
-struct block_info_t {
-    const char *name;
-    uint32_t base_addr;
-    uint32_t max_size;
-    uint32_t file_offset;
+    Image::Reader reader() { return {this, size, read}; }
 };
 
-static const block_info_t BLOCKS_SX577[] = {
-    {"BLX", 0x08000000, 0x04000,  0x00000},
-    {"CCX", 0x08004000, 0x3C000,  0x04000},
-    {"CDX", 0x08040000, 0xC0000,  0x40000},
-    {"CMX", 0x08004000, 0xFC000,  0x04000},
-};
-#define BLOCK_COUNT 4
-
-static volatile bool flash_active = false;
-static volatile bool flash_cancel = false;
-static volatile size_t flash_sent = 0;
-static volatile size_t flash_total = 0;
-static char flash_phase[32] = "";
-static char flash_error[128] = "";
-static TaskHandle_t flash_task_handle = nullptr;
-
-struct flash_params_t {
-    char block[8];
-    size_t fw_size;
-    bool flash_blx;
-    bool force_blx;
-};
-static flash_params_t flash_params;
-
-static const block_info_t* find_block(const char *name) {
-    for (int i = 0; i < BLOCK_COUNT; i++) {
-        if (strcmp(BLOCKS_SX577[i].name, name) == 0) return &BLOCKS_SX577[i];
+bool open_input(Input &input) {
+    if (work.source == Source::Staging) {
+        input.partition = work.staged.partition;
+        input.size = work.staged.size;
+        if (!input.partition || !input.size || input.size > input.partition->size)
+            return fail("invalid_staged_source");
+    } else {
+        if (!ResmedFirmwareRepository::valid_path(work.request.path))
+            return fail("invalid_repository_path");
+        phase("Open SD image");
+        const uint32_t started = millis();
+        while (!input.session.begin(SdStorage::Access::Firmware, work.request.path)) {
+            if (cancelled()) return false;
+            if (!SdStorage::local_access_allowed() || !SdStorage::mounted())
+                return fail("sd_unavailable");
+            if (millis() - started >= 5000) return fail("sd_busy");
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        if (!input.file.open(input.session, work.request.path))
+            return fail("source_open_failed");
+        input.size = input.file.size();
     }
-    return nullptr;
-}
-
-// Format: [0x03] [length] [address:4 big-endian] [data...] [0x00]
-// length = 4 (addr) + data_len + 1 (trailing zero)
-static int build_record_03(uint8_t *out, size_t out_size,
-                           uint32_t addr, const uint8_t *data, size_t data_len) {
-    size_t rec_len = 2 + 4 + data_len + 1;  // type + len + addr + data + zero
-    if (out_size < rec_len) return -1;
-
-    uint8_t payload_len = 4 + data_len + 1;
-    out[0] = 0x03;
-    out[1] = payload_len;
-    out[2] = (addr >> 24) & 0xFF;
-    out[3] = (addr >> 16) & 0xFF;
-    out[4] = (addr >> 8) & 0xFF;
-    out[5] = addr & 0xFF;
-    memcpy(out + 6, data, data_len);
-    out[6 + data_len] = 0x00;
-
-    return (int)rec_len;
-}
-
-// Data frame: block_name + 0x00 + seq + record
-// Completion: block_name + 'F' + seq
-static int build_f_payload(uint8_t *out, size_t out_size,
-                           const char *block_name, uint8_t seq,
-                           const uint8_t *record, size_t record_len,
-                           bool is_completion) {
-    size_t name_len = strlen(block_name);
-    size_t total = name_len + 1 + 1 + (is_completion ? 0 : record_len);
-    if (out_size < total) return -1;
-
-    memcpy(out, block_name, name_len);
-    out[name_len] = is_completion ? 'F' : 0x00;
-    out[name_len + 1] = seq;
-    if (!is_completion && record && record_len > 0) {
-        memcpy(out + name_len + 2, record, record_len);
+    if (!input.size || input.size > Image::FULL_SIZE) return fail("invalid_image_size");
+    input.scratch = allocate_buffer(SOURCE_CHUNK);
+    if (!input.scratch) return fail("source_buffer_unavailable");
+    if (input.size == Image::FULL_SIZE ||
+        Image::parse_block(work.request.block) == Image::Block::BLX ||
+        (!work.request.block[0] && input.size == BLX_BYTES)) {
+        if (input.size < BLX_BYTES) return fail("incomplete_blx");
+        input.blx = allocate_buffer(BLX_BYTES);
+        if (!input.blx) return fail("blx_buffer_unavailable");
+        // Finish every BLX source read before any device erase, including FULL.
+        for (size_t pos = 0; pos < BLX_BYTES; pos += SOURCE_CHUNK) {
+            if (cancelled()) return false;
+            if (!input.read_source(pos, input.blx + pos, SOURCE_CHUNK))
+                return fail("blx_preflight_read_failed");
+        }
     }
-
-    return is_completion ? (int)(name_len + 2) : (int)(name_len + 2 + record_len);
+    return true;
 }
 
-// Bypasses arbiter queue
-static bool send_raw_cmd(const char *cmd, char *resp, uint16_t resp_size,
-                         uint16_t timeout_ms = 2000) {
+bool device_text(const char *tag, char *out, size_t capacity) {
+    return Arbiter::read_var(tag, CMD_SRC_OTA, CMD_PRIO_CRITICAL,
+                             out, capacity, 1000) == Arbiter::VarResult::Ok;
+}
+
+struct Plan {
+    const Image::Profile *profile = nullptr;
+    Image::Result image;
+    Image::Range blocks[2] = {};
+    uint32_t offsets[2] = {};
+    size_t count = 0;
+    char bid[32] = {};
+    char serial[24] = {};
+};
+
+bool prepare(Input &input, Plan &plan) {
+    phase("Prepare image");
+    if (!AirSenseState::system_idle()) return fail("device_not_idle");
+    if (!device_text("BID", plan.bid, sizeof(plan.bid))) return fail("device_bid_unavailable");
+    plan.profile = Image::profile_for_bid(plan.bid);
+    if (!plan.profile) return fail("unsupported_device_bid: %s", plan.bid);
+    if (!device_text("SRN", plan.serial, sizeof(plan.serial)) || !plan.serial[0])
+        return fail("device_identity_unavailable");
+
+    Image::Block selected = Image::parse_block(work.request.block);
+    const bool full = input.size == Image::FULL_SIZE;
+    Image::Options options;
+    options.platform = plan.profile->platform;
+    options.target = full ? Image::Block::FULL : selected;
+    const auto shape = full ? Image::Block::FULL : selected != Image::Block::Unknown
+        ? selected : input.size == BLX_BYTES ? Image::Block::BLX : Image::Block::Unknown;
+    const auto &staged_image = work.staged.image;
+    const bool inspected_staging = work.source == Source::Staging &&
+        staged_image.status == Image::Status::Ok && staged_image.size == input.size &&
+        staged_image.platform == plan.profile->platform && staged_image.target == shape;
+    // The promoted upload lease preserves these exact bytes and their inspector
+    // facts. Do not repeat its CRC pass. Unclassified blocks need target/layout.
+    if (inspected_staging) plan.image = staged_image;
+    else if (!Image::inspect(input.reader(), plan.image, options, input.scratch, SOURCE_CHUNK)) {
+        portENTER_CRITICAL(&status_mux);
+        published.image = plan.image;
+        ++published.revision;
+        portEXIT_CRITICAL(&status_mux);
+        return fail("image_inspection_failed: %u", unsigned(plan.image.status));
+    }
+    if (selected == Image::Block::Unknown) selected = plan.image.target;
+    const bool has_blx = shape == Image::Block::FULL || shape == Image::Block::BLX;
+    const bool warnings = !plan.image.crc_ok() ||
+        (has_blx && !plan.image.bid_matches) ||
+        plan.image.integrity_patch == Image::IntegrityPatch::Unsafe ||
+        plan.image.integrity_patch == Image::IntegrityPatch::Partial;
+
+    // Publish factual inspection even when explicit warning confirmation is needed.
+    portENTER_CRITICAL(&status_mux);
+    published.image = plan.image;
+    snprintf(published.device_bid, sizeof(published.device_bid), "%s", plan.bid);
+    ++published.revision;
+    portEXIT_CRITICAL(&status_mux);
+    if (warnings && !work.request.force_blx) return fail("image_warnings_require_force");
+
+    if (selected == Image::Block::FULL) {
+        if (work.request.flash_blx) plan.blocks[plan.count++] = *Image::range(*plan.profile, Image::Block::BLX);
+        plan.blocks[plan.count++] = *Image::range(*plan.profile, Image::Block::CMX);
+    } else {
+        const auto *block = Image::range(*plan.profile, selected);
+        if (!block || (!full && input.size != block->size)) return fail("invalid_selected_region");
+        plan.blocks[plan.count++] = *block;
+    }
+    size_t total = 0;
+    for (size_t i = 0; i < plan.count; ++i) {
+        plan.offsets[i] = full ? plan.blocks[i].image_offset : 0;
+        if (plan.offsets[i] > input.size || plan.blocks[i].size > input.size - plan.offsets[i])
+            return fail("selected_region_out_of_bounds");
+        if (plan.blocks[i].block == Image::Block::BLX && !input.blx)
+            return fail("blx_not_preloaded");
+        total += plan.blocks[i].size;
+    }
+    if (cancelled()) return false;
+    portENTER_CRITICAL(&status_mux);
+    published.prepared = true;
+    published.total = total;
+    snprintf(published.block, sizeof(published.block), "%s", Image::block_name(selected));
+    ++published.revision;
+    portEXIT_CRITICAL(&status_mux);
+    return true;
+}
+
+// Existing raw UART framing is used only after exclusive stream suspension.
+bool send_raw_cmd(const char *cmd, char *resp, uint16_t capacity, uint16_t timeout_ms = 2000) {
     uint8_t frame[QFRAME_MAX_RAW];
-    int frame_len = qframe_build_cmd(cmd, frame, sizeof(frame));
-    if (frame_len < 0) return false;
-
+    const int length = qframe_build_cmd(cmd, frame, sizeof(frame));
+    if (length <= 0) return false;
     Arbiter::clear_rx_frames();
-    Arbiter::write_raw(frame, frame_len);
-    if (!timeout_ms) return true;  // Reset commands need TX completion, not ACK.
-
-    qframe_t rx;
-    uint32_t started = millis();
-    while (true) {
-        uint32_t elapsed = millis() - started;
-        if (elapsed >= timeout_ms) break;
-        uint16_t remaining = timeout_ms - elapsed;
-        if (!Arbiter::wait_frame(&rx, remaining)) break;
-        if ((rx.type != QFRAME_TYPE_R && rx.type != QFRAME_TYPE_E) ||
-            !qframe_response_matches(frame, frame_len, rx)) continue;
-        if (resp && resp_size > 0) {
-            uint16_t copy = min((uint16_t)rx.payload_len, (uint16_t)(resp_size - 1));
-            memcpy(resp, rx.payload, copy);
-            resp[copy] = '\0';
+    Arbiter::write_raw(frame, length);
+    if (!timeout_ms) return true;
+    qframe_t reply;
+    const uint32_t started = millis();
+    while (millis() - started < timeout_ms) {
+        const uint16_t remaining = timeout_ms - (millis() - started);
+        if (!Arbiter::wait_frame(&reply, remaining)) break;
+        if ((reply.type != QFRAME_TYPE_R && reply.type != QFRAME_TYPE_E) ||
+            !qframe_response_matches(frame, length, reply)) continue;
+        if (resp && capacity) {
+            const size_t count = min(size_t(reply.payload_len), size_t(capacity - 1));
+            memcpy(resp, reply.payload, count);
+            resp[count] = 0;
         }
-        return (rx.type == QFRAME_TYPE_R);
+        return reply.type == QFRAME_TYPE_R;
     }
     return false;
 }
 
-
-static bool send_and_check(const char *cmd, char *resp, uint16_t resp_size,
-                           uint16_t timeout_ms = 3000) {
-    uint16_t len = resp_size;
-    return Arbiter::send_cmd(cmd, CMD_SRC_OTA, CMD_PRIO_CRITICAL,
-                              resp, &len, timeout_ms);
-}
-
-
-static bool check_bid(const esp_partition_t *part, size_t blx_partition_offset, bool force) {
-    if (force) return true;
-
-    strncpy(flash_phase, "BID check", sizeof(flash_phase));
-
-    char img_bid[32] = {};
-    esp_partition_read(part, blx_partition_offset + BID_OFFSET_SX577,
-                       img_bid, sizeof(img_bid) - 1);
-
-    char dev_bid[32] = {};
-    if (!send_and_check("G S #BID", dev_bid, sizeof(dev_bid))) {
-        snprintf(flash_error, sizeof(flash_error), "Failed to read device BID");
-        return false;
-    }
-
-    const char *dev_bid_str = qframe_response_value(dev_bid);
-    if (!dev_bid_str) dev_bid_str = dev_bid;
-
-    if (strncmp(img_bid, dev_bid_str, 20) != 0) {
-        snprintf(flash_error, sizeof(flash_error),
-                 "BID mismatch: image=%.20s device=%.20s", img_bid, dev_bid_str);
-        return false;
-    }
-    Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] BID check passed\n");
+bool raw_text(const char *command, char *out, size_t capacity, uint16_t timeout = 1000) {
+    char response[128] = {};
+    if (!send_raw_cmd(command, response, sizeof(response), timeout)) return false;
+    const char *value = qframe_response_value(response);
+    if (!value || !*value || strlen(value) >= capacity) return false;
+    snprintf(out, capacity, "%s", value);
     return true;
 }
 
-
-static bool negotiate_baud_460800() {
-    uint8_t bdd_frame[64];
-    int bdd_len = qframe_build_cmd("P S #BDD 0002", bdd_frame, sizeof(bdd_frame));
-    if (bdd_len <= 0) return false;
-    Arbiter::clear_rx_frames();
-    Arbiter::write_raw(bdd_frame, bdd_len);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    qframe_t rx;
-    Arbiter::wait_frame(&rx, 500);
-    Arbiter::set_baud(460800);
-    Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Baud set to %u\n", Arbiter::get_baud());
+bool raw_hex(const char *command, uint32_t &out, uint16_t timeout = 1000) {
+    char value[16];
+    if (!raw_text(command, value, sizeof(value), timeout)) return false;
+    char *end = nullptr;
+    const unsigned long parsed = strtoul(value, &end, 16);
+    if (!end || end == value || *end || parsed > UINT32_MAX) return false;
+    out = parsed;
     return true;
 }
 
-static bool enter_bootloader(bool send_bll = true) {
-    if (flash_cancel) return false;
-    char resp[48] = {};
-    strncpy(flash_phase, "Enter bootloader", sizeof(flash_phase));
-    Log::logf(CAT_OTA, LOG_INFO, "[RESMED] Entering bootloader (bll=%s)...\n", send_bll ? "yes" : "no");
-
-    if (send_bll) {
-        // Check if already in bootloader
-        if (send_raw_cmd("G S #BLS", resp, sizeof(resp), 300)) {
-            const char *bv = qframe_response_value(resp);
-            if (bv && strtol(bv, nullptr, 16) >= 1) {
-                Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Already in bootloader\n");
-                return true;
-            }
-        }
-        Log::logf(CAT_OTA, LOG_INFO, "[RESMED] Triggering reboot...\n");
-        if (flash_cancel) return false;
-        if (!send_raw_cmd("P S #BLL 0001", nullptr, 0, 0)) return false;
-        // write_raw flushes TX at the old baud; reset starts at 57600.
-        Arbiter::set_baud(57600);
-    }
-
-
-    int bls0_count = 0;
-    for (int i = 0; i < 100 && !flash_cancel; i++) {
-        memset(resp, 0, sizeof(resp));
-        bool got = send_raw_cmd("G S #BLS", resp, sizeof(resp), 100);
-        if (got) {
-            const char *bv = qframe_response_value(resp);
-            if (bv) {
-                int bls = (int)strtol(bv, nullptr, 16);
-                if (bls >= 1) {
-                    Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] In bootloader (BLS=%d) after %d polls\n", bls, i);
-                    return true;
-                }
-                // BLS=0: app is running; send BLL to reboot into bootloader
-                bls0_count++;
-                Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] BLS poll %d: app running (BLS=0)\n", i);
-                if (bls0_count >= 3) {
-                    if (flash_cancel) return false;
-                    Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Sending BLL...\n");
-                    if (!send_raw_cmd("P S #BLL 0001", nullptr, 0, 0)) return false;
-                    Arbiter::set_baud(57600);
-                    bls0_count = 0;
-                }
-            }
-        } else {
-            // No response; device resetting? keep polling fast
-            bls0_count = 0;
-            if (i < 3 || i % 20 == 0) Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] BLS poll %d: no response\n", i);
-        }
+bool enter_bootloader() {
+    phase("Enter bootloader");
+    uint32_t state = 0;
+    if (cancelled()) return false;
+    if (raw_hex("G S #BLS", state, 300) && (state == 1 || state == 2)) return true;
+    if (!send_raw_cmd("P S #BLL 0001", nullptr, 0, 0)) return fail("bootloader_entry_failed");
+    Arbiter::set_baud(57600);
+    for (unsigned attempt = 0; attempt < 100 && !cancelled(); ++attempt) {
+        if (raw_hex("G S #BLS", state, 100) && (state == 1 || state == 2)) return true;
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-
-    snprintf(flash_error, sizeof(flash_error), "Failed to enter bootloader");
-    return false;
+    return cancelled() ? false : fail("bootloader_entry_timeout");
 }
 
-static bool wait_for_erase(uint32_t timeout_ms) {
-    uint32_t t0 = millis();
-    int p_count = 0;
-
-    while (millis() - t0 < timeout_ms && !flash_cancel) {
-        qframe_t rx;
-        if (Arbiter::wait_frame(&rx, 500)) {
-            if (rx.type == QFRAME_TYPE_P) {
-                p_count++;
-            } else if (rx.type == QFRAME_TYPE_R) {
-                Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Erase done (%d ACKs)\n", p_count);
-                return true;
-            } else if (rx.type == QFRAME_TYPE_E) {
-                char err[32] = {};
-                memcpy(err, rx.payload, min((int)rx.payload_len, 31));
-                snprintf(flash_error, sizeof(flash_error), "Erase error: %s", err);
-                return false;
-            }
-        }
-    }
-    snprintf(flash_error, sizeof(flash_error), "Erase timeout (%d ACKs received)", p_count);
-    return false;
-}
-
-
-static bool flash_one_block(const esp_partition_t *part, size_t part_offset,
-                            const block_info_t *block, size_t data_size,
-                            bool send_completion = true) {
-    // Trim trailing 0xFF
-    size_t trimmed_size = data_size;
-    {
-        uint8_t tail[256];
-        while (trimmed_size > 0) {
-            size_t check_len = min(trimmed_size, sizeof(tail));
-            size_t check_off = trimmed_size - check_len;
-            esp_partition_read(part, part_offset + check_off, tail, check_len);
-            bool all_ff = true;
-            for (int i = check_len - 1; i >= 0; i--) {
-                if (tail[i] != 0xFF) {
-                    trimmed_size = check_off + i + 1;
-                    all_ff = false;
-                    break;
-                }
-            }
-            if (!all_ff) break;
-            trimmed_size = check_off;
-        }
-    }
-    // Align to 4 bytes
-    trimmed_size = (trimmed_size + 3) & ~3;
-    if (trimmed_size == 0) {
-        Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] %s data is all 0xFF, skipping\n", block->name);
-        return true;
-    }
-
-    Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] %s: %u bytes (trimmed from %u)\n",
-                 block->name, trimmed_size, data_size);
-
-    // ERASE
-    {
-        char erase_cmd[24];
-        snprintf(erase_cmd, sizeof(erase_cmd), "P F *%s 0000", block->name);
-        snprintf(flash_phase, sizeof(flash_phase), "Erase %s", block->name);
-        Log::logf(CAT_OTA, LOG_INFO, "[RESMED] Erasing %s...\n", block->name);
-
-        uint8_t frame[64];
-        int frame_len = qframe_build_cmd(erase_cmd, frame, sizeof(frame));
-        if (frame_len < 0) {
-            snprintf(flash_error, sizeof(flash_error), "Erase frame build error");
-            return false;
-        }
-        Arbiter::clear_rx_frames();
-        Arbiter::write_raw(frame, frame_len);
-
-        if (!wait_for_erase(30000)) return false;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(300));
-
-    // WRITE
-    snprintf(flash_phase, sizeof(flash_phase), "Flash %s", block->name);
-    Log::logf(CAT_OTA, LOG_INFO, "[RESMED] Writing %u bytes to %s @ %u baud...\n",
-                 trimmed_size, block->name, Arbiter::get_baud());
-
-    uint8_t seq = 0;
-    size_t offset = 0;
-    int frame_count = 0;
-
-    while (offset < trimmed_size && !flash_cancel) {
-        size_t chunk_len = min((size_t)CHUNK_SIZE, trimmed_size - offset);
-
-        uint8_t chunk_buf[CHUNK_SIZE];
-        esp_err_t err = esp_partition_read(part, part_offset + offset,
-                                            chunk_buf, chunk_len);
-        if (err != ESP_OK) {
-            snprintf(flash_error, sizeof(flash_error),
-                     "Read error at %u: %s", offset, esp_err_to_name(err));
-            return false;
-        }
-
-        // Build binary record
-        uint8_t record[CHUNK_SIZE + 8];
-        uint32_t addr = block->base_addr + offset;
-        int rec_len = build_record_03(record, sizeof(record), addr, chunk_buf, chunk_len);
-        if (rec_len < 0) {
-            snprintf(flash_error, sizeof(flash_error), "Record build error at %u", offset);
-            return false;
-        }
-
-        // Build F-frame payload
-        uint8_t f_payload[CHUNK_SIZE + 16];
-        int f_len = build_f_payload(f_payload, sizeof(f_payload),
-                                     block->name, seq, record, rec_len, false);
-        if (f_len < 0) {
-            snprintf(flash_error, sizeof(flash_error), "F-payload build error");
-            return false;
-        }
-
-        // Build and send Q-frame type 'f'
-        uint8_t frame[QFRAME_MAX_RAW];
-        int frame_len = qframe_build('f', f_payload, f_len, frame, sizeof(frame));
-        if (frame_len < 0) {
-            snprintf(flash_error, sizeof(flash_error), "F-frame build error");
-            return false;
-        }
-
-        Arbiter::write_raw(frame, frame_len);
-        frame_count++;
-        offset += chunk_len;
-        flash_sent += chunk_len;
-        seq = (seq + 1) & 0xFF;
-
-        // Drain responses
-        if (frame_count % 20 == 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            qframe_t rx;
-            while (Arbiter::wait_frame(&rx, 10)) {
-                if (rx.type == QFRAME_TYPE_E) {
-                    char err_str[32] = {};
-                    memcpy(err_str, rx.payload, min((int)rx.payload_len, 31));
-                    snprintf(flash_error, sizeof(flash_error),
-                             "Flash error at %s+0x%X: %s", block->name, offset, err_str);
-                    return false;
-                }
-            }
-        }
-    }
-
-    if (flash_cancel) return false;
-
-    if (send_completion) {
-        // Completion frame
-        snprintf(flash_phase, sizeof(flash_phase), "Complete %s", block->name);
-        Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Sending completion frame for %s (%d frames sent)...\n",
-                     block->name, frame_count);
-
-        {
-            uint8_t f_payload[8];
-            int f_len = build_f_payload(f_payload, sizeof(f_payload),
-                                         block->name, seq, nullptr, 0, true);
-            uint8_t frame[64];
-            int frame_len = qframe_build('f', f_payload, f_len, frame, sizeof(frame));
-            if (frame_len > 0) {
-                Arbiter::write_raw(frame, frame_len);
-            }
-        }
-
-        // Device resets after completion - restore baud
-        Arbiter::set_baud(57600);
-    } else {
-        Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] %s data sent (%d frames), skipping completion (chaining)\n",
-                     block->name, frame_count);
-    }
-
-    Log::logf(CAT_OTA, LOG_INFO, "[RESMED] %s flash done\n", block->name);
+bool negotiate_baud() {
+    phase("Baud negotiate");
+    if (!send_raw_cmd("P S #BDD 0002", nullptr, 0, 1000)) return fail("baud_negotiate_failed");
+    Arbiter::set_baud(460800);
     return true;
 }
 
+int build_record_03(uint8_t *out, size_t capacity, uint32_t address,
+                    const uint8_t *data, size_t count) {
+    if (count > UART_CHUNK || capacity < count + 7) return -1;
+    out[0] = 0x03;
+    out[1] = count + 5;
+    out[2] = address >> 24;
+    out[3] = address >> 16;
+    out[4] = address >> 8;
+    out[5] = address;
+    memcpy(out + 6, data, count);
+    out[6 + count] = 0;
+    return count + 7;
+}
 
-static void flash_task(void *param) {
-    flash_params_t *p = (flash_params_t*)param;
-    char resp[48] = {};
-    bool is_full = (strcmp(p->block, "FULL") == 0);
+int build_f_payload(uint8_t *out, size_t capacity, const char *block,
+                    uint8_t sequence, const uint8_t *record, size_t length, bool complete) {
+    if (strlen(block) != 3 || capacity < 5 + (complete ? 0 : length)) return -1;
+    memcpy(out, block, 3);
+    out[3] = complete ? 'F' : 0;
+    out[4] = sequence;
+    if (!complete && length) memcpy(out + 5, record, length);
+    return 5 + (complete ? 0 : length);
+}
 
-    flash_active = true;
-    flash_cancel = false;
-    flash_sent = 0;
-    flash_error[0] = '\0';
-
-    // Calculate total bytes
-    if (is_full) {
-        const block_info_t *cmx = find_block("CMX");
-        size_t cmx_size = min(p->fw_size - 0x4000, (size_t)cmx->max_size);
-        flash_total = cmx_size;
-        if (p->flash_blx) {
-            flash_total += find_block("BLX")->max_size;
-        }
-    } else {
-        flash_total = p->fw_size;
+bool wait_for_erase(const uint8_t *request, size_t length) {
+    const uint32_t started = millis();
+    qframe_t reply;
+    while (millis() - started < 30000) {
+        if (!Arbiter::wait_frame(&reply, 500)) continue;
+        if (!qframe_response_matches(request, length, reply)) continue;
+        if (reply.type == QFRAME_TYPE_R) return true;
+        if (reply.type == QFRAME_TYPE_E) return fail("device_erase_error");
     }
+    return fail("device_erase_timeout");
+}
 
-    const esp_partition_t *part = ResmedOta::get_staging_partition();
-    if (!part) {
-        snprintf(flash_error, sizeof(flash_error), "No staging partition found");
-        goto done;
-    }
-    Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Using partition '%s' (0x%X, %u bytes)\n",
-              part->label, part->address, part->size);
+bool flash_one_block(const Image::Reader &reader, size_t source_offset,
+                     const Image::Range &block, uint8_t *scratch, bool complete) {
+    const char *name = Image::block_name(block.block);
+    char label[32];
+    snprintf(label, sizeof(label), "Erase %s", name);
+    phase(label);
+    if (!begin_programming()) return false;
+    char command[24];
+    snprintf(command, sizeof(command), "P F *%s 0000", name);
+    uint8_t erase[64];
+    const int erase_length = qframe_build_cmd(command, erase, sizeof(erase));
+    if (erase_length <= 0) return fail("erase_frame_failed");
+    Arbiter::clear_rx_frames();
+    Arbiter::write_raw(erase, erase_length);
+    if (!wait_for_erase(erase, erase_length)) return false;
+    vTaskDelay(pdMS_TO_TICKS(300));
 
-    Arbiter::set_state(SYS_OTA_AIRSENSE);
-    strncpy(flash_phase, "Claim UART", sizeof(flash_phase));
-    if (!Arbiter::wait_idle(3000)) {
-        snprintf(flash_error, sizeof(flash_error), "UART busy before OTA");
-        goto cleanup;
-    }
-
-    strncpy(flash_phase, "Suspend streams", sizeof(flash_phase));
-    if (!LiveStream::suspend_for_ota()) {
-        snprintf(flash_error, sizeof(flash_error), "Failed to stop live streams");
-        goto cleanup;
-    }
-
-    // BLX safety check
-    if ((is_full && p->flash_blx) || strcmp(p->block, "BLX") == 0) {
-        if (!check_bid(part, 0, p->force_blx)) goto cleanup;
-    }
-
-    AirSenseState::invalidate_identity();
-    if (!enter_bootloader()) goto cleanup;
-    if (flash_cancel) goto cleanup;
-
-    // Negotiate baud
-    {
-        strncpy(flash_phase, "Baud negotiate", sizeof(flash_phase));
-        Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Negotiating baud 460800...\n");
-        negotiate_baud_460800();
-    }
-
-    if (is_full) {
-        // FULL image: BLX (optional, no completion) -> CMX (with completion)
-        if (p->flash_blx) {
-            const block_info_t *blx = find_block("BLX");
-            // Skip completion frame
-            if (!flash_one_block(part, 0, blx, blx->max_size, false)) goto cleanup;
-
-            // Bootloader enters mode 5 (upgrade) after receiving data.
-            // Without completion frame, mode 5 times out after ~2s and
-            // bootloader reverts to idle at 57600 baud.
-            strncpy(flash_phase, "BLX mode timeout", sizeof(flash_phase));
-            Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Waiting for mode 5 timeout (~2s)...\n");
-            vTaskDelay(pdMS_TO_TICKS(2500));
-            Arbiter::set_baud(57600);
-
-            // Verify still in bootloader
-            char bl_resp[48] = {};
-            if (!send_raw_cmd("G S #BLS", bl_resp, sizeof(bl_resp), 500)) {
-                snprintf(flash_error, sizeof(flash_error),
-                         "Lost bootloader after BLX flash");
-                goto cleanup;
-            }
-            Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Still in bootloader after BLX\n");
-
-            // Re-negotiate baud for CMX
-            {
-                Log::logf(CAT_OTA, LOG_DEBUG, "[RESMED] Re-negotiating baud 460800...\n");
-                negotiate_baud_460800();
-            }
-        }
-
-        const block_info_t *cmx = find_block("CMX");
-        size_t cmx_size = min(p->fw_size - 0x4000, (size_t)cmx->max_size);
-
-        if (!flash_one_block(part, 0x4000, cmx, cmx_size, true)) goto cleanup;
-
-    } else {
-        const block_info_t *block = find_block(p->block);
-        if (!block) {
-            snprintf(flash_error, sizeof(flash_error), "Unknown block: %s", p->block);
-            goto cleanup;
-        }
-        if (p->fw_size > block->max_size) {
-            snprintf(flash_error, sizeof(flash_error), "Firmware %u > %s max %u",
-                     p->fw_size, block->name, block->max_size);
-            goto cleanup;
-        }
-        if (!flash_one_block(part, 0, block, p->fw_size)) goto cleanup;
-    }
-
-    // Wait for device to boot new firmware
-    {
-        strncpy(flash_phase, "Verifying", sizeof(flash_phase));
-        Arbiter::set_baud(57600);
-        bool app_running = false;
-        for (int i = 0; i < 30 && !flash_cancel; i++) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            memset(resp, 0, sizeof(resp));
-            if (send_raw_cmd("G S #BLS", resp, sizeof(resp), 2000)) {
-                const char *bv = qframe_response_value(resp);
-                if (bv) {
-                    int bls = (int)strtol(bv, nullptr, 16);
-                    if (bls == 0) { app_running = true; break; }
+    snprintf(label, sizeof(label), "Flash %s", name);
+    phase(label);
+    uint8_t sequence = 0;
+    unsigned frames = 0;
+    // A source read is 4 KiB, independent of the UART's 250-byte record limit.
+    // Never consult cancellation after erase: especially BLX must finish.
+    for (size_t offset = 0; offset < block.size;) {
+        const size_t count = min(SOURCE_CHUNK, size_t(block.size - offset));
+        if (!reader.read_at(reader.context, source_offset + offset, scratch, count))
+            return fail("source_read_failed: %s+0x%X", name, unsigned(offset));
+        for (size_t pos = 0; pos < count;) {
+            const size_t chunk = min(UART_CHUNK, count - pos);
+            uint8_t record[UART_CHUNK + 7], payload[UART_CHUNK + 16], frame[QFRAME_MAX_RAW];
+            const int record_length = build_record_03(record, sizeof(record),
+                block.flash_start + offset + pos, scratch + pos, chunk);
+            if (record_length <= 0) return fail("record_frame_failed");
+            const int payload_length = build_f_payload(payload, sizeof(payload), name,
+                sequence, record, record_length, false);
+            if (payload_length <= 0) return fail("payload_frame_failed");
+            const int frame_length = qframe_build('f', payload, payload_length, frame, sizeof(frame));
+            if (frame_length <= 0) return fail("data_frame_failed");
+            Arbiter::write_raw(frame, frame_length);
+            pos += chunk;
+            ++sequence;
+            portENTER_CRITICAL(&status_mux);
+            published.sent += chunk;
+            ++published.revision;
+            portEXIT_CRITICAL(&status_mux);
+            if (++frames % 20 == 0) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                qframe_t reply;
+                while (Arbiter::wait_frame(&reply, 10)) {
+                    if (reply.type == QFRAME_TYPE_E) return fail("device_program_error: %s", name);
                 }
             }
         }
-
-        if (app_running) {
-            strncpy(flash_phase, "Complete", sizeof(flash_phase));
-            Log::logf(CAT_OTA, LOG_INFO, "[RESMED] Flash complete, device running\n");
-        } else if (!flash_cancel) {
-            snprintf(flash_error, sizeof(flash_error),
-                     "Device did not return to app after flash");
-        }
+        offset += count;
     }
+    uint32_t error = 0;
+    if (!raw_hex("G S #BLE", error) || (error != 0 && error != 0x700D))
+        return fail("device_program_error: %s %04X", name, unsigned(error));
+    if (complete) {
+        phase("Complete transfer");
+        uint8_t payload[8], frame[64];
+        const int payload_length = build_f_payload(payload, sizeof(payload), name,
+            sequence, nullptr, 0, true);
+        const int length = qframe_build('f', payload, payload_length, frame, sizeof(frame));
+        if (length <= 0) return fail("completion_frame_failed");
+        Arbiter::write_raw(frame, length);
+    }
+    return true;
+}
 
-cleanup:
+bool confirm_install(const Plan &plan) {
+    phase("Verify device");
+    // Completion clears BLE, but does not verify the image. The transfer status
+    // was checked before that marker; require fresh app status/identity here.
+    uint32_t error = 0;
+    Arbiter::set_baud(57600);
+    for (unsigned attempt = 0; attempt < 10; ++attempt) {
+        // Successful bootloader commands restart its ~2s activity timeout.
+        // Leave a real quiet window, including after a clean-status retry.
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        uint32_t state = UINT32_MAX;
+        if (!raw_hex("G S #BLS", state, 1000)) continue;
+        if (state != 0) {
+            if (raw_hex("G S #BLE", error) && error && error != 0x700D)
+                return fail("device_bootloader_error: %04X", unsigned(error));
+            continue;
+        }
+        char bid[32], serial[24], sid[64];
+        if (!raw_hex("G S #BLE", error) || error != 0)
+            return fail("device_bootloader_error: %04X", unsigned(error));
+        if (!raw_text("G S #BID", bid, sizeof(bid)) ||
+            !raw_text("G S #SRN", serial, sizeof(serial)) ||
+            !raw_text("G S #SID", sid, sizeof(sid))) continue;
+        // FORCE permits an explicitly selected different BLX; it does not
+        // permit a different physical device to satisfy this operation.
+        const char *expected_bid = plan.bid;
+        bool wrote_blx = false;
+        for (size_t i = 0; i < plan.count; ++i)
+            wrote_blx |= plan.blocks[i].block == Image::Block::BLX;
+        if (wrote_blx && plan.image.bid_present) expected_bid = plan.image.bid;
+        if (strcmp(bid, expected_bid) || strcmp(serial, plan.serial))
+            return fail("device_identity_changed");
+        return true;
+    }
+    return fail("device_did_not_return_to_application");
+}
+
+bool run_install() {
+    Input input;
+    Plan plan;
+    if (!open_input(input) || cancelled() || !prepare(input, plan)) return false;
+    if (cancelled()) return false;
+    // Preparing has no irreversible side effects. Claim raw UART only now.
+    if (!AirSenseState::system_idle()) return fail("device_not_idle");
+    Arbiter::set_state(SYS_OTA_AIRSENSE);
+    bool success = false;
+    do {
+        // The SD owner must explicitly support this lease in OTA mode. Never
+        // discover an incompatible/revoked lease after erasing the target.
+        if (!input.partition && !input.session.valid()) { fail("sd_ota_lease_unavailable"); break; }
+        phase("Claim UART");
+        if (!Arbiter::wait_idle(3000)) { fail("uart_busy"); break; }
+        phase("Suspend streams");
+        if (!LiveStream::suspend_for_ota()) { fail("stream_suspend_failed"); break; }
+        char current_bid[32], current_serial[24];
+        if (!raw_text("G S #BID", current_bid, sizeof(current_bid)) ||
+            !raw_text("G S #SRN", current_serial, sizeof(current_serial)) ||
+            strcmp(current_bid, plan.bid) || strcmp(current_serial, plan.serial)) {
+            fail("device_identity_changed"); break;
+        }
+        if (cancelled()) break;
+        CustomSettings::invalidate("ResMed OTA");
+        AirSenseState::invalidate_identity();
+        if (!enter_bootloader() || !negotiate_baud()) break;
+        bool programmed = true;
+        for (size_t i = 0; i < plan.count; ++i) {
+            if (!flash_one_block(input.reader(), plan.offsets[i], plan.blocks[i],
+                                  input.scratch, i + 1 == plan.count)) {
+                programmed = false; break;
+            }
+            if (i + 1 < plan.count) {
+                phase("BLX mode timeout");
+                vTaskDelay(pdMS_TO_TICKS(2500));
+                Arbiter::set_baud(57600);
+                uint32_t state = 0;
+                if (!raw_hex("G S #BLS", state) || (state != 1 && state != 2)) {
+                    fail("lost_bootloader_after_blx"); programmed = false; break;
+                }
+                if (!negotiate_baud()) { programmed = false; break; }
+            }
+        }
+        if (programmed) success = confirm_install(plan);
+    } while (false);
     Arbiter::set_baud(57600);
     Arbiter::set_state(SYS_IDLE);
-    if (flash_cancel && flash_error[0] == '\0') {
-        strncpy(flash_error, "Cancelled by user", sizeof(flash_error));
-        strncpy(flash_phase, "Cancelled", sizeof(flash_phase));
-    }
+    AirSenseState::request_refresh();
+    return success;
+}
 
-done:
-    if (flash_error[0] != '\0') {
-        strncpy(flash_phase, "Error", sizeof(flash_phase));
-        Log::logf(CAT_OTA, LOG_ERROR, "[RESMED] Error: %s\n", flash_error);
-    }
-    flash_active = false;
-    flash_task_handle = nullptr;
+void finish(bool success) {
+    portENTER_CRITICAL(&status_mux);
+    published.active = false;
+    published.cancel_allowed = false;
+    published.result = success ? Result::Succeeded :
+        (!programming && cancel_requested.load() && !published.error[0])
+        ? Result::Cancelled : Result::Failed;
+    if (published.result == Result::Failed && !published.error[0])
+        snprintf(published.error, sizeof(published.error), "install_failed");
+    snprintf(published.phase, sizeof(published.phase), "%s", success ? "Complete" :
+        published.result == Result::Cancelled ? "Cancelled" : "Error");
+    ++published.revision;
+    active.store(false);
+    portEXIT_CRITICAL(&status_mux);
+}
+
+void flash_task(void *) {
+    const bool success = run_install();  // All C++ I/O/buffer owners unwind here.
+    if (work.staged.token) ResmedFirmwareUpload::release_source(work.staged.token);
+    finish(success);
+    // No timer infers our lifetime; this is the only normal reservation release.
+    OtaManager::end_resmed_flash();
     vTaskDelete(nullptr);
 }
 
+}  // namespace
 
+bool start_install(const InstallRequest &request, const char **error) {
+    if (error) *error = nullptr;
+    const auto reject = [error](const char *reason) {
+        if (error) *error = reason;
+        return false;
+    };
+    if (!memchr(request.path, 0, sizeof(request.path)) ||
+        !memchr(request.block, 0, sizeof(request.block)) ||
+        (bool(request.upload_id) == bool(request.path[0]))) return reject("invalid_install_request");
+    if (request.block[0] && Image::parse_block(request.block) == Image::Block::Unknown)
+        return reject("unknown_block");
+    if (request.path[0] && !ResmedFirmwareRepository::valid_path(request.path))
+        return reject("invalid_repository_path");
 
-const char* ResmedOta::detect_block(size_t fw_size) {
-    if (fw_size == 0) return nullptr;
-    if (fw_size <= 0x4000)   return "BLX";
-    if (fw_size <= 0x3C000)  return "CCX";
-    if (fw_size <= 0xC0000)  return "CDX";
-    if (fw_size <= 0xFC000)  return "CMX";
-    if (fw_size <= 0x100000) return "FULL";
+    Work next;
+    next.request = request;
+    next.source = Source::Repository;
+    bool claimed = false;
+    if (request.upload_id) {
+        ResmedFirmwareUpload::Status upload;
+        if (!ResmedFirmwareUpload::copy_status(request.upload_id, upload) ||
+            upload.state != ResmedFirmwareUpload::State::Ready || !upload.source_ready)
+            return reject("upload_not_ready");
+        if (upload.destination == ResmedFirmwareUpload::Destination::Staging) {
+            if (!ResmedFirmwareUpload::claim_source(request.upload_id, next.staged, error)) return false;
+            next.source = Source::Staging;
+            claimed = true;
+        } else {
+            if (!ResmedFirmwareRepository::valid_path(upload.path)) return reject("invalid_repository_path");
+            snprintf(next.request.path, sizeof(next.request.path), "%s", upload.path);
+        }
+    }
+    if (!claimed && !OtaManager::begin_resmed_flash(error)) return false;
+
+    // Reservation, params and visible activity are initialized before scheduling.
+    work = next;
+    portENTER_CRITICAL(&status_mux);
+    const uint32_t previous_revision = published.revision;
+    uint32_t id = published.id + 1;
+    if (!id) ++id;
+    published = {};
+    published.id = id;
+    published.revision = previous_revision + 1;
+    published.active = true;
+    published.result = Result::Running;
+    published.source = next.source;
+    published.upload_id = request.upload_id;
+    snprintf(published.source_path, sizeof(published.source_path), "%s", next.request.path);
+    snprintf(published.block, sizeof(published.block), "%s", request.block);
+    snprintf(published.phase, sizeof(published.phase), "Preparing");
+    published.cancel_allowed = true;
+    cancel_requested.store(false);
+    programming = false;
+    active.store(true);
+    portEXIT_CRITICAL(&status_mux);
+    if (xTaskCreatePinnedToCore(flash_task, "resmed_ota", FLASH_TASK_STACK,
+                                nullptr, 3, nullptr, 1) != pdPASS) {
+        fail("worker_create_failed");
+        if (next.staged.token) ResmedFirmwareUpload::release_source(next.staged.token);
+        finish(false);
+        OtaManager::end_resmed_flash();
+        return reject("worker_create_failed");
+    }
+    return true;
+}
+
+void cancel() {
+    portENTER_CRITICAL(&status_mux);
+    if (published.active && !cancel_requested.exchange(true)) {
+        published.cancellation_requested = true;
+        ++published.revision;
+    }
+    portEXIT_CRITICAL(&status_mux);
+}
+
+bool is_active() { return active.load(); }
+
+void poll() {
+    // Admission facts are cached-owner reads, never UART or filesystem work.
+    ResmedFirmwareUpload::Status upload;
+    ResmedFirmwareUpload::get_status(upload);
+    const bool staged = upload.state == ResmedFirmwareUpload::State::Ready &&
+        upload.destination == ResmedFirmwareUpload::Destination::Staging && upload.source_ready;
+    const char *blocked = OtaManager::resmed_flash_blocked(staged);
+    OtaManager::Status ota;
+    const bool can_upload = OtaManager::get_status(ota) && !ota.upload_blocked;
+    portENTER_CRITICAL(&status_mux);
+    const bool allowed = !published.active && !blocked;
+    const bool upload_allowed = !published.active && can_upload;
+    const char *reason = published.active ? "resmed_ota_active" : blocked ? blocked : "";
+    if (published.install_allowed != allowed || published.upload_allowed != upload_allowed ||
+        strcmp(published.blocked, reason)) {
+        published.install_allowed = allowed;
+        published.upload_allowed = upload_allowed;
+        snprintf(published.blocked, sizeof(published.blocked), "%s", reason);
+        ++published.revision;
+    }
+    portEXIT_CRITICAL(&status_mux);
+}
+
+void get_status(Status &out) {
+    portENTER_CRITICAL(&status_mux);
+    out = published;
+    portEXIT_CRITICAL(&status_mux);
+}
+
+uint32_t revision() {
+    portENTER_CRITICAL(&status_mux);
+    const uint32_t value = published.revision;
+    portEXIT_CRITICAL(&status_mux);
+    return value;
+}
+
+const esp_partition_t *get_staging_partition() {
+    const auto *partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "resmed");
+    return partition ? partition : esp_ota_get_next_update_partition(esp_ota_get_running_partition());
+}
+
+fw_verify_result_t verify_image(const esp_partition_t *partition, size_t size) {
+    fw_verify_result_t result = {};
+    if (!partition || size > partition->size) return result;
+    Input input;
+    input.partition = partition;
+    input.size = size;
+    Image::Result image;
+    Image::inspect(input.reader(), image);
+    snprintf(result.bid, sizeof(result.bid), "%s", image.bid);
+    result.bid_ok = image.bid_supported;
+    for (size_t i = 0; i < image.block_count; ++i) {
+        const auto &check = image.blocks[i];
+        if (check.range.block == Image::Block::BLX) { result.has_blx = true; result.blx_crc_ok = check.crc_ok; }
+        if (check.range.block == Image::Block::CCX) { result.has_ccx = true; result.ccx_crc_ok = check.crc_ok; }
+        if (check.range.block == Image::Block::CDX) { result.has_cdx = true; result.cdx_crc_ok = check.crc_ok; }
+    }
+    result.blx_patch = image.integrity_patch == Image::IntegrityPatch::Unsafe ? BLX_PATCH_A_DANGEROUS :
+        image.integrity_patch == Image::IntegrityPatch::Safe ? BLX_PATCH_B_SAFE : BLX_PATCH_NONE;
+    return result;
+}
+
+const char *detect_block(size_t size) {
+    if (size == Image::FULL_SIZE) return "FULL";
+    if (size == BLX_BYTES) return "BLX";
     return nullptr;
 }
 
-void ResmedOta::start_flash(const char *block, size_t fw_size,
-                            bool flash_blx, bool force_blx) {
-    if (flash_active) return;
-
-    if (!block || block[0] == '\0') {
-        block = detect_block(fw_size);
-        if (!block) {
-            strncpy(flash_error, "Cannot detect block for this file size", sizeof(flash_error));
-            return;
-        }
+bool start_flash(const char *block, size_t size, bool flash_blx, bool force_blx, const char **error) {
+    ResmedFirmwareUpload::Status upload;
+    ResmedFirmwareUpload::get_status(upload);
+    if (!upload.id || size != upload.size) {
+        if (error) *error = "upload_not_ready";
+        return false;
     }
-
-    CustomSettings::invalidate("ResMed OTA");
-
-    strncpy(flash_params.block, block, sizeof(flash_params.block) - 1);
-    flash_params.block[sizeof(flash_params.block) - 1] = '\0';
-    flash_params.fw_size = fw_size;
-    flash_params.flash_blx = flash_blx;
-    flash_params.force_blx = force_blx;
-
-    xTaskCreatePinnedToCore(flash_task, "resmed_ota", FLASH_TASK_STACK,
-                            &flash_params, FLASH_TASK_PRIO, &flash_task_handle, 1);
+    InstallRequest request;
+    request.upload_id = upload.id;
+    snprintf(request.block, sizeof(request.block), "%s", block ? block : "");
+    request.flash_blx = flash_blx;
+    request.force_blx = force_blx;
+    return start_install(request, error);
 }
 
-void ResmedOta::cancel()            { flash_cancel = true; }
-bool ResmedOta::is_active()         { return flash_active; }
-const char* ResmedOta::get_phase()  { return flash_phase; }
-size_t ResmedOta::get_sent()        { return flash_sent; }
-size_t ResmedOta::get_total()       { return flash_total; }
-const char* ResmedOta::last_error() { return flash_error; }
+// Compatibility accessors for callers transitioning to one copied Status.
+const char *get_phase() {
+    static thread_local char value[32];
+    portENTER_CRITICAL(&status_mux);
+    memcpy(value, published.phase, sizeof(value));
+    portEXIT_CRITICAL(&status_mux);
+    return value;
+}
+const char *last_error() {
+    static thread_local char value[128];
+    portENTER_CRITICAL(&status_mux);
+    memcpy(value, published.error, sizeof(value));
+    portEXIT_CRITICAL(&status_mux);
+    return value;
+}
+size_t get_sent() {
+    portENTER_CRITICAL(&status_mux);
+    const size_t value = published.sent;
+    portEXIT_CRITICAL(&status_mux);
+    return value;
+}
+size_t get_total() {
+    portENTER_CRITICAL(&status_mux);
+    const size_t value = published.total;
+    portEXIT_CRITICAL(&status_mux);
+    return value;
+}
+
+}  // namespace ResmedOta

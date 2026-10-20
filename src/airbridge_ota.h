@@ -62,7 +62,12 @@ namespace OtaManager {
     void abort_image();
     const OtaImage::Status &image_status();
 
-    bool begin_resmed_flash();
+    // Only the ResMed owner/claimed upload source may use these. Promotion
+    // transfers OP_MANUAL atomically; no gap in the update/USB reservation.
+    const char *resmed_flash_blocked(bool from_manual_upload = false);
+    bool begin_resmed_flash(const char **error = nullptr,
+                            bool from_manual_upload = false);
+    void end_resmed_flash();
     void cancel_resmed_flash_claim();
     bool busy();
 }

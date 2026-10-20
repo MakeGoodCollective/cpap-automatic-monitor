@@ -54,8 +54,6 @@ struct RuntimeStatus {
     uint32_t last_check_ms = 0;
     uint32_t next_check_ms = 0;
     uint32_t reboot_at_ms = 0;
-    uint32_t resmed_claimed_at_ms = 0;
-    bool resmed_started = false;
     bool manual_image_started = false;
     Operation operation = OP_NONE;
     char update_version[OtaRelease::VERSION_MAX] = {};
@@ -483,26 +481,12 @@ void handle() {
     const char *blocked = "ota_unavailable";
     if (lock(pdMS_TO_TICKS(10))) {
         initialized = runtime.initialized;
-        reboot = runtime.reboot_pending &&
+        reboot = runtime.operation == OP_NONE && runtime.reboot_pending &&
                  deadline_due(millis(), runtime.reboot_at_ms);
         if (reboot) prepare = runtime.reboot_prepare;
         auto_check = runtime.enabled && runtime.operation == OP_NONE &&
                      !runtime.reboot_pending &&
                      deadline_due(millis(), runtime.next_check_ms);
-        if (runtime.operation == OP_RESMED) {
-            if (ResmedOta::is_active()) runtime.resmed_started = true;
-            bool release_claim =
-                (runtime.resmed_started && !ResmedOta::is_active()) ||
-                (!runtime.resmed_started &&
-                 millis() - runtime.resmed_claimed_at_ms >= 5000);
-            if (release_claim) {
-                runtime.operation = OP_NONE;
-                if (!runtime.resmed_started)
-                    Log::logf(CAT_OTA, LOG_WARN, "ResMed OTA claim expired before start\n");
-                runtime.resmed_started = false;
-                status_revision.fetch_add(1);
-            }
-        }
         blocked = cached_start_blocked();
         unlock();
     }
@@ -712,24 +696,43 @@ bool finish_image() { return image_writer.finish(); }
 void abort_image() { image_writer.abort(); }
 const OtaImage::Status &image_status() { return image_writer.status(); }
 
-bool begin_resmed_flash() {
+const char *resmed_flash_blocked(bool from_manual_upload) {
+    if (!lock(pdMS_TO_TICKS(20))) return "ota_busy";
+    const char *blocked = nullptr;
+    if (!mutex) blocked = "ota_unavailable";
+    else if (runtime.operation != (from_manual_upload ? OP_MANUAL : OP_NONE) ||
+             runtime.reboot_pending) blocked = "ota_busy";
+    else if (!SdStorage::local_access_allowed()) blocked = "usb_storage_active";
+    else if (!AirSenseState::system_idle()) blocked = "device_not_idle";
+    else if (ResmedOta::is_active()) blocked = "resmed_ota_active";
+    else if (!background_work_idle()) blocked = "background_work_active";
+    unlock();
+    return blocked;
+}
+
+bool begin_resmed_flash(const char **error, bool from_manual_upload) {
+    if (error) *error = "ota_unavailable";
     if (!lock()) return false;
-    const bool allowed = AirSenseState::system_idle() && !manual_start_blocked();
+    const char *blocked = resmed_flash_blocked(from_manual_upload);
+    const bool allowed = !blocked;
     if (allowed) {
         runtime.operation = OP_RESMED;
-        runtime.resmed_claimed_at_ms = millis();
-        runtime.resmed_started = false;
     }
     unlock(allowed);
+    if (error) *error = blocked;
     return allowed;
 }
 
-void cancel_resmed_flash_claim() {
+void end_resmed_flash() {
     if (!lock()) return;
-    bool cancelled = runtime.operation == OP_RESMED && !runtime.resmed_started;
-    if (cancelled)
-        runtime.operation = OP_NONE;
-    unlock(cancelled);
+    const bool ended = runtime.operation == OP_RESMED;
+    if (ended) runtime.operation = OP_NONE;
+    unlock(ended);
+}
+
+void cancel_resmed_flash_claim() {
+    // Compatibility for old admission callers; an active worker owns cleanup.
+    if (!ResmedOta::is_active()) end_resmed_flash();
 }
 
 bool busy() {
