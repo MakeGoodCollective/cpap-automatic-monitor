@@ -40,6 +40,7 @@
 #include <new>
 #include <errno.h>
 #include <utility>
+#include <memory>
 #include <mutex>
 
 static AsyncWebServer *http = nullptr;
@@ -548,11 +549,16 @@ static bool refreshStatusCacheIfNeeded() {
         now - status_cache_built_at < STATUS_CACHE_TTL_MS)
         return true;
 
-    char body[STATUS_JSON_MAX];
-    size_t len = buildStatusJson(body, sizeof(body));
+    // Keep bounded serialization scratch off the AsyncTCP task stack.
+    std::unique_ptr<char, decltype(&aircannect::Memory::free)> body(
+        static_cast<char *>(aircannect::Memory::alloc_large(STATUS_JSON_MAX)),
+        aircannect::Memory::free);
+    if (!body) return false;
+    size_t len = buildStatusJson(body.get(), STATUS_JSON_MAX);
     if (len == 0) return false;
 
-    status_cache = body;
+    if (!status_cache.reserve(len)) return false;
+    status_cache = body.get();
     status_cache_built_at = millis();
     status_cache_config_revision = revision;
     return true;
