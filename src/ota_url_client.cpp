@@ -24,6 +24,7 @@ static constexpr int REDIRECT_LIMIT = 5;
 
 struct StreamContext {
     size_t expected_size = 0;
+    size_t *response_size = nullptr;
     size_t offset = 0;
     bool size_checked = false;
     WriteCallback write_callback = nullptr;
@@ -117,6 +118,7 @@ esp_err_t stream_event(esp_http_client_event_t *event) {
     if (!event || !event->user_data || event->event_id != HTTP_EVENT_ON_DATA ||
         event->data_len <= 0) return ESP_OK;
     StreamContext &ctx = *(StreamContext *)event->user_data;
+    if (ctx.error->code[0]) return ESP_FAIL;
     if (esp_http_client_get_status_code(event->client) != 200) return ESP_OK;
     if (!allowed(ctx.continue_callback, ctx.callback_ctx)) {
         set_error(*ctx.error, "url_cancelled");
@@ -124,10 +126,22 @@ esp_err_t stream_event(esp_http_client_event_t *event) {
     }
     if (!ctx.size_checked) {
         int64_t length = esp_http_client_get_content_length(event->client);
+        if (!ctx.expected_size) {
+            if (length <= 0) {
+                set_error(*ctx.error, "url_content_length_missing");
+                return ESP_FAIL;
+            }
+            if (uint64_t(length) > SIZE_MAX) {
+                set_error(*ctx.error, "url_response_too_large");
+                return ESP_FAIL;
+            }
+            ctx.expected_size = size_t(length);
+        }
         if (length > 0 && (uint64_t)length != ctx.expected_size) {
             set_error(*ctx.error, "url_size_changed");
             return ESP_FAIL;
         }
+        if (ctx.response_size) *ctx.response_size = ctx.expected_size;
         ctx.size_checked = true;
     }
 
@@ -200,15 +214,17 @@ bool supported(const char *url) {
 
 bool stream(const char *url, size_t expected_size,
             WriteCallback write_callback, ContinueCallback continue_callback,
-            void *callback_ctx, Error &error) {
+            void *callback_ctx, Error &error, size_t *response_size) {
     error = {};
-    if (!supported(url) || expected_size == 0 || !write_callback) {
+    if (response_size) *response_size = 0;
+    if (!supported(url) || !write_callback) {
         set_error(error, "url_invalid_request");
         return false;
     }
 
     StreamContext context;
     context.expected_size = expected_size;
+    context.response_size = response_size;
     context.write_callback = write_callback;
     context.continue_callback = continue_callback;
     context.callback_ctx = callback_ctx;
@@ -225,9 +241,11 @@ bool stream(const char *url, size_t expected_size,
     error.http_status = status;
     if (result != ESP_OK) capture_transport_error(client, result, error);
     else if (status != 200) snprintf(error.code, sizeof(error.code), "url_http_%d", status);
-    else if (context.offset != expected_size) set_error(error, "url_incomplete_response");
+    else if (!context.size_checked || context.offset != context.expected_size)
+        set_error(error, "url_incomplete_response");
     esp_http_client_cleanup(client);
-    return result == ESP_OK && status == 200 && context.offset == expected_size;
+    return result == ESP_OK && status == 200 && !error.code[0] &&
+        context.size_checked && context.offset == context.expected_size;
 }
 
 bool fetch(const char *url, uint8_t *&buffer, size_t capacity, size_t &length,

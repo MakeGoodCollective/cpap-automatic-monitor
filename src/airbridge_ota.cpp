@@ -276,7 +276,7 @@ void abort_install(const char *error) {
         unlock(true);
     }
     Arbiter::set_state(SYS_IDLE);
-    Log::logf(CAT_OTA, LOG_ERROR, "Release install failed: %s\n",
+    Log::logf(CAT_OTA, LOG_ERROR, "Firmware install failed: %s\n",
               error ? error : "install_failed");
 }
 
@@ -288,8 +288,10 @@ bool install_continue(void *) {
     return allowed;
 }
 
-bool install_write(void *, size_t offset, const uint8_t *data, size_t len) {
+bool install_write(void *context, size_t offset, const uint8_t *data, size_t len) {
     if (!lock(pdMS_TO_TICKS(100))) return false;
+    if (runtime.operation == OP_INSTALL && !runtime.total_size && context)
+        runtime.total_size = *static_cast<size_t *>(context);
     bool expected = runtime.operation == OP_INSTALL && offset == runtime.bytes &&
                     runtime.bytes <= runtime.total_size &&
                     len <= runtime.total_size - runtime.bytes;
@@ -308,8 +310,13 @@ bool install_write(void *, size_t offset, const uint8_t *data, size_t len) {
 
 void install_task(void *) {
     OtaRelease::Artifact artifact;
+    bool direct_url = false;
     if (lock()) {
-        artifact = available_artifact;
+        direct_url = work_url[0];
+        if (direct_url) {
+            artifact = {};
+            snprintf(artifact.url, sizeof(artifact.url), "%s", work_url);
+        } else artifact = available_artifact;
         unlock();
     }
 
@@ -322,6 +329,7 @@ void install_task(void *) {
     }
 
     if (!begin_image(artifact.size, artifact.image_size,
+                     direct_url ? OtaImage::Encoding::Auto :
                      artifact.zlib ? OtaImage::Encoding::Zlib : OtaImage::Encoding::Plain)) {
         abort_install(image_status().error);
         vTaskDelete(nullptr);
@@ -329,8 +337,9 @@ void install_task(void *) {
     }
 
     OtaUrl::Error transport_error;
+    size_t response_size = artifact.size;
     if (!OtaUrl::stream(artifact.url, artifact.size, install_write,
-                        install_continue, nullptr, transport_error)) {
+                        install_continue, &response_size, transport_error, &response_size)) {
         abort_install(image_status().error ? image_status().error :
                       transport_error.code[0] ? transport_error.code
                                               : "firmware_fetch_failed");
@@ -355,8 +364,7 @@ void install_task(void *) {
         unlock(true);
     }
     Log::logf(CAT_OTA, LOG_INFO,
-              "Release %s installed to '%s', rebooting\n",
-              runtime.update_version, partition_name);
+              "Firmware installed to '%s', rebooting\n", partition_name);
     vTaskDelete(nullptr);
 }
 
@@ -407,10 +415,10 @@ const char *cached_start_blocked() {
         AirSenseState::esp_update_allowed(), ResmedOta::is_active(), background_work_idle(),
         SdStorage::local_access_allowed()};
     if (!observed || !(inputs == previous)) {
+        const char *previous_upload_blocked = last_upload_blocked;
         last_upload_blocked = manual_start_blocked();
         const char *blocked = start_blocked();
-        if (blocked != last_blocked && runtime.enabled &&
-            runtime.operation == OP_NONE && !runtime.reboot_pending)
+        if (blocked != last_blocked || last_upload_blocked != previous_upload_blocked)
             status_revision.fetch_add(1);
         last_blocked = blocked;
         previous = inputs;
@@ -551,20 +559,23 @@ bool request_check(const char **error) {
     return false;
 }
 
-bool request_install(const char **error) {
+bool request_install(const char **error, const char *url) {
     if (error) *error = nullptr;
     if (!mutex || !lock()) {
         if (error) *error = "ota_unavailable";
         return false;
     }
     const char *rejected = start_blocked();
-    if (!rejected && ((runtime.result != State::Available && runtime.result != State::Current) ||
+    if (!rejected && url && (strlen(url) >= sizeof(work_url) || !OtaUrl::supported(url)))
+        rejected = "update_url_invalid";
+    if (!rejected && !url && ((runtime.result != State::Available && runtime.result != State::Current) ||
                      !available_artifact.size))
         rejected = "update_not_available";
     if (!rejected) {
+        snprintf(work_url, sizeof(work_url), "%s", url ? url : "");
         runtime.operation = OP_INSTALL;
         runtime.bytes = 0;
-        runtime.total_size = available_artifact.size;
+        runtime.total_size = url ? 0 : available_artifact.size;
         runtime.error[0] = '\0';
         Arbiter::set_state(SYS_OTA_ESP);
         unlock(true);

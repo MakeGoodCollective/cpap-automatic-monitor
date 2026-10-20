@@ -2261,21 +2261,26 @@ static String buildOtaStatus(const OtaManager::Status &status, bool full) {
     jsonAddUInt32(json, "release_notes_id", status.release_notes_id);
     jsonAddBool(json, "version_comparable", status.version_comparable);
     jsonAddBool(json, "release_installable", status.release_installable);
+    jsonAddString(json, "upload_blocked", status.upload_blocked ? status.upload_blocked : "");
     if (status.state == OtaManager::State::Installing ||
-        status.state == OtaManager::State::Rebooting)
+        status.state == OtaManager::State::Rebooting) {
         jsonAddInt(json, "progress", status.progress);
+        jsonAddInt(json, "bytes", status.bytes);
+        jsonAddInt(json, "total_size", status.total_size);
+    }
     else if (status.blocked && status.state != OtaManager::State::Busy &&
-             status.state != OtaManager::State::Checking &&
-             status.state != OtaManager::State::Disabled)
+             status.state != OtaManager::State::Checking)
         jsonAddString(json, "blocked", status.blocked);
     if (full) {
-        jsonAddString(json, "upload_blocked", status.upload_blocked ? status.upload_blocked : "");
         jsonAddString(json, "version", airbridge_version());
         jsonAddUInt32(json, "uptime", millis() / 1000);
         jsonAddString(json, "release_target", AB_OTA_RELEASE_TARGET);
         json += ",\"upload_encodings\":[\"auto\",\"plain\",\"zlib\"]";
-        jsonAddInt(json, "bytes", status.bytes);
-        jsonAddInt(json, "total_size", status.total_size);
+        if (status.state != OtaManager::State::Installing &&
+            status.state != OtaManager::State::Rebooting) {
+            jsonAddInt(json, "bytes", status.bytes);
+            jsonAddInt(json, "total_size", status.total_size);
+        }
         jsonAddInt(json, "last_check_age_ms", status.last_check_age_ms);
     }
     if (status.update_version[0]) jsonAddString(json, "update_version", status.update_version);
@@ -2359,7 +2364,9 @@ static void handleOtaReleaseNotes(AsyncWebServerRequest *request) {
 static void handleOtaRequest(AsyncWebServerRequest *request, bool install) {
     if (!checkAuth(request)) return;
     const char *error = nullptr;
-    bool accepted = install ? OtaManager::request_install(&error) : OtaManager::request_check(&error);
+    const auto *url = install && request->hasParam("url") ? request->getParam("url") : nullptr;
+    bool accepted = install ? OtaManager::request_install(&error, url ? url->value().c_str() : nullptr)
+                            : OtaManager::request_check(&error);
     if (accepted) sendOtaStatus(request, 202);
     else {
         String json = "{";

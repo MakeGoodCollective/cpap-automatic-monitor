@@ -38,6 +38,8 @@ html:not([data-theme-ready]) .app,html:not([data-theme-ready]) .bottom-nav{visib
 #p-setup .btn-row{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px}
 #p-setup input,#p-setup select{max-width:100%}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg,Canvas);color:var(--text,CanvasText);min-height:100vh;overflow:hidden}
+button,input,select,textarea{font-family:inherit}
+input::file-selector-button{font:inherit}
 .app{display:grid;grid-template-columns:220px 1fr;height:100vh}
 
 /* Sidebar */
@@ -290,15 +292,16 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .firmware-toolbar .btn{white-space:nowrap}
 .firmware-section-title{margin:22px 0 12px;color:var(--blue);font-size:12px;font-weight:500;text-transform:uppercase}
 .firmware-messages{display:block;width:100%;height:150px;resize:vertical;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);padding:10px 12px;margin:8px 0 4px;font:12px/1.6 monospace}
-#flashCard .row{gap:16px}
-#flashCard .row>label{flex:1}
-#flashCard input[type=file]{max-width:100%;width:300px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font-size:12px}
-#flashCard .btn-group{justify-content:flex-start;margin-top:12px}
+.firmware-card .row{gap:16px}
+.firmware-card .row>label{flex:1}
+.firmware-card .value{min-width:0;max-width:70%;text-align:right;overflow-wrap:anywhere}
+.firmware-card input[type=file],.firmware-card input[type=url]{max-width:100%;width:300px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font-size:12px}
+.firmware-card .btn-group{justify-content:flex-start;margin-top:12px}
 #firmwareEntries .storage-row{grid-template-columns:minmax(0,1fr) auto}
 @media(max-width:768px){
-  #flashCard .row{flex-wrap:wrap}
-  #flashCard .row:has(input,select)>label{flex-basis:100%}
-  #flashCard .row>select,#flashCard input[type=file]{width:100%;max-width:100%}
+  .firmware-card .row{flex-wrap:wrap}
+  .firmware-card .row:has(input,select)>label{flex-basis:100%}
+  .firmware-card .row>select,.firmware-card input[type=file],.firmware-card input[type=url]{width:100%;max-width:100%}
   #firmwareEntries .storage-row{grid-template-columns:minmax(0,1fr)}
   #firmwareEntries .storage-entry-actions{justify-content:flex-start}
   #flashBlocked,#firmwareDumpBlocked,#firmwareRepositoryState{height:2.8em}
@@ -328,7 +331,6 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 @keyframes slideIn{from{opacity:0;transform:translateX(30px)}to{opacity:1;transform:translateX(0)}}
 
 /* Storage */
-#p-storage .btn{font-family:inherit}
 #storageUsage{font-size:12px;color:var(--text-dim);margin-bottom:16px}
 .storage-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
 #storagePath,#firmwareRepositoryPath{flex:1 1 200px;min-width:0;padding:9px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface);font:12px 'SF Mono',Consolas,monospace;overflow-wrap:anywhere}
@@ -791,13 +793,15 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
       <div class="pane" id="p-ota">
 
         <!-- AirBridge OTA -->
-        <div class="card" style="border-left:3px solid var(--accent)">
-          <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
-            <div class="icon" style="width:24px;height:24px"><svg aria-hidden="true"><use href="#icon-ota"/></svg></div>
-            <div>
-              <div style="font-weight:600;font-size:15px"><span data-i18n="ota.airbridgeFirmware"></span></div>
-              <div style="font-size:12px;color:var(--text-dim)">ESP32 &middot; <span id="espFwTarget">--</span> &middot; <span id="espFwVer">--</span></div>
-            </div>
+        <div class="card firmware-card" id="espFirmwareCard" style="border-left:3px solid var(--accent)">
+          <h3 data-i18n="ota.airbridgeFirmware"></h3>
+          <div class="row">
+            <label data-i18n="ota.version"></label>
+            <span class="value" id="espFwVer">--</span>
+          </div>
+          <div class="row">
+            <label data-i18n="ota.target"></label>
+            <span class="value" id="espFwTarget">--</span>
           </div>
           <div class="row">
             <label><span data-i18n="ota.latest"></span></label>
@@ -809,26 +813,29 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
             <button class="btn btn-accent" id="btnOtaInstall" onclick="otaInstallRelease()" style="display:none"><span data-i18n="ota.install"></span></button>
             <button class="btn" id="btnOtaNotes" onclick="otaShowReleaseNotes()" hidden><span data-i18n="ota.whatsNew"></span></button>
           </div>
-          <div class="progress" id="otaReleaseProgress"><div class="bar" id="otaReleaseBar" style="background:var(--accent)"></div></div>
-          <div class="msg" id="otaReleaseMsg"></div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-            <div>
-              <div class="upload-area" id="espDropZone" style="padding:24px;border-color:var(--accent)">
-                <p style="font-size:13px"><span data-i18n="ota.selectEsp"></span><br><small style="color:var(--text-dim)"><span data-i18n="ota.drop"></span></small></p>
-                <input type="file" id="espFileInput" style="display:none" accept=".bin,.zlib">
-              </div>
-            </div>
-            <div>
-              <div id="espFileInfo" style="font-size:13px;color:var(--text-dim)"></div>
-              <div class="progress" id="espUploadProgress"><div class="bar" id="espUploadBar" style="background:var(--accent)"></div></div>
-              <div class="msg" id="espUploadMsg"></div>
-              <button class="btn btn-danger" id="btnEspReboot" onclick="espReboot()" style="display:none;margin-top:8px"><span data-i18n="ota.reboot"></span></button>
-            </div>
+          <h4 class="firmware-section-title" data-i18n="ota.installFirmware"></h4>
+          <div class="row">
+            <label data-i18n="ota.progress"></label>
+            <span class="value" id="espProgressText">--</span>
           </div>
+          <div class="row">
+            <label for="espFirmwareUrl" data-i18n="ota.firmwareUrl"></label>
+            <input id="espFirmwareUrl" type="url" placeholder="https://..." disabled>
+          </div>
+          <div class="row">
+            <label for="espFileInput" data-i18n="ota.firmwareImage"></label>
+            <input type="file" id="espFileInput" accept=".bin,.zlib" disabled>
+          </div>
+          <div class="progress" id="otaReleaseProgress"><div class="bar" id="otaReleaseBar" style="background:var(--accent)"></div></div>
+          <div class="btn-group">
+            <button class="btn btn-accent" id="btnEspInstall" onclick="espInstall()" disabled><span data-i18n="ota.installImage"></span></button>
+            <button class="btn" id="btnEspReboot" onclick="espReboot()" style="display:none"><span data-i18n="ota.reboot"></span></button>
+          </div>
+          <div class="msg" id="otaReleaseMsg" role="status" aria-live="polite"></div>
         </div>
 
         <!-- ResMed OTA -->
-        <div class="card" id="flashCard" style="border-left:3px solid var(--orange)">
+        <div class="card firmware-card" id="flashCard" style="border-left:3px solid var(--orange)">
           <h3 data-i18n="ota.resmedFirmware"></h3>
           <div class="row">
             <label data-i18n="ota.state"></label>
@@ -4775,6 +4782,7 @@ document.getElementById('cmdInput').addEventListener('keydown', e => {
 let otaStatusTimer = null;
 let otaStatus = null, otaWatch = null, otaSerial = 0;
 let otaNotes = null;
+let espSubmitting = false, espReady = false;
 
 function appendReleaseNotesInline(parent, value) {
   const token = /(\*\*[^*]+\*\*|\x60[^\x60]+\x60)/g;
@@ -4944,32 +4952,36 @@ function renderOtaNotice(d) {
   uiText(mobile, message, 'title');
 }
 
-function renderOtaStatus(d) {
+function renderOtaStatus(d, keepMessage = false) {
   var latest = d.update_version || '--';
   if (d.state === 'disabled') latest = uiMessage('ota.checksDisabled');
   else if (d.state === 'checking') latest = uiMessage('ota.checking');
   else if (d.state === 'available') latest = uiMessage('ota.availableVersion', {version:latest});
   uiText(document.getElementById('espFwLatest'), latest);
-  var active = ['checking', 'installing', 'rebooting', 'busy'].includes(d.state);
+  var active = espSubmitting || espReady || !!otaWatch?.restarting ||
+    ['checking', 'installing', 'rebooting', 'busy'].includes(d.state);
   const installable = d.release_installable === true;
   const versionHint = document.getElementById('otaVersionHint');
   versionHint.hidden = !installable || active || d.version_comparable !== false;
   uiText(versionHint, versionHint.hidden ? '' : uiMessage('ota.versionUncomparable', {version:d.update_version}));
 
   var check = document.getElementById('btnOtaCheck');
-  check.disabled = d.state === 'disabled' || active || !!d.blocked;
   var install = document.getElementById('btnOtaInstall');
   install.style.display = installable ? '' : 'none';
   uiText(install, d.update_version ? uiMessage('ota.installVersion', {version:d.update_version}) : uiMessage('ota.install'));
-  install.disabled = !installable || active || !!d.blocked;
   const blocked = d.blocked ? uiMessage('ota.blockedReason', {reason:uiError(d.blocked)}) : '';
   uiText(check, blocked, 'title');
   uiText(install, blocked, 'title');
 
   var progress = document.getElementById('otaReleaseProgress');
   var bar = document.getElementById('otaReleaseBar');
-  progress.style.display = ['installing', 'rebooting'].includes(d.state) ? 'block' : 'none';
-  bar.style.width = (d.state === 'rebooting' ? 100 : (d.progress || 0)) + '%';
+  if (!espSubmitting && !espReady) {
+    progress.style.display = ['installing', 'rebooting'].includes(d.state) ? 'block' : 'none';
+    const percent = d.state === 'rebooting' ? 100 : (d.progress || 0);
+    bar.style.width = percent + '%';
+    uiText(document.getElementById('espProgressText'),
+      ['installing', 'rebooting'].includes(d.state) ? percent + '%' : '--');
+  }
 
   var msgEl = document.getElementById('otaReleaseMsg');
   var text = d.state === 'rebooting' ? uiMessage('ota.updateRestarting') :
@@ -4977,8 +4989,11 @@ function renderOtaStatus(d) {
     d.state === 'checking' ? uiMessage('ota.checkingUpdates') :
     d.state === 'busy' ? uiMessage('ota.operationBusy') :
     d.state === 'error' && d.error ? uiMessage('ota.error', {error:uiError(d.error)}) : '';
-  uiText(msgEl, text);
-  msgEl.className = text ? 'msg ' + (d.state === 'error' ? 'err' : 'ok') : 'msg';
+  if (!espSubmitting && !espReady && !keepMessage) {
+    uiText(msgEl, text);
+    msgEl.className = text ? 'msg ' + (d.state === 'error' ? 'err' : 'ok') : 'msg';
+  }
+  renderEspInstall(d);
 }
 
 function applyOtaStatus(d) {
@@ -4997,6 +5012,7 @@ function finishOtaObservation() {
   const restarted = (otaWatch.version && lastStatus.version && lastStatus.version !== otaWatch.version) ||
     (Number.isFinite(otaWatch.uptime) && Number.isFinite(lastStatus.uptime) && lastStatus.uptime < otaWatch.uptime);
   if (otaWatch.restarting && restarted) {
+    espReady = false;
     message = uiMessage('ota.backOnline', {version:lastStatus.version || '--'});
   } else if (d.state === 'error') { message = d.error ? uiMessage('ota.error', {error:uiError(d.error)}) : ''; type = 'err'; }
   else if (otaWatch.restarting) return;
@@ -5004,6 +5020,7 @@ function finishOtaObservation() {
     message = d.state === 'available' ? uiMessage('ota.versionAvailable', {version:d.update_version}) : uiMessage('ota.upToDate');
   } else return;
   clearTimeout(otaStatusTimer); otaStatusTimer = null; otaWatch = null;
+  renderEspInstall();
   showMsg(document.getElementById('otaReleaseMsg'), message, type, 0);
 }
 
@@ -5017,14 +5034,16 @@ function watchOta(restarting, baseline) {
   }, 120000);
 }
 
-async function otaAction(action) {
+async function otaAction(action, url = '') {
   const restarting = action === 'install';
   const baseline = {...lastStatus};
   const serial = otaSerial;
   var msgEl = document.getElementById('otaReleaseMsg');
+  espSubmitting = true;
+  if (otaStatus) renderOtaStatus(otaStatus);
   showMsg(msgEl, uiMessage(restarting ? 'ota.startingUpdate' : 'ota.checkingUpdates'), 'ok', 0);
   try {
-    var r = await api('/api/ota/' + action, {method:'POST'});
+    var r = await api('/api/ota/' + action + (url ? '?' + new URLSearchParams({url}) : ''), {method:'POST'});
     if (!r) return;
     var d = await r.json();
     if (!r.ok) throw d.error ? new Error(d.error) : uiFailure('ota.requestRejected');
@@ -5033,6 +5052,10 @@ async function otaAction(action) {
       (otaStatus.revision > d.revision || lastStatus.version !== baseline.version || lastStatus.uptime < baseline.uptime);
     applyOtaStatus(newerPush ? otaStatus : d);
   } catch(e) { showMsg(msgEl, uiMessage('ota.error', {error:uiError(e)}), 'err', 0); }
+  finally {
+    espSubmitting = false;
+    if (otaStatus) renderOtaStatus(otaStatus, true);
+  }
 }
 
 function otaCheckRelease() { return otaAction('check'); }
@@ -5049,12 +5072,48 @@ firmwareDrop.addEventListener('dragleave', () => firmwareDrop.classList.remove('
 firmwareDrop.addEventListener('drop', e => { e.preventDefault(); firmwareDrop.classList.remove('dragover'); prepareFirmwareUpload(e.dataTransfer.files[0], true); });
 
 // ESP32 OTA
-const edz = document.getElementById('espDropZone'), efi = document.getElementById('espFileInput');
-edz.addEventListener('click', () => efi.click());
-edz.addEventListener('dragover', e => { e.preventDefault(); edz.classList.add('dragover'); });
-edz.addEventListener('dragleave', () => edz.classList.remove('dragover'));
-edz.addEventListener('drop', e => { e.preventDefault(); edz.classList.remove('dragover'); espUploadFile(e.dataTransfer.files[0]); });
-efi.addEventListener('change', e => { if (e.target.files[0]) espUploadFile(e.target.files[0]); });
+const efi = document.getElementById('espFileInput');
+const efu = document.getElementById('espFirmwareUrl');
+efi.addEventListener('change', () => {
+  if (efi.files.length) efu.value = '';
+  renderEspInstall();
+});
+efu.addEventListener('input', () => {
+  if (efu.value.trim()) efi.value = '';
+  renderEspInstall();
+});
+
+function renderEspInstall(d = otaStatus) {
+  const active = espSubmitting || espReady || !!otaWatch?.restarting ||
+    ['checking', 'installing', 'rebooting', 'busy'].includes(d?.state);
+  const url = efu.value.trim(), file = efi.files[0];
+  const blocked = url ? d?.blocked : d?.upload_blocked;
+  document.getElementById('btnOtaCheck').disabled = !d || active ||
+    d.state === 'disabled' || !!d.blocked;
+  document.getElementById('btnOtaInstall').disabled = !d || active ||
+    !d.release_installable || !!d.blocked;
+  efi.disabled = efu.disabled = !d || active;
+  const button = document.getElementById('btnEspInstall');
+  button.disabled = !d || active || !!blocked || (!file && !url) || (!!file && !!url);
+  uiText(button, blocked ? uiMessage('ota.blockedReason', {reason:uiError(blocked)}) : '', 'title');
+  const reboot = document.getElementById('btnEspReboot');
+  reboot.style.display = espReady ? '' : 'none';
+  reboot.disabled = espSubmitting;
+}
+
+async function espInstall() {
+  if (document.getElementById('btnEspInstall').disabled) return;
+  const file = efi.files[0], url = efu.value.trim();
+  if (file) return espUploadFile(file);
+  try {
+    const parsed = new URL(url);
+    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('update_url_invalid');
+  } catch(e) {
+    showMsg(document.getElementById('otaReleaseMsg'), uiMessage('ota.invalidFirmwareUrl'), 'err', 0);
+    return;
+  }
+  return otaAction('install', url);
+}
 
 function uploadResponse(xhr) {
   let data;
@@ -5068,31 +5127,51 @@ function uploadResponse(xhr) {
 }
 
 async function espUploadFile(file) {
-  var msgEl = document.getElementById('espUploadMsg');
-  uiText(document.getElementById('espFileInfo'), uiMessage('ota.fileInfo', {name:file.name, size:{number:file.size/1024, max:1, min:1}}));
-  document.getElementById('btnEspReboot').style.display = 'none';
-  var prog = document.getElementById('espUploadProgress'), bar = document.getElementById('espUploadBar');
+  var msgEl = document.getElementById('otaReleaseMsg');
+  espSubmitting = true;
+  if (otaStatus) renderOtaStatus(otaStatus);
+  showMsg(msgEl, uiMessage('ota.uploadSending'), 'ok', 0);
+  var prog = document.getElementById('otaReleaseProgress'), bar = document.getElementById('otaReleaseBar');
   prog.style.display = 'block'; bar.style.width = '0%';
+  uiText(document.getElementById('espProgressText'), '0%');
   try {
-    var xhr = new XMLHttpRequest();
-    xhr.upload.onprogress = function(e) { if (e.lengthComputable) bar.style.width = (e.loaded/e.total*100)+'%'; };
-    xhr.onload = function() {
-      try {
-        const d = uploadResponse(xhr);
-        showMsg(msgEl, uiMessage('ota.espUploadReady', {count:d.size, partition:d.partition || 'OTA'}), 'ok', 0);
-        document.getElementById('btnEspReboot').style.display = '';
-      } catch(e) { showMsg(msgEl, uiMessage('ota.uploadFailed', {error:uiError(e)}), 'err'); }
-    };
-    xhr.onerror = function() { showMsg(msgEl, uiMessage('ota.uploadError'), 'err'); };
-    var fd = new FormData(); fd.append('firmware', file);
-    xhr.open('POST', '/api/esp32/upload'); xhr.send(fd);
-  } catch(e) { showMsg(msgEl, uiMessage('ota.error', {error:uiError(e)}), 'err'); }
+    await new Promise((resolve, reject) => {
+      var xhr = new XMLHttpRequest();
+      xhr.upload.onprogress = function(e) {
+        if (!e.lengthComputable) return;
+        const percent = Math.floor(e.loaded / e.total * 100);
+        bar.style.width = percent + '%';
+        uiText(document.getElementById('espProgressText'), percent + '%');
+      };
+      xhr.onload = function() {
+        try { resolve(uploadResponse(xhr)); } catch(e) { reject(e); }
+      };
+      xhr.onerror = xhr.onabort = () => reject(uiFailure('ota.uploadError'));
+      var fd = new FormData(); fd.append('firmware', file);
+      xhr.open('POST', '/api/esp32/upload'); xhr.send(fd);
+    });
+    espReady = true;
+    bar.style.width = '100%';
+    uiText(document.getElementById('espProgressText'), '100%');
+    await espReboot();
+  } catch(e) { showMsg(msgEl, uiMessage('ota.uploadFailed', {error:uiError(e)}), 'err', 0); }
+  finally { espSubmitting = false; if (otaStatus) renderOtaStatus(otaStatus, true); }
 }
 
 async function espReboot() {
-  showMsg(document.getElementById('espUploadMsg'), uiMessage('ota.rebooting'), 'ok', 0);
-  document.getElementById('btnEspReboot').style.display = 'none';
-  try { await api('/api/reboot', {method:'POST'}); } catch(e) {}
+  const baseline = {...lastStatus};
+  const msg = document.getElementById('otaReleaseMsg');
+  espSubmitting = true;
+  renderEspInstall();
+  showMsg(msg, uiMessage('ota.rebooting'), 'ok', 0);
+  try {
+    const response = await api('/api/reboot', {method:'POST'});
+    if (!response?.ok) throw uiFailure('ota.requestRejected');
+    watchOta(true, baseline);
+    finishOtaObservation();
+  } catch(e) {
+    showMsg(msg, uiMessage('ota.restartFailed', {error:uiError(e)}), 'err', 0);
+  } finally { espSubmitting = false; renderEspInstall(); }
 }
 
 function firmwareImageMessages(d) {

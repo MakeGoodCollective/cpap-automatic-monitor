@@ -43,7 +43,8 @@ namespace OtaManager {
     bool request_reboot(bool (*prepare)() = nullptr);
 
     bool request_check(const char **error = nullptr);
-    bool request_install(const char **error = nullptr);
+    // No URL installs the checked release; a URL is a one-time image source.
+    bool request_install(const char **error = nullptr, const char *url = nullptr);
     void config_changed();
     uint32_t revision();
     bool get_status(Status &status);
