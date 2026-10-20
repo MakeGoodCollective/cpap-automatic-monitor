@@ -699,7 +699,7 @@ const OtaImage::Status &image_status() { return image_writer.status(); }
 const char *resmed_flash_blocked(bool from_manual_upload) {
     if (!lock(pdMS_TO_TICKS(20))) return "ota_busy";
     const char *blocked = nullptr;
-    if (!mutex) blocked = "ota_unavailable";
+    if (!mutex || !runtime.initialized) blocked = "ota_unavailable";
     else if (runtime.operation != (from_manual_upload ? OP_MANUAL : OP_NONE) ||
              runtime.reboot_pending) blocked = "ota_busy";
     else if (!SdStorage::local_access_allowed()) blocked = "usb_storage_active";

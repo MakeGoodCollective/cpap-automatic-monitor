@@ -11,6 +11,11 @@
 #include "resmed_firmware_upload.h"
 #include "sd_storage.h"
 #include "uart_arbiter.h"
+#include "board.h"
+
+#if AB_STORAGE_HAS_SDCARD
+#include <FS.h>
+#endif
 
 #include <atomic>
 #include <stdarg.h>
@@ -34,6 +39,14 @@ std::atomic<bool> cancel_requested{false};
 bool programming = false;  // Protected by status_mux, like published.
 
 struct Work {
+    bool dump = false;
+    bool waiting = false;
+    bool recovery = false;
+    bool bootloader_entered = false;
+    bool app_confirmed = false;
+    bool quiet_done = false;
+    char expected_bid[32] = {};
+    char expected_serial[24] = {};
     InstallRequest request;
     Source source = Source::None;
     ResmedFirmwareUpload::Source staged;
@@ -131,6 +144,17 @@ struct Input {
     Image::Reader reader() { return {this, size, read}; }
 };
 
+bool acquire_firmware(Input &input, const char *path) {
+    const uint32_t started = millis();
+    while (!input.session.begin(SdStorage::Access::Firmware, path)) {
+        if (cancelled()) return false;
+        if (!SdStorage::local_access_allowed() || !SdStorage::mounted()) return fail("sd_unavailable");
+        if (millis() - started >= 5000) return fail("sd_busy");
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return true;
+}
+
 bool open_input(Input &input) {
     if (work.source == Source::Staging) {
         input.partition = work.staged.partition;
@@ -141,14 +165,7 @@ bool open_input(Input &input) {
         if (!ResmedFirmwareRepository::valid_path(work.request.path))
             return fail("invalid_repository_path");
         phase("Open SD image");
-        const uint32_t started = millis();
-        while (!input.session.begin(SdStorage::Access::Firmware, work.request.path)) {
-            if (cancelled()) return false;
-            if (!SdStorage::local_access_allowed() || !SdStorage::mounted())
-                return fail("sd_unavailable");
-            if (millis() - started >= 5000) return fail("sd_busy");
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
+        if (!acquire_firmware(input, work.request.path)) return false;
         if (!input.file.open(input.session, work.request.path))
             return fail("source_open_failed");
         input.size = input.file.size();
@@ -187,15 +204,19 @@ struct Plan {
     char serial[24] = {};
 };
 
-bool prepare(Input &input, Plan &plan) {
-    phase("Prepare image");
+bool freeze_device(Plan &plan) {
     if (!AirSenseState::system_idle()) return fail("device_not_idle");
     if (!device_text("BID", plan.bid, sizeof(plan.bid))) return fail("device_bid_unavailable");
     plan.profile = Image::profile_for_bid(plan.bid);
     if (!plan.profile) return fail("unsupported_device_bid: %s", plan.bid);
     if (!device_text("SRN", plan.serial, sizeof(plan.serial)) || !plan.serial[0])
         return fail("device_identity_unavailable");
+    return true;
+}
 
+bool prepare(Input &input, Plan &plan) {
+    phase("Prepare image");
+    if (!freeze_device(plan)) return false;
     Image::Block selected = Image::parse_block(work.request.block);
     const bool full = input.size == Image::FULL_SIZE;
     Image::Options options;
@@ -307,6 +328,9 @@ bool enter_bootloader() {
     phase("Enter bootloader");
     uint32_t state = 0;
     if (cancelled()) return false;
+    work.bootloader_entered = true;
+    work.app_confirmed = false;
+    work.quiet_done = false;
     if (raw_hex("G S #BLS", state, 300) && (state == 1 || state == 2)) return true;
     if (!send_raw_cmd("P S #BLL 0001", nullptr, 0, 0)) return fail("bootloader_entry_failed");
     Arbiter::set_baud(57600);
@@ -462,37 +486,41 @@ bool confirm_install(const Plan &plan) {
         if (wrote_blx && plan.image.bid_present) expected_bid = plan.image.bid;
         if (strcmp(bid, expected_bid) || strcmp(serial, plan.serial))
             return fail("device_identity_changed");
+        work.app_confirmed = true;
         return true;
     }
     return fail("device_did_not_return_to_application");
 }
 
+bool claim_uart(Input &input, const Plan &plan) {
+    if (cancelled()) return false;
+    snprintf(work.expected_bid, sizeof(work.expected_bid), "%s", plan.bid);
+    snprintf(work.expected_serial, sizeof(work.expected_serial), "%s", plan.serial);
+    if (!AirSenseState::system_idle()) return fail("device_not_idle");
+    Arbiter::set_state(SYS_OTA_AIRSENSE);
+    // Detect an incompatible/revoked lease before any erase or bootloader entry.
+    if (!input.partition && !input.session.valid()) return fail("sd_ota_lease_unavailable");
+    phase("Claim UART");
+    if (!Arbiter::wait_idle(3000)) return fail("uart_busy");
+    phase("Suspend streams");
+    if (!LiveStream::suspend_for_ota()) return fail("stream_suspend_failed");
+    char current_bid[32], current_serial[24];
+    if (!raw_text("G S #BID", current_bid, sizeof(current_bid)) ||
+        !raw_text("G S #SRN", current_serial, sizeof(current_serial)) ||
+        strcmp(current_bid, plan.bid) || strcmp(current_serial, plan.serial))
+        return fail("device_identity_changed");
+    if (cancelled()) return false;
+    CustomSettings::invalidate("ResMed OTA");
+    AirSenseState::invalidate_identity();
+    return true;
+}
+
 bool run_install() {
     Input input;
     Plan plan;
-    if (!open_input(input) || cancelled() || !prepare(input, plan)) return false;
-    if (cancelled()) return false;
-    // Preparing has no irreversible side effects. Claim raw UART only now.
-    if (!AirSenseState::system_idle()) return fail("device_not_idle");
-    Arbiter::set_state(SYS_OTA_AIRSENSE);
+    if (!open_input(input) || cancelled() || !prepare(input, plan) || !claim_uart(input, plan)) return false;
     bool success = false;
     do {
-        // The SD owner must explicitly support this lease in OTA mode. Never
-        // discover an incompatible/revoked lease after erasing the target.
-        if (!input.partition && !input.session.valid()) { fail("sd_ota_lease_unavailable"); break; }
-        phase("Claim UART");
-        if (!Arbiter::wait_idle(3000)) { fail("uart_busy"); break; }
-        phase("Suspend streams");
-        if (!LiveStream::suspend_for_ota()) { fail("stream_suspend_failed"); break; }
-        char current_bid[32], current_serial[24];
-        if (!raw_text("G S #BID", current_bid, sizeof(current_bid)) ||
-            !raw_text("G S #SRN", current_serial, sizeof(current_serial)) ||
-            strcmp(current_bid, plan.bid) || strcmp(current_serial, plan.serial)) {
-            fail("device_identity_changed"); break;
-        }
-        if (cancelled()) break;
-        CustomSettings::invalidate("ResMed OTA");
-        AirSenseState::invalidate_identity();
         if (!enter_bootloader() || !negotiate_baud()) break;
         bool programmed = true;
         for (size_t i = 0; i < plan.count; ++i) {
@@ -513,35 +541,388 @@ bool run_install() {
         }
         if (programmed) success = confirm_install(plan);
     } while (false);
-    Arbiter::set_baud(57600);
-    Arbiter::set_state(SYS_IDLE);
-    AirSenseState::request_refresh();
     return success;
 }
 
+#if AB_STORAGE_HAS_SDCARD
+bool dump_chunk(uint32_t offset, uint8_t *out, size_t length) {
+    if (!length || length > 240 || offset > Image::FULL_SIZE || length > Image::FULL_SIZE - offset)
+        return false;
+    uint8_t payload[7] = {'D'};
+    SdStorage::put_le32(payload + 1, offset);
+    SdStorage::put_le16(payload + 5, length);
+    uint8_t frame[64];
+    const int count = qframe_build('O', payload, sizeof(payload), frame, sizeof(frame));
+    if (count <= 0) return false;
+    for (unsigned attempt = 0; attempt < 3 && !cancelled(); ++attempt) {
+        Arbiter::clear_rx_frames();
+        Arbiter::write_raw(frame, count);
+        const uint32_t started = millis();
+        qframe_t reply;
+        while (millis() - started < 1000) {
+            if (!Arbiter::wait_frame(&reply, 1000 - (millis() - started))) break;
+            if (reply.type != 'O' || !reply.crc_valid || reply.payload_len < 7) continue;
+            if (reply.payload[0] == 'E' && SdStorage::get_le32(reply.payload + 1) == offset) return false;
+            if (reply.payload[0] != 'd' || reply.payload_len != 7 + length ||
+                SdStorage::get_le32(reply.payload + 1) != offset ||
+                SdStorage::get_le16(reply.payload + 5) != length) continue;
+            memcpy(out, reply.payload + 7, length);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool dump_range(uint32_t offset, uint8_t *out, size_t length) {
+    while (length) {
+        const size_t count = min(size_t(240), length);
+        if (!dump_chunk(offset, out, count)) return false;
+        offset += count;
+        out += count;
+        length -= count;
+    }
+    return true;
+}
+
+bool recover_dump(Input &input, Plan &plan) {
+    char path[256];
+    if (!ResmedFirmwareRepository::bootloader_path(plan.bid, path, sizeof(path)))
+        return fail("unsupported_device_bid");
+    portENTER_CRITICAL(&status_mux);
+    snprintf(published.recovery_path, sizeof(published.recovery_path), "%s", path);
+    ++published.revision;
+    portEXIT_CRITICAL(&status_mux);
+    if (!input.file.open(input.session, path)) return fail("matching_bootloader_missing");
+    input.size = input.file.size();
+    if (input.size != BLX_BYTES) return fail("invalid_recovery_blx_size");
+    for (size_t offset = 0; offset < BLX_BYTES; offset += SOURCE_CHUNK) {
+        if (cancelled()) return false;
+        if (!input.read_source(offset, input.blx + offset, SOURCE_CHUNK))
+            return fail("blx_preflight_read_failed");
+    }
+    input.file.close();
+    Image::Options options;
+    options.target = Image::Block::BLX;
+    options.platform = plan.profile->platform;
+    const bool inspected = Image::inspect(input.reader(), plan.image, options, input.scratch, SOURCE_CHUNK);
+    portENTER_CRITICAL(&status_mux);
+    published.image = plan.image;
+    ++published.revision;
+    portEXIT_CRITICAL(&status_mux);
+    // Canonical path plus user consent declares the extension. Exact payload
+    // recognition is informational; BID, CRC and unsafe integrity patches gate.
+    if (!inspected || !plan.image.bid_matches || !plan.image.crc_ok() ||
+        plan.image.integrity_patch == Image::IntegrityPatch::Unsafe ||
+        plan.image.integrity_patch == Image::IntegrityPatch::Partial)
+        return fail("invalid_recovery_blx");
+
+    if (!work.recovery) {
+        // Leave no task, RAM buffer or reservation waiting on human input.
+        // Consent resumes this ID, reclaims admission and rereads the source.
+        snprintf(work.expected_bid, sizeof(work.expected_bid), "%s", plan.bid);
+        snprintf(work.expected_serial, sizeof(work.expected_serial), "%s", plan.serial);
+        snprintf(work.request.path, sizeof(work.request.path), "%s", path);
+        Arbiter::set_baud(57600);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        work.quiet_done = true;
+        if (cancelled()) return false;
+        work.waiting = true;
+        portENTER_CRITICAL(&status_mux);
+        published.prepared = true;
+        published.recovery_available = true;
+        snprintf(published.source_path, sizeof(published.source_path), "%s", path);
+        ++published.revision;
+        portEXIT_CRITICAL(&status_mux);
+        return false;
+    }
+    if (!enter_bootloader() || !negotiate_baud()) return false;
+    plan.blocks[0] = *Image::range(*plan.profile, Image::Block::BLX);
+    plan.count = 1;
+    if (!flash_one_block(input.reader(), 0, plan.blocks[0], input.scratch, true) || !confirm_install(plan))
+        return false;
+    // Cancellation during BLX programming was deferred until device confirmation.
+    // It may safely stop the subsequent read-only dump now.
+    portENTER_CRITICAL(&status_mux);
+    programming = false;
+    published.cancel_allowed = true;
+    published.sent = 0;
+    ++published.revision;
+    portEXIT_CRITICAL(&status_mux);
+    if (cancelled()) return false;
+    if (!enter_bootloader() || !negotiate_baud()) return false;
+    if (!dump_chunk(0, input.blx, 240)) return fail("dump_unavailable_after_recovery");
+    return true;
+}
+
+struct DumpReader {
+    Input &input;
+    SdStorage::Writer &output;
+    uint32_t written = 0;
+
+    static bool read(void *context, uint64_t offset, uint8_t *out, size_t length) {
+        auto &dump = *static_cast<DumpReader *>(context);
+        if (cancelled() || length > SOURCE_CHUNK || offset > Image::FULL_SIZE ||
+            length > Image::FULL_SIZE - offset) return false;
+        if (offset < BLX_BYTES) {
+            if (length > BLX_BYTES - offset) return false;
+            memcpy(out, dump.input.blx + offset, length);
+        } else if (!dump_range(offset, out, length)) return false;
+        // The inspector's BID lookup borrows preloaded BLX, not another UART
+        // pass or an out-of-order write. Its CRC reads then stream the full file.
+        if (offset == dump.written) {
+            if (!dump.output.write(out, length)) return fail("dump_sd_write_failed");
+            dump.written += length;
+            portENTER_CRITICAL(&status_mux);
+            published.sent = dump.written;
+            ++published.revision;
+            portEXIT_CRITICAL(&status_mux);
+        } else if (offset >= BLX_BYTES) return false;
+        return true;
+    }
+};
+
+struct DumpOutput {
+    Input &input;
+    SdStorage::Writer writer;
+    char path[192] = {}, temporary[256] = {};
+    bool private_created = false;
+    bool committed = false;
+
+    ~DumpOutput() {
+        writer.close();
+        if (private_created && !committed)
+            input.session.mutate(temporary, [&](fs::FS &fs) {
+                return !fs.exists(temporary) || fs.remove(temporary);
+            });
+    }
+
+    bool prepare_name() {
+        char pna[64] = {}, fgt[32] = {}, sid[64] = {};
+        if (!device_text("FGT", fgt, sizeof(fgt)) || !fgt[0])
+            return fail("device_fgt_unavailable");
+        if (!device_text("SID", sid, sizeof(sid)) || !sid[0])
+            return fail("device_sid_unavailable");
+        if (!ResmedFirmwareRepository::valid_filename(fgt) ||
+            !ResmedFirmwareRepository::valid_filename(sid))
+            return fail("invalid_dump_identity");
+        if (!device_text("PNA", pna, sizeof(pna))) pna[0] = '\0';
+        const char *family = "air10";
+        if (!pna[11] || pna[11] == '_' || pna[11] == ' ') {
+            if (!strncasecmp(pna, "AirSense_10", 11) || !strncasecmp(pna, "AirSense 10", 11))
+                family = "airsense10";
+            else if (!strncasecmp(pna, "AirCurve_10", 11) || !strncasecmp(pna, "AirCurve 10", 11))
+                family = "aircurve10";
+        }
+        const int length = snprintf(path, sizeof(path), "%s/dump-%s-%s_%s",
+            ResmedFirmwareRepository::ROOT, family, fgt, sid);
+        return (length > 0 && static_cast<size_t>(length) < sizeof(path)) ||
+            fail("dump_name_too_long");
+    }
+
+    bool open() {
+        if (!input.session.mutate(ResmedFirmwareRepository::ROOT, [](fs::FS &fs) {
+            return (fs.exists("/airbridge") || fs.mkdir("/airbridge")) &&
+                (fs.exists(ResmedFirmwareRepository::ROOT) || fs.mkdir(ResmedFirmwareRepository::ROOT));
+        })) return fail("repository_unavailable");
+        const size_t stem_length = strlen(path);
+        for (unsigned copy = 1; copy <= 256; ++copy) {
+            const int length = copy == 1 ?
+                snprintf(path + stem_length, sizeof(path) - stem_length, ".bin") :
+                snprintf(path + stem_length, sizeof(path) - stem_length, "-%u.bin", copy);
+            if (length < 0 || static_cast<size_t>(length) >= sizeof(path) - stem_length)
+                return fail("dump_name_too_long");
+            snprintf(temporary, sizeof(temporary), "%s.part", path);
+            bool available = false;
+            if (!input.session.run([&](fs::FS &fs) {
+                available = !fs.exists(path) && !fs.exists(temporary);
+                return true;
+            })) return fail("dump_path_unavailable");
+            if (!available) continue;
+            // Both names were absent under the exclusive firmware lease. Even
+            // a failed create may leave our own private file; clean only that.
+            private_created = true;
+            if (!writer.open(input.session, temporary)) return fail("dump_sd_open_failed");
+            return true;
+        }
+        return fail("dump_name_exhausted");
+    }
+
+    bool publish() {
+        if (!writer.finish(Image::FULL_SIZE)) return fail("dump_sd_finish_failed");
+        if (cancelled()) return false;
+        committed = input.session.mutate(temporary, path, [&](fs::FS &fs) {
+            return !fs.exists(path) && fs.rename(temporary, path);
+        });
+        if (!committed) return fail("dump_publish_failed");
+        ResmedFirmwareRepository::notify_published(path);
+        portENTER_CRITICAL(&status_mux);
+        snprintf(published.source_path, sizeof(published.source_path), "%s", path);
+        ++published.revision;
+        portEXIT_CRITICAL(&status_mux);
+        return true;
+    }
+};
+
+bool run_dump() {
+    Input input;
+    Plan plan;
+    phase("Prepare dump");
+    if (!acquire_firmware(input, ResmedFirmwareRepository::ROOT) || !freeze_device(plan)) return false;
+    if (work.recovery && (strcmp(plan.bid, work.expected_bid) ||
+        strcmp(plan.serial, work.expected_serial))) return fail("device_identity_changed");
+    DumpOutput output{input};
+    if (!output.prepare_name()) return false;
+    input.blx = allocate_buffer(BLX_BYTES);
+    input.scratch = allocate_buffer(SOURCE_CHUNK);
+    if (!input.blx || !input.scratch) return fail("dump_buffer_unavailable");
+    portENTER_CRITICAL(&status_mux);
+    published.total = Image::FULL_SIZE;
+    snprintf(published.device_bid, sizeof(published.device_bid), "%s", plan.bid);
+    snprintf(published.block, sizeof(published.block), "FULL");
+    ++published.revision;
+    portEXIT_CRITICAL(&status_mux);
+    if (!claim_uart(input, plan)) return false;
+    if (work.recovery) {
+        if (!recover_dump(input, plan)) return false;
+    } else {
+        if (!enter_bootloader() || !negotiate_baud()) return false;
+        phase("Probe dump");
+        if (!dump_chunk(0, input.blx, 240) && (cancelled() || !recover_dump(input, plan))) return false;
+    }
+    if (!dump_range(240, input.blx + 240, BLX_BYTES - 240))
+        return cancelled() ? false : fail("dump_blx_read_failed");
+    if (!output.open()) return false;
+    phase("Dump firmware");
+    portENTER_CRITICAL(&status_mux);
+    published.prepared = true;
+    ++published.revision;
+    portEXIT_CRITICAL(&status_mux);
+    DumpReader source{input, output.writer};
+    Image::Reader reader{&source, Image::FULL_SIZE, DumpReader::read};
+    Image::Options options;
+    options.target = Image::Block::FULL;
+    options.platform = plan.profile->platform;
+    Image::Result image;
+    const bool inspected = Image::inspect(reader, image, options, input.scratch, SOURCE_CHUNK);
+    portENTER_CRITICAL(&status_mux);
+    published.image = image;
+    ++published.revision;
+    portEXIT_CRITICAL(&status_mux);
+    if (!inspected || source.written != Image::FULL_SIZE)
+        return cancelled() ? false : fail("dump_read_failed");
+    // A dump preserves device evidence, including CRC warnings. No re-read or
+    // extra full-image BID comparison is needed for this captured byte stream.
+    return output.publish();
+}
+#else
+bool run_dump() { return fail("sd_unsupported"); }
+#endif
+
 void finish(bool success) {
     portENTER_CRITICAL(&status_mux);
+    const bool waiting = work.waiting && !cancel_requested.load() && !published.error[0];
     published.active = false;
-    published.cancel_allowed = false;
-    published.result = success ? Result::Succeeded :
+    published.cancel_allowed = waiting;
+    published.confirmation_required = waiting;
+    published.result = waiting ? Result::None : success ? Result::Succeeded :
         (!programming && cancel_requested.load() && !published.error[0])
         ? Result::Cancelled : Result::Failed;
     if (published.result == Result::Failed && !published.error[0])
         snprintf(published.error, sizeof(published.error), "install_failed");
-    snprintf(published.phase, sizeof(published.phase), "%s", success ? "Complete" :
+    snprintf(published.phase, sizeof(published.phase), "%s", waiting ? "Confirmation" : success ? "Complete" :
         published.result == Result::Cancelled ? "Cancelled" : "Error");
     ++published.revision;
     active.store(false);
     portEXIT_CRITICAL(&status_mux);
 }
 
+bool restore_uart() {
+    if (Arbiter::get_state() != SYS_OTA_AIRSENSE) return true;
+    Arbiter::set_baud(57600);
+    if (work.bootloader_entered && !work.app_confirmed) {
+        phase("Restore application");
+        for (unsigned attempt = 0; attempt < 3 && !work.app_confirmed; ++attempt) {
+            if (!work.quiet_done) vTaskDelay(pdMS_TO_TICKS(3000));
+            work.quiet_done = false;
+            uint32_t state = UINT32_MAX;
+            if (!raw_hex("G S #BLS", state) || state != 0) continue;
+            char bid[32], serial[24];
+            if (!raw_text("G S #BID", bid, sizeof(bid)) ||
+                !raw_text("G S #SRN", serial, sizeof(serial))) continue;
+            if (strcmp(bid, work.expected_bid) || strcmp(serial, work.expected_serial)) {
+                fail("device_identity_changed");
+                break;
+            }
+            work.app_confirmed = true;
+        }
+        if (!work.app_confirmed) {
+            work.waiting = false;
+            fail("device_did_not_return_to_application");
+            Arbiter::set_state(SYS_BOOTLOADER);
+            return false;
+        }
+    }
+    Arbiter::set_state(SYS_IDLE);
+    AirSenseState::request_refresh();
+    return true;
+}
+
 void flash_task(void *) {
-    const bool success = run_install();  // All C++ I/O/buffer owners unwind here.
+    Status status;
+    get_status(status);
+    Log::logf(CAT_OTA, LOG_INFO, "ResMed %s started id=%lu source=%s\n",
+        work.dump ? "dump" : "install", static_cast<unsigned long>(status.id), status.source_path);
+    bool success = work.dump ? run_dump() : run_install();  // Owners unwind here.
+    if (!restore_uart()) success = false;
     if (work.staged.token) ResmedFirmwareUpload::release_source(work.staged.token);
     finish(success);
+    get_status(status);
+    Log::logf(CAT_OTA, status.error[0] ? LOG_ERROR : LOG_INFO, "ResMed %s %s id=%lu bytes=%u: %s\n",
+        work.dump ? "dump" : "install", status.phase, static_cast<unsigned long>(status.id),
+        unsigned(status.sent), status.error);
     // No timer infers our lifetime; this is the only normal reservation release.
     OtaManager::end_resmed_flash();
     vTaskDelete(nullptr);
+}
+
+bool launch(const Work &next, const char **error, uint32_t resumed_id = 0) {
+    // Reservation, params and visible activity are initialized before scheduling.
+    portENTER_CRITICAL(&status_mux);
+    if (resumed_id && (published.id != resumed_id || !published.confirmation_required)) {
+        portEXIT_CRITICAL(&status_mux);
+        OtaManager::end_resmed_flash();
+        if (error) *error = "stale_dump_confirmation";
+        return false;
+    }
+    work = next;
+    const uint32_t previous_revision = published.revision;
+    uint32_t id = resumed_id ? resumed_id : published.id + 1;
+    if (!id) ++id;
+    published = {};
+    published.id = id;
+    published.revision = previous_revision + 1;
+    published.active = true;
+    published.result = Result::Running;
+    published.source = next.source;
+    published.upload_id = next.request.upload_id;
+    snprintf(published.source_path, sizeof(published.source_path), "%s", next.request.path);
+    snprintf(published.block, sizeof(published.block), "%s", next.request.block);
+    snprintf(published.phase, sizeof(published.phase), "Preparing");
+    published.cancel_allowed = true;
+    cancel_requested.store(false);
+    programming = false;
+    active.store(true);
+    portEXIT_CRITICAL(&status_mux);
+    if (xTaskCreatePinnedToCore(flash_task, "resmed_ota", FLASH_TASK_STACK,
+                                nullptr, 3, nullptr, 1) != pdPASS) {
+        fail("worker_create_failed");
+        if (next.staged.token) ResmedFirmwareUpload::release_source(next.staged.token);
+        finish(false);
+        OtaManager::end_resmed_flash();
+        if (error) *error = "worker_create_failed";
+        return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -559,7 +940,6 @@ bool start_install(const InstallRequest &request, const char **error) {
         return reject("unknown_block");
     if (request.path[0] && !ResmedFirmwareRepository::valid_path(request.path))
         return reject("invalid_repository_path");
-
     Work next;
     next.request = request;
     next.source = Source::Repository;
@@ -579,43 +959,58 @@ bool start_install(const InstallRequest &request, const char **error) {
         }
     }
     if (!claimed && !OtaManager::begin_resmed_flash(error)) return false;
+    return launch(next, error);
+}
 
-    // Reservation, params and visible activity are initialized before scheduling.
-    work = next;
-    portENTER_CRITICAL(&status_mux);
-    const uint32_t previous_revision = published.revision;
-    uint32_t id = published.id + 1;
-    if (!id) ++id;
-    published = {};
-    published.id = id;
-    published.revision = previous_revision + 1;
-    published.active = true;
-    published.result = Result::Running;
-    published.source = next.source;
-    published.upload_id = request.upload_id;
-    snprintf(published.source_path, sizeof(published.source_path), "%s", next.request.path);
-    snprintf(published.block, sizeof(published.block), "%s", request.block);
-    snprintf(published.phase, sizeof(published.phase), "Preparing");
-    published.cancel_allowed = true;
-    cancel_requested.store(false);
-    programming = false;
-    active.store(true);
-    portEXIT_CRITICAL(&status_mux);
-    if (xTaskCreatePinnedToCore(flash_task, "resmed_ota", FLASH_TASK_STACK,
-                                nullptr, 3, nullptr, 1) != pdPASS) {
-        fail("worker_create_failed");
-        if (next.staged.token) ResmedFirmwareUpload::release_source(next.staged.token);
-        finish(false);
-        OtaManager::end_resmed_flash();
-        return reject("worker_create_failed");
+bool start_dump(const char **error) {
+    if (error) *error = nullptr;
+#if AB_STORAGE_HAS_SDCARD
+    if (!SdStorage::mounted()) {
+        if (error) *error = "sd_unavailable";
+        return false;
     }
-    return true;
+    if (!OtaManager::begin_resmed_flash(error)) return false;
+    Work next;
+    next.dump = true;
+    return launch(next, error);
+#else
+    if (error) *error = "sd_unsupported";
+    return false;
+#endif
+}
+
+bool confirm_dump(uint32_t id, const char **error) {
+    if (error) *error = nullptr;
+    if (!OtaManager::begin_resmed_flash(error)) return false;
+    portENTER_CRITICAL(&status_mux);
+    const bool accepted = id && published.id == id && !published.active &&
+        published.confirmation_required && published.recovery_available && work.dump;
+    Work next;
+    if (accepted) {
+        next = work;
+        next.waiting = false;
+        next.recovery = true;
+        next.bootloader_entered = next.app_confirmed = next.quiet_done = false;
+    }
+    portEXIT_CRITICAL(&status_mux);
+    if (!accepted) {
+        OtaManager::end_resmed_flash();
+        if (error) *error = "stale_dump_confirmation";
+        return false;
+    }
+    return launch(next, error, id);
 }
 
 void cancel() {
     portENTER_CRITICAL(&status_mux);
     if (published.active && !cancel_requested.exchange(true)) {
         published.cancellation_requested = true;
+        ++published.revision;
+    } else if (!published.active && published.confirmation_required) {
+        published.confirmation_required = false;
+        published.cancel_allowed = false;
+        published.result = Result::Cancelled;
+        snprintf(published.phase, sizeof(published.phase), "Cancelled");
         ++published.revision;
     }
     portEXIT_CRITICAL(&status_mux);
@@ -630,17 +1025,26 @@ void poll() {
     const bool staged = upload.state == ResmedFirmwareUpload::State::Ready &&
         upload.destination == ResmedFirmwareUpload::Destination::Staging && upload.source_ready;
     const char *blocked = OtaManager::resmed_flash_blocked(staged);
+    const char *dump_blocked = "sd_unsupported";
+#if AB_STORAGE_HAS_SDCARD
+    dump_blocked = SdStorage::mounted() ? OtaManager::resmed_flash_blocked() : "sd_unavailable";
+#endif
     OtaManager::Status ota;
     const bool can_upload = OtaManager::get_status(ota) && !ota.upload_blocked;
     portENTER_CRITICAL(&status_mux);
     const bool allowed = !published.active && !blocked;
     const bool upload_allowed = !published.active && can_upload;
+    const bool dump_allowed = !published.active && !dump_blocked;
     const char *reason = published.active ? "resmed_ota_active" : blocked ? blocked : "";
+    const char *dump_reason = published.active ? "resmed_ota_active" : dump_blocked ? dump_blocked : "";
     if (published.install_allowed != allowed || published.upload_allowed != upload_allowed ||
-        strcmp(published.blocked, reason)) {
+        published.dump_allowed != dump_allowed || strcmp(published.blocked, reason) ||
+        strcmp(published.dump_blocked, dump_reason)) {
         published.install_allowed = allowed;
         published.upload_allowed = upload_allowed;
+        published.dump_allowed = dump_allowed;
         snprintf(published.blocked, sizeof(published.blocked), "%s", reason);
+        snprintf(published.dump_blocked, sizeof(published.dump_blocked), "%s", dump_reason);
         ++published.revision;
     }
     portEXIT_CRITICAL(&status_mux);

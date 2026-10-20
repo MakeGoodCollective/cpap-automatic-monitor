@@ -58,6 +58,7 @@ namespace ResmedOta {
         bool install_allowed = false;
         bool dump_allowed = false;
         char blocked[48] = {};
+        char dump_blocked[48] = {};
         bool recovery_available = false;
         char recovery_path[256] = {};
         bool confirmation_required = false;
@@ -67,6 +68,10 @@ namespace ResmedOta {
     // Callback-safe admission/copy only. The owner reserves synchronously,
     // then validates/prepares/programs on its worker. No hardware I/O here.
     bool start_install(const InstallRequest &request, const char **error = nullptr);
+    // Dump probes the live extension first. Recovery, when available, waits for
+    // explicit consent bound to this operation ID; neither callback does I/O.
+    bool start_dump(const char **error = nullptr);
+    bool confirm_dump(uint32_t id, const char **error = nullptr);
     // Main-loop publication of cached admission facts. No UART/storage I/O.
     void poll();
     // Copy only; does not refresh admission or join other owners.
