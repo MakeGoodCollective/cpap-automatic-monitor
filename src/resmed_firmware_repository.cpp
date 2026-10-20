@@ -10,10 +10,10 @@
 #include <FS.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
-#include <freertos/task.h>
 #include <new>
 #include "memory_manager.h"
 #include "sd_storage.h"
+#include "storage_browser.h"
 #endif
 
 namespace ResmedFirmwareRepository {
@@ -36,6 +36,31 @@ bool bootloader_path(const char *bid, char *out, size_t capacity) {
     return written > 0 && size_t(written) < capacity;
 }
 
+
+bool valid_directory(const char *path) {
+    if (!path || strlen(path) >= MAX_PATH) return false;
+    if (!strcmp(path, ROOT)) return true;
+    const size_t root_length = strlen(ROOT);
+    if (strncmp(path, ROOT, root_length) || path[root_length] != '/') return false;
+    const char *name = path + root_length + 1;
+    for (;;) {
+        const char *slash = strchr(name, '/');
+        const size_t length = slash ? size_t(slash - name) : strlen(name);
+        char component[193];
+        if (!length || length >= sizeof(component)) return false;
+        memcpy(component, name, length);
+        component[length] = 0;
+        if (!valid_filename(component)) return false;
+        if (!slash) return true;
+        name = slash + 1;
+    }
+}
+
+bool is_bootloader(const char *path) {
+    constexpr const char *prefix = "/airbridge/resmed-firmware/bootloaders/";
+    return path && !strncmp(path, prefix, strlen(prefix));
+}
+
 bool valid_path(const char *path) {
     if (!path || strlen(path) >= MAX_PATH) return false;
     const size_t root_length = strlen(ROOT);
@@ -43,19 +68,7 @@ bool valid_path(const char *path) {
     const char *name = path + root_length + 1;
     if (!strchr(name, '/')) return valid_filename(name);
     constexpr const char *prefix = "bootloaders/";
-    if (strncmp(name, prefix, strlen(prefix))) {
-        for (;;) {
-            const char *slash = strchr(name, '/');
-            const size_t length = slash ? size_t(slash - name) : strlen(name);
-            char component[193];
-            if (!length || length >= sizeof(component)) return false;
-            memcpy(component, name, length);
-            component[length] = 0;
-            if (!valid_filename(component)) return false;
-            if (!slash) return true;
-            name = slash + 1;
-        }
-    }
+    if (strncmp(name, prefix, strlen(prefix))) return valid_directory(path);
     name += strlen(prefix);
     const char *slash = strchr(name, '/');
     if (!slash || size_t(slash - name) > 31) return false;
@@ -67,27 +80,25 @@ bool valid_path(const char *path) {
 #if AB_STORAGE_HAS_SDCARD
 namespace {
 SemaphoreHandle_t mutex = nullptr;
-TaskHandle_t task = nullptr;
 Status status;
 std::shared_ptr<const Snapshot> published;
-std::weak_ptr<const Snapshot> retired;
-uint32_t requested = 1, completed = 0;
-bool last_available = false;
 constexpr size_t INTERNAL_BYTES = 4096;
-constexpr size_t MAX_PACKED_BYTES = MAX_ENTRIES * (MAX_PATH + 40);
-constexpr const char *BOOTLOADERS = "/airbridge/resmed-firmware/bootloaders";
+constexpr size_t MAX_PACKED_BYTES = PAGE_SIZE * (MAX_PATH + 40);
 }
 
 struct Builder {
     std::shared_ptr<Snapshot> result{new (std::nothrow) Snapshot};
     size_t used = 0, capacity = 0;
 
-    void truncate() { if (result) result->truncated_ = true; }
+    void select(const char *path, uint32_t offset) {
+        if (result) { strcpy(result->path_, path); result->offset_ = offset; }
+    }
+    void finish_page(bool more) { if (result) result->more_ = more; }
 
     bool append(const char *path, uint64_t size, int64_t modified, bool bootloader,
                 bool directory = false) {
         if (!result) return false;
-        if (result->count_ == MAX_ENTRIES) { result->truncated_ = true; return true; }
+        if (result->count_ == PAGE_SIZE) return false;
         const size_t bytes = (sizeof(Snapshot::Entry) + strlen(path) + 1 + 7) & ~size_t(7);
         if (used + bytes > capacity) {
             size_t wanted = capacity ? capacity * 2 : 512;
@@ -113,10 +124,9 @@ struct Builder {
         return true;
     }
 
-    void finish(uint32_t revision, bool truncated) {
+    void finish(uint32_t revision) {
         if (!result) return;
         result->revision_ = revision;
-        result->truncated_ |= truncated;
         if (used && used < capacity) {
             void *shrunk = aircannect::Memory::realloc_large(result->packed_, used,
                                                            used <= INTERNAL_BYTES);
@@ -149,169 +159,9 @@ bool Snapshot::contains(const char *path) const {
     return false;
 }
 
-namespace {
-// Only queued paths, not open directories or image bytes. Popped nodes release
-// their allocation immediately; the scan's entry limit bounds the whole walk.
-class Directories {
-    struct Node { Node *next; size_t bytes; char path[1]; };
-    Node *first_ = nullptr, *last_ = nullptr;
-    size_t bytes_ = 0;
-public:
-    ~Directories() {
-        while (first_) {
-            Node *next = first_->next;
-            aircannect::Memory::free(first_);
-            first_ = next;
-        }
-    }
-    bool add(const char *path) {
-        const size_t bytes = sizeof(Node) + strlen(path);
-        auto *node = static_cast<Node *>(aircannect::Memory::alloc_large(
-            bytes, bytes_ + bytes <= INTERNAL_BYTES));
-        if (!node) return false;
-        node->next = nullptr;
-        node->bytes = bytes;
-        strcpy(node->path, path);
-        if (last_) last_->next = node;
-        else first_ = node;
-        last_ = node;
-        bytes_ += bytes;
-        return true;
-    }
-    bool take(char (&path)[MAX_PATH]) {
-        if (!first_) return false;
-        Node *node = first_;
-        strcpy(path, node->path);
-        first_ = node->next;
-        if (!first_) last_ = nullptr;
-        bytes_ -= node->bytes;
-        aircannect::Memory::free(node);
-        return true;
-    }
-};
-
-bool ensure_directories(SdStorage::Session &session) {
-    return session.mutate(ROOT, [](fs::FS &fs) {
-        for (const char *path : {"/airbridge", ROOT, BOOTLOADERS}) {
-            if (!fs.exists(path) && !fs.mkdir(path)) return false;
-            fs::File dir = fs.open(path);
-            if (!dir || !dir.isDirectory()) return false;
-        }
-        return true;
-    });
-}
-
-const char *scan(Builder &builder, uint32_t files, SdStorage::Session &session) {
-    // Keep the pending FIFO ticket across retries so background peers yield.
-    if (!session.begin()) return "storage_busy";
-    const char *error = nullptr;
-    {
-        SdStorage::Reader directory;
-        Directories pending;
-        char parent[MAX_PATH];
-        unsigned visited = 0;
-        if (!ensure_directories(session)) error = "directory_failed";
-        if (!error && !pending.add(ROOT)) error = "catalog_no_memory";
-        while (!error && pending.take(parent)) {
-            directory.close();
-            if (!directory.open(session, parent, true)) {
-                error = "scan_open_failed";
-                break;
-            }
-            for (;;) {
-                SdStorage::Reader::Entry item{};
-                bool end = false;
-                if (session.yield_requested()) { error = "storage_busy"; break; }
-                if (visited == MAX_SCAN_ENTRIES) { builder.truncate(); break; }
-                if (!directory.next(item, end)) { error = "scan_failed"; break; }
-                if (end) break;
-                ++visited;
-                const char *name = strrchr(item.name, '/');
-                name = name ? name + 1 : item.name;
-                if (!valid_filename(name)) continue;
-                char path[MAX_PATH];
-                const int length = snprintf(path, sizeof(path), "%s/%s", parent, name);
-                if (length < 0 || size_t(length) >= sizeof(path)) {
-                    builder.truncate();
-                    continue;
-                }
-                if (item.directory) {
-                    if (!builder.append(path, 0, item.modified, false, true)) {
-                        error = "catalog_no_memory";
-                        break;
-                    }
-                    if (!pending.add(path)) { error = "catalog_no_memory"; break; }
-                    continue;
-                }
-                if (!valid_path(path)) continue;
-                const size_t bootloaders_length = strlen(BOOTLOADERS);
-                const bool bootloader = !strncmp(path, BOOTLOADERS, bootloaders_length) &&
-                                        path[bootloaders_length] == '/';
-                if (!builder.append(path, item.size, item.modified, bootloader)) {
-                    error = "catalog_no_memory";
-                    break;
-                }
-                vTaskDelay(1);
-            }
-            if (visited == MAX_SCAN_ENTRIES) break;
-        }
-    }
-    if (!session.valid() || files != SdStorage::files_revision(SdStorage::FileScope::Firmware)) error = "storage_changed";
-    session.end();
-    return error;
-}
-
-void worker(void *) {
-    SdStorage::Session session;
-    for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        xSemaphoreTake(mutex, portMAX_DELAY);
-        const uint32_t target = requested, files = status.files_revision;
-        if (!status.available || completed == target || !retired.expired()) {
-            xSemaphoreGive(mutex);
-            session.end();
-            continue;
-        }
-        status.refreshing = true;
-        xSemaphoreGive(mutex);
-
-        Builder builder;
-        const char *error = builder.result ? scan(builder, files, session) : "catalog_no_memory";
-        if (!builder.result) session.end();
-        xSemaphoreTake(mutex, portMAX_DELAY);
-        status.refreshing = false;
-        if (!error && target == requested && status.available) {
-            ++status.revision;
-            builder.finish(status.revision, false);
-            retired = published;
-            published = std::move(builder.result);
-            status.ready = true;
-            status.entries = published->size();
-            status.truncated = published->truncated();
-            status.error[0] = 0;
-            completed = target;
-        } else {
-            const char *reason = error ? error : "storage_changed";
-            // Retrying the same unavailable SD lease is not a new publication.
-            if (status.ready || strcmp(status.error, reason)) ++status.revision;
-            status.ready = false;
-            snprintf(status.error, sizeof(status.error), "%s", reason);
-            // Admission/preemption retries are driven by main poll, not HTTP.
-            if (error && strcmp(error, "storage_busy") && strcmp(error, "storage_changed"))
-                completed = target;
-        }
-        xSemaphoreGive(mutex);
-    }
-}
-}
-
 void init() {
-    if (mutex) return;
-    mutex = xSemaphoreCreateMutex();
-    if (!mutex) return;
-    status.supported = true;
-    if (xTaskCreate(worker, "fw_catalog", 4096, nullptr, 1, &task) != pdPASS)
-        snprintf(status.error, sizeof(status.error), "worker_no_memory");
+    if (!mutex) mutex = xSemaphoreCreateMutex();
+    if (mutex) status.supported = true;
 }
 
 void poll() {
@@ -319,29 +169,79 @@ void poll() {
     const bool available = SdStorage::mounted() && SdStorage::local_access_allowed();
     const uint32_t files = SdStorage::files_revision(SdStorage::FileScope::Firmware);
     xSemaphoreTake(mutex, portMAX_DELAY);
-    const bool changed = last_available != available || files != status.files_revision;
-    if (changed) {
-        last_available = available;
+    status.supported = true;
+    if (status.available != available || files != status.files_revision) {
         status.available = available;
         status.files_revision = files;
         status.ready = false;
-        ++requested;
+        published.reset();
         ++status.revision;
-        if (!available) snprintf(status.error, sizeof(status.error), "storage_unavailable");
+        snprintf(status.error, sizeof(status.error), "%s", available ? "" : "storage_unavailable");
     }
-    const bool wake = !status.refreshing && (changed || (available && completed != requested));
     xSemaphoreGive(mutex);
-    if (wake && task) xTaskNotifyGive(task);
 }
 
 void request_refresh() {
     if (!mutex) return;
     xSemaphoreTake(mutex, portMAX_DELAY);
-    ++requested;
+    published.reset();
     status.ready = false;
     ++status.revision;
     xSemaphoreGive(mutex);
-    if (task) xTaskNotifyGive(task);
+}
+
+bool request_listing(const char *path, uint32_t offset) {
+    if (!mutex || !valid_directory(path)) return false;
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    if (status.refreshing || (published && status.ready &&
+        published->offset() == offset && !strcmp(published->path(), path))) {
+        xSemaphoreGive(mutex);
+        return true;
+    }
+    status.refreshing = true;
+    status.ready = false;
+    status.error[0] = 0;
+    published.reset();
+    const uint32_t revision = status.revision;
+    xSemaphoreGive(mutex);
+
+    auto builder = std::shared_ptr<Builder>(new(std::nothrow) Builder);
+    if (!builder || !builder->result) {
+        xSemaphoreTake(mutex, portMAX_DELAY);
+        status.refreshing = false;
+        snprintf(status.error, sizeof(status.error), "listing_no_memory");
+        xSemaphoreGive(mutex);
+        return false;
+    }
+    builder->select(path, offset);
+    StorageBrowser::Request request = {};
+    request.kind = StorageBrowser::Kind::List;
+    request.firmware_repository = true;
+    request.offset = offset;
+    strcpy(request.path, path);
+    std::weak_ptr<StorageBrowser::Transfer> active;
+    auto complete = [builder, revision](int, const char *error,
+            std::shared_ptr<StorageBrowser::Transfer>, uint64_t) {
+        xSemaphoreTake(mutex, portMAX_DELAY);
+        status.refreshing = false;
+        if (!error && revision == status.revision && builder->result) {
+            builder->finish(revision);
+            published = builder->result;
+            status.ready = true;
+            status.entries = published->size();
+        } else {
+            snprintf(status.error, sizeof(status.error), "%s", error ? error : "storage_changed");
+        }
+        xSemaphoreGive(mutex);
+    };
+    const auto result = StorageBrowser::start(request, complete, active, nullptr,
+        [builder](const char *entry, uint64_t size, int64_t modified, bool directory, bool more) {
+            if (!entry) { builder->finish_page(more); return bool(builder->result); }
+            return builder->append(entry, size, modified, !directory && is_bootloader(entry), directory);
+        });
+    if (result != StorageBrowser::StartResult::Started)
+        complete(503, result == StorageBrowser::StartResult::Busy ? "storage_busy" : "storage_unavailable", {}, 0);
+    return result == StorageBrowser::StartResult::Started;
 }
 
 void get_status(Status &out) {
@@ -370,7 +270,6 @@ std::shared_ptr<const Snapshot> snapshot(Status &out) {
 bool notify_published(const char *path) {
     if (!valid_path(path)) return false;
     SdStorage::notify_files_changed(path);
-    request_refresh();
     return true;
 }
 
@@ -382,6 +281,7 @@ void init() {}
 void poll() {}
 void request_refresh() {}
 void get_status(Status &out) { out = {}; }
+bool request_listing(const char *, uint32_t) { return false; }
 std::shared_ptr<const Snapshot> snapshot() { return {}; }
 std::shared_ptr<const Snapshot> snapshot(Status &out) { out = {}; return {}; }
 bool notify_published(const char *) { return false; }

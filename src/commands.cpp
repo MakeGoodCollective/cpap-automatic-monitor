@@ -695,19 +695,34 @@ void dispatch_command(const char *line, String &response) {
             ResmedFirmwareUpload::get_status(upload);
             ResmedFirmwareUpload::cancel(upload.id);
             response = "OK: cancellation requested; see FLASH STATUS\n";
-        } else if (sub == "LIST") {
+        } else if (sub == "LIST" || sub.startsWith("LIST ")) {
+            int position = 10;
+            String path = parse_quoted_token(cmd, &position);
+            const String offset_text = parse_quoted_token(cmd, &position);
+            uint32_t offset = 0;
+            if (path.isEmpty()) path = ResmedFirmwareRepository::ROOT;
+            if (!ResmedFirmwareRepository::valid_directory(path.c_str()) ||
+                (!offset_text.isEmpty() && !aircannect::parse_uint32_decimal(offset_text.c_str(), offset)) ||
+                !parse_quoted_token(cmd, &position).isEmpty()) {
+                response = "ERR: FLASH LIST [directory] [offset]\n";
+                return;
+            }
+            ResmedFirmwareRepository::request_listing(path.c_str(), offset);
             ResmedFirmwareRepository::Status status;
             const auto listing = ResmedFirmwareRepository::snapshot(status);
-            if (!status.ready || !listing) {
-                response = "ERR: repository not ready\n";
+            if (!status.ready || !listing || listing->offset() != offset || strcmp(listing->path(), path.c_str())) {
+                response = status.refreshing ? "Listing requested; repeat FLASH LIST for result\n" :
+                    "ERR: " + String(*status.error ? status.error : "repository unavailable") + "\n";
             } else {
                 response = "Firmware repository:\n";
                 for (size_t i = 0; i < listing->size(); ++i) {
                     ResmedFirmwareRepository::EntryView entry;
                     if (!listing->entry(i, entry)) break;
-                    response += String(entry.path) + " " + String(uint32_t(entry.size)) + " bytes\n";
+                    response += String(entry.path) + (entry.directory ? "/\n" :
+                        " " + String(uint32_t(entry.size)) + " bytes\n");
                 }
-                if (listing->truncated()) response += "WARN: listing truncated\n";
+                if (listing->more()) response += "Next: FLASH LIST \"" + path + "\" " +
+                    String(offset + ResmedFirmwareRepository::PAGE_SIZE) + "\n";
             }
         } else if (sub == "REFRESH") {
             ResmedFirmwareRepository::request_refresh();
@@ -808,7 +823,8 @@ void dispatch_command(const char *line, String &response) {
                    "  STORAGE USB ON|OFF  Share SD over USB / return after disconnect\n"
                    "  FLASH [block] [BLX] [FORCE]  Flash uploaded firmware\n"
                    "  FLASH STATUS|CANCEL Monitor/cancel flash or dump\n"
-                   "  FLASH LIST|REFRESH  Firmware repository\n"
+                   "  FLASH LIST [directory] [offset]  Firmware directory page\n"
+                   "  FLASH REFRESH       Refresh firmware repository\n"
                    "  FLASH DUMP          Save firmware to SD\n"
                    "  LOG                 Show all category log levels\n"
                    "  LOG [cat] level     Set log level (use LOG to list categories, or ALL)\n"

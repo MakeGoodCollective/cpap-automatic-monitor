@@ -2094,77 +2094,18 @@ static void handleFlashStart(AsyncWebServerRequest *request) {
     request->send(accepted ? 202 : 409, "application/json", json);
 }
 
-class FirmwareRepositoryResponse : public AsyncAbstractResponse {
-public:
-    FirmwareRepositoryResponse() {
-        _code = 200;
-        _contentType = "application/json";
-        _chunked = true;
-        _sendContentLength = false;
-        valid_ = pending_.reserve(768);
-        if (!valid_) return;
-        ResmedFirmwareRepository::Status status;
-        snapshot_ = ResmedFirmwareRepository::snapshot(status);
-        pending_ = "{";
-        jsonAddUInt32(pending_, "revision", status.revision, false);
-        jsonAddBool(pending_, "supported", status.supported);
-        jsonAddBool(pending_, "available", status.available);
-        jsonAddBool(pending_, "ready", status.ready);
-        jsonAddBool(pending_, "truncated", status.truncated);
-        jsonAddString(pending_, "error", status.error);
-        jsonAddString(pending_, "root", ResmedFirmwareRepository::ROOT);
-        pending_ += ",\"entries\":[";
-    }
-
-    bool _sourceValid() const override { return valid_; }
-
-protected:
-    size_t _fillBuffer(uint8_t *out, size_t capacity) override {
-        size_t written = 0;
-        while (written < capacity) {
-            if (offset_ == pending_.length()) {
-                if (done_) break;
-                offset_ = 0;
-                ResmedFirmwareRepository::EntryView entry;
-                if (snapshot_ && snapshot_->entry(next_, entry)) {
-                    pending_ = next_++ ? ",{" : "{";
-                    jsonAddString(pending_, "name", entry.filename, false);
-                    jsonAddString(pending_, "path", entry.path);
-                    jsonAddUInt32(pending_, "size", entry.size);
-                    char modified[24];
-                    snprintf(modified, sizeof(modified), "%lld",
-                             static_cast<long long>(entry.modified > 0 ? entry.modified : 0));
-                    pending_ += ",\"modified\":";
-                    pending_ += modified;
-                    jsonAddBool(pending_, "bootloader", entry.bootloader);
-                    jsonAddBool(pending_, "directory", entry.directory);
-                    pending_ += '}';
-                } else { pending_ = "]}"; done_ = true; }
-            }
-            const size_t count = min(capacity - written, pending_.length() - offset_);
-            memcpy(out + written, pending_.c_str() + offset_, count);
-            offset_ += count;
-            written += count;
-        }
-        return written;
-    }
-
-private:
-    std::shared_ptr<const ResmedFirmwareRepository::Snapshot> snapshot_;
-    String pending_;
-    size_t offset_ = 0, next_ = 0;
-    bool valid_ = false, done_ = false;
-};
+#if AB_STORAGE_HAS_SDCARD
+static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind kind,
+                          bool repository = false);
+#endif
 
 static void handleFirmwareRepository(AsyncWebServerRequest *request) {
+#if AB_STORAGE_HAS_SDCARD
+    handleStorage(request, StorageBrowser::Kind::List, true);
+#else
     if (!checkAuth(request)) return;
-    auto *response = new(std::nothrow) FirmwareRepositoryResponse;
-    if (!response || !response->_sourceValid()) {
-        delete response;
-        request->send(503, "application/json", "{\"error\":\"no_memory\"}");
-        return;
-    }
-    request->send(response);
+    request->send(200, "application/json", "{\"supported\":false,\"ready\":false,\"entries\":[]}");
+#endif
 }
 
 static void handleFirmwareRepositoryRefresh(AsyncWebServerRequest *request) {
@@ -2681,13 +2622,14 @@ static void handleStorageUsb(AsyncWebServerRequest *request) {
     request->send(202, "application/json", "{\"ok\":true}");
 }
 
-static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind kind) {
+static void handleStorage(AsyncWebServerRequest *request, StorageBrowser::Kind kind, bool repository) {
     if (!checkAuth(request)) return;
     StorageBrowser::Request operation = {};
     operation.kind = kind;
+    operation.firmware_repository = repository;
     const bool mutation = kind == StorageBrowser::Kind::Rename || kind == StorageBrowser::Kind::Delete;
     const String path = request->hasParam("path", mutation)
-        ? request->getParam("path", mutation)->value() : "/";
+        ? request->getParam("path", mutation)->value() : repository ? ResmedFirmwareRepository::ROOT : "/";
     if (path.isEmpty() || path[0] != '/' || path.length() >= sizeof(operation.path) ||
         path.length() != strlen(path.c_str())) {
         request->send(400, "application/json", "{\"error\":\"invalid_path\"}");

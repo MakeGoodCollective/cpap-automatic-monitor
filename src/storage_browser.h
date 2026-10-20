@@ -7,6 +7,8 @@
 
 namespace StorageBrowser {
 
+constexpr uint32_t LIST_PAGE_SIZE = 32;
+
 enum class Kind { List, File, Archive, Rename, Delete, Immutable };
 enum class StartResult { Started, BadRequest, Busy, Unavailable };
 
@@ -15,6 +17,7 @@ struct Request {
     char path[256];
     char selection[2048]; // Child names separated by newlines, or destination for Rename.
     uint32_t offset;
+    bool firmware_repository = false;
     struct Range { uint32_t first = 0, last = 0; } ranges[8];
     uint8_t range_count = 0;
     bool head = false, unchanged = false;
@@ -33,6 +36,10 @@ public:
 using Ready = std::function<void(int code, const char *error,
     std::shared_ptr<Transfer> transfer, uint64_t size)>;
 using Released = void (*)();
+// Optional metadata consumer instead of a JSON transfer. A null path marks the
+// end of the page; more then indicates another page. Runs in the list worker.
+using ListSink = std::function<bool(const char *path, uint64_t size,
+    int64_t modified, bool directory, bool more)>;
 
 struct MutationStatus {
     bool active;
@@ -53,7 +60,7 @@ struct MutationStatus {
 // cancelled/failed before activation. It is not called unless start returns
 // Started. An active slot outlives the producer until its response is released.
 StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active,
-                  Released released = nullptr);
+                  Released released = nullptr, ListSink listing = {});
 void mutation_status(MutationStatus &out);
 
 }  // namespace StorageBrowser

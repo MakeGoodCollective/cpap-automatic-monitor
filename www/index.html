@@ -878,6 +878,10 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
             <div class="firmware-list">
               <div id="firmwareEntries" role="group" data-i18n-aria-label="ota.repository"></div>
             </div>
+            <div class="btn-row" id="firmwarePages" hidden>
+              <button class="btn" id="firmwarePrev" onclick="openFirmwareDirectory(firmwareDirectory, firmwareOffset - 32)" data-i18n="common.previous"></button>
+              <button class="btn" id="firmwareNext" onclick="openFirmwareDirectory(firmwareDirectory, firmwareOffset + 32)" data-i18n="common.next"></button>
+            </div>
           </section>
           <section id="firmwareDumpConfirmation" hidden>
             <p class="firmware-note" data-i18n="ota.dumpBootloaderWarning"></p>
@@ -5194,6 +5198,7 @@ let resmedAuthFailed = false, resmedConnectionSerial = 0;
 let firmwareRepository = null, firmwareRepositoryRead = null, firmwareRepositoryDirty = true;
 let firmwareRepositorySerial = 0, firmwareRepositoryRevision = null, firmwareRepositoryError = '';
 let firmwareDirectory = '';
+let firmwareOffset = 0;
 let firmwareConfirmationKey = '';
 let firmwareUploadRequest = false, firmwareUploadId = null;
 let firmwareUploadProgress = {sent:0,total:0,failed:false};
@@ -5289,14 +5294,33 @@ async function loadFirmwareRepository() {
   firmwareRepositoryError = '';
   firmwareRepositoryRead = (async () => {
     try {
-      const response = await api('/api/resmed/repository', undefined, 5000);
+      const query = new URLSearchParams({offset:firmwareOffset});
+      if (firmwareDirectory) query.set('path', firmwareDirectory);
+      const response = await api('/api/resmed/repository?' + query, undefined, 15000);
       if (!response) { resmedAuthFailed = true; resmedDisconnected(); return; }
       const data = await response.json();
       if (serial !== firmwareRepositorySerial || storageMutation || !resmedFresh) return;
-      if (!response.ok) throw new Error(data.error || 'repository_unavailable');
+      if (!response.ok) {
+        if (data.error === 'directory_not_found' && firmwareDirectory &&
+            firmwareRepository?.root && firmwareDirectory !== firmwareRepository.root) {
+          firmwareDirectory = firmwareDirectory.slice(0, firmwareDirectory.lastIndexOf('/'));
+          firmwareOffset = 0;
+          firmwareRepositoryDirty = true;
+          return;
+        }
+        throw new Error(data.error || 'repository_unavailable');
+      }
       if (typeof data.supported !== 'boolean' || typeof data.ready !== 'boolean' || !Array.isArray(data.entries))
         throw new Error('repository_invalid_response');
       firmwareRepository = data;
+      if (data.ready) {
+        firmwareDirectory = data.path;
+        if (firmwareOffset && !data.entries.length) {
+          firmwareOffset = 0;
+          firmwareRepositoryDirty = true;
+          return;
+        }
+      }
       renderFirmwareRepository();
     } catch(error) {
       if (serial === firmwareRepositorySerial) firmwareRepositoryError = uiError(error);
@@ -5310,24 +5334,20 @@ async function loadFirmwareRepository() {
   return firmwareRepositoryRead;
 }
 
-function firmwareDirectoryEntries() {
-  const parent = (firmwareDirectory || firmwareRepository?.root || '') + '/';
-  return (firmwareRepository?.entries || []).filter(entry =>
-    entry.path.startsWith(parent) && !entry.path.slice(parent.length).includes('/'));
-}
-
-function openFirmwareDirectory(path) {
+function openFirmwareDirectory(path, offset = 0) {
   if (!resmedFresh || !firmwareRepository?.ready || firmwareRepositoryDirty ||
       firmwareRepositoryRead || firmwareRepositoryError || storageMutation ||
       resmedRequest || firmwareUploadRequest) return;
   path ??= firmwareDirectory.slice(0, firmwareDirectory.lastIndexOf('/'));
   const ancestor = path.startsWith(firmwareRepository.root + '/') &&
     firmwareDirectory.startsWith(path + '/');
-  if (path !== firmwareRepository.root && !ancestor && !firmwareRepository.entries.some(entry =>
+  if (path !== firmwareDirectory && path !== firmwareRepository.root && !ancestor && !firmwareRepository.entries.some(entry =>
     entry.directory && entry.path === path)) return;
   firmwareDirectory = path;
-  renderFirmwareRepository();
-  renderResmedStatus();
+  firmwareOffset = Math.max(0, offset);
+  firmwareRepositorySerial++;
+  firmwareRepositoryDirty = true;
+  loadFirmwareRepository();
 }
 
 function renderFirmwareRepository() {
@@ -5341,12 +5361,7 @@ function renderFirmwareRepository() {
   const root = firmwareRepository.root;
   if (!firmwareDirectory || (firmwareDirectory !== root && !firmwareDirectory.startsWith(root + '/')))
     firmwareDirectory = root;
-  // A deleted/moved directory returns to the nearest surviving parent.
-  // A truncated scan cannot establish that a directory disappeared.
-  while (firmwareDirectory !== root && !firmwareRepository.truncated &&
-      !firmwareRepository.entries.some(entry => entry.directory && entry.path === firmwareDirectory))
-    firmwareDirectory = firmwareDirectory.slice(0, firmwareDirectory.lastIndexOf('/'));
-  for (const entry of firmwareDirectoryEntries().sort((a, b) =>
+  for (const entry of [...firmwareRepository.entries].sort((a, b) =>
       Number(!!b.directory) - Number(!!a.directory) || a.name.localeCompare(b.name))) {
     const row = document.createElement('div'); row.className = 'storage-row';
     const content = document.createElement('div');
@@ -5432,6 +5447,9 @@ function renderResmedStatus() {
   document.getElementById('firmwareRepositoryPath').hidden = !repository?.root;
   document.getElementById('firmwareUp').disabled = !repositoryReady || busy ||
     !firmwareDirectory || firmwareDirectory === repository?.root;
+  document.getElementById('firmwarePages').hidden = !firmwareOffset && !repository?.more;
+  document.getElementById('firmwarePrev').disabled = !repositoryReady || busy || !firmwareOffset;
+  document.getElementById('firmwareNext').disabled = !repositoryReady || busy || !repository?.more;
   const uploadAllowed = resmedFresh && !busy && upload?.active !== true && state.upload_allowed === true;
   const repositoryUploadAllowed = uploadAllowed && repositoryReady && repository?.supported === true;
   fi.disabled = !uploadAllowed;
@@ -5462,8 +5480,7 @@ function renderResmedStatus() {
     repository?.supported !== false && (firmwareRepositoryRead || !repository) ? uiMessage('ota.repositoryLoading') :
     state.blocked ? uiError(state.blocked) :
     repository?.supported === false ? '' :
-      repository.truncated ? uiMessage('ota.repositoryTruncated') :
-      !firmwareDirectoryEntries().length ? uiMessage(firmwareDirectory === repository.root ?
+      !repository?.entries.length ? uiMessage(firmwareDirectory === repository?.root ?
         'ota.repositoryEmpty' : 'storage.emptyDirectory') : ''));
   document.getElementById('btnFirmwareDump').disabled = !resmedFresh || busy || state.dump_allowed !== true;
   uiText(document.getElementById('btnFirmwareDump'),

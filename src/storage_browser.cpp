@@ -1,4 +1,5 @@
 #include "storage_browser.h"
+#include "resmed_firmware_repository.h"
 #include "board.h"
 
 #if AB_STORAGE_HAS_SDCARD
@@ -104,6 +105,8 @@ bool rename_target(const Request &request, char (&out)[256]) {
 bool valid_request(const Request &request) {
     if (!memchr(request.path, 0, sizeof(request.path)) || !valid_path(request.path) ||
         !memchr(request.selection, 0, sizeof(request.selection))) return false;
+    if (request.firmware_repository && (request.kind != Kind::List ||
+        !ResmedFirmwareRepository::valid_directory(request.path))) return false;
     if (request.range_count > 8 || (request.kind != Kind::Immutable && request.range_count)) return false;
     uint64_t bytes = 0;
     for (unsigned i = 0; i < request.range_count; ++i) {
@@ -139,6 +142,7 @@ class Job final : public Transfer {
 public:
     Request request = {};
     Ready ready;
+    ListSink listing;
     Released released = nullptr;
     SdStorage::Session session;
     SdStorage::Reader input;
@@ -303,30 +307,64 @@ public:
 };
 
 bool list(Job &job, aircannect::LargeTextBuffer &json) {
-    if (!job.open_input(job.request.path, true)) return job.fail("directory_open_failed");
+    const bool repository = job.request.firmware_repository;
+    bool end = false;
+    if (repository) {
+        bool exists = false;
+        if (!job.session.run([&](fs::FS &fs) { exists = fs.exists(job.request.path); return true; }))
+            return job.fail("directory_read_failed");
+        if (!exists && strcmp(job.request.path, ResmedFirmwareRepository::ROOT))
+            return job.fail("directory_not_found");
+        end = !exists;
+    }
+    if (!end && !job.open_input(job.request.path, true)) return job.fail("directory_open_failed");
     json = "{\"ok\":true";
     aircannect::json_add_string(json, "path", job.request.path);
+    aircannect::json_add_uint64(json, "offset", job.request.offset);
+    if (repository) {
+        aircannect::json_add_string(json, "root", ResmedFirmwareRepository::ROOT);
+        aircannect::json_add_bool(json, "supported", true);
+        aircannect::json_add_bool(json, "available", true);
+        aircannect::json_add_bool(json, "ready", true);
+    }
     json += ",\"entries\":[";
     uint32_t seen = 0, count = 0;
-    bool end = false;
     SdStorage::Reader::Entry entry;
     while (!end) {
         if (!job.next_input(entry, end)) return job.fail("directory_read_failed");
         if (end) break;
+        char path[256] = {};
+        if ((repository || job.listing) &&
+            !child_path(job.request.path, entry.name, strlen(entry.name), path))
+            return job.fail("invalid_path");
+        if (repository && !(entry.directory ? ResmedFirmwareRepository::valid_directory(path)
+                                            : ResmedFirmwareRepository::valid_path(path))) continue;
         if (seen++ < job.request.offset) continue;
-        if (count == 32) break;
+        if (count == LIST_PAGE_SIZE) break;
+        if (job.listing) {
+            if (!job.listing(path, entry.size, entry.modified, entry.directory, false))
+                return job.fail("listing_no_memory");
+            ++count;
+            continue;
+        }
         if (count++) json += ',';
         json += '{';
         aircannect::json_add_string(json, "name", entry.name, false);
         aircannect::json_add_uint64(json, "size", entry.size);
         aircannect::json_add_uint64(json, "modified", entry.modified > 0 ? entry.modified : 0);
         aircannect::json_add_bool(json, "directory", entry.directory);
+        if (repository) {
+            aircannect::json_add_string(json, "path", path);
+            aircannect::json_add_bool(json, "bootloader", !entry.directory &&
+                ResmedFirmwareRepository::is_bootloader(path));
+        }
         json += '}';
     }
     json += ']';
     aircannect::json_add_bool(json, "more", !end);
     json += '}';
     job.close_input();
+    if (job.listing) return job.listing(nullptr, 0, 0, false, !end);
     return !json.overflowed() || job.fail("listing_no_memory");
 }
 
@@ -608,9 +646,17 @@ void produce(void *context) {
     } else if (job->request.kind == Kind::List) {
         aircannect::LargeTextBuffer json;
         if (list(*job, json)) {
-            job->ready(200, nullptr, job, json.length());
-            success = job->emit(reinterpret_cast<const uint8_t *>(json.c_str()), json.length());
-        } else job->ready(409, "listing_failed", nullptr, 0);
+            if (job->listing) {
+                job->session.end();
+                job->release_owner();
+                job->ready(200, nullptr, nullptr, 0);
+                success = true;
+            } else {
+                job->ready(200, nullptr, job, json.length());
+                success = job->emit(reinterpret_cast<const uint8_t *>(json.c_str()), json.length());
+            }
+        } else job->ready(409, job->failure ? job->failure : "listing_failed", nullptr, 0);
+        job->listing = nullptr;
     } else if (job->request.kind == Kind::Immutable) {
         success = immutable_file(job);
     } else if (job->request.kind == Kind::File) {
@@ -660,7 +706,7 @@ const char *launch(const std::shared_ptr<Job> &job) {
     if (job->cancelled.load()) return "cancelled";
     if (!SdStorage::local_access_allowed() || !SdStorage::mounted() ||
         !AirSenseState::local_background_allowed()) return "storage_unavailable";
-    if (!mutating(job->request.kind)) {
+    if (!mutating(job->request.kind) && !job->listing) {
         job->capacity = RING_BYTES;
         job->ring = static_cast<uint8_t *>(aircannect::Memory::alloc_large(RING_BYTES, false));
         if (!job->ring) {
@@ -769,8 +815,8 @@ void cancel_pending(Job *target) {
 }  // namespace
 
 StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &active,
-                  Released released) {
-    if (!valid_request(request)) return StartResult::BadRequest;
+                  Released released, ListSink listing) {
+    if (!valid_request(request) || (listing && request.kind != Kind::List)) return StartResult::BadRequest;
     if (!SdStorage::local_access_allowed() || !SdStorage::mounted()) return StartResult::Unavailable;
     void *memory = aircannect::Memory::alloc_large(sizeof(Job));
     if (!memory) {
@@ -783,6 +829,7 @@ StartResult start(const Request &request, Ready ready, std::weak_ptr<Transfer> &
     });
     job->request = request;
     job->ready = std::move(ready);
+    job->listing = std::move(listing);
     const bool exclusive = mutating(request.kind);
     bool accepted = false, queued = false;
     portENTER_CRITICAL(&admission_mux);
