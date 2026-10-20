@@ -9,6 +9,9 @@
 #include "sd_storage.h"
 #include "wifi_setup.h"
 #include "app_config.h"
+#include "resmed_firmware_repository.h"
+#include "resmed_firmware_upload.h"
+#include "resmed_ota.h"
 #include <string.h>
 
 namespace DeviceStatus {
@@ -36,6 +39,9 @@ struct Snapshot {
     bool report_available = false;
     uint32_t clinical_revision = 0;
     SdStorage::Status storage = {};
+    ResmedFirmwareRepository::Status firmware_repository = {};
+    ResmedFirmwareUpload::Status firmware_upload = {};
+    ResmedOta::Status resmed = {};
 };
 
 // Copy published owner state only; presentation must not query the device.
@@ -65,6 +71,9 @@ inline Snapshot snapshot() {
     out.report_available = report.local.available;
     out.clinical_revision = ClinicalJobs::revision();
     SdStorage::get_status(out.storage);
+    ResmedFirmwareRepository::get_status(out.firmware_repository);
+    ResmedFirmwareUpload::get_status(out.firmware_upload);
+    ResmedOta::get_status(out.resmed);
     return out;
 }
 

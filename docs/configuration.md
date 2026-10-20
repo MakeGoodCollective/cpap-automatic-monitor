@@ -174,8 +174,12 @@ All commands are prefixed with `$`. Anything without `$` is sent to the AirSense
 | `$WIFI HINTS` | Show cached BSSID/channel/PMF hints |
 | `$WIFI HINTS CLEAR` | Drop all cached hints |
 | `$FLASH [block] [FORCE]` | Flash uploaded ResMed firmware |
-| `$FLASH STATUS` | Flash progress |
-| `$FLASH CANCEL` | Abort flash |
+| `$FLASH FILE "path" [block] [BLX] [FORCE]` | Install an image from the SD firmware repository |
+| `$FLASH LIST` / `$FLASH REFRESH` | List saved images or refresh the repository |
+| `$FLASH DUMP` | Save the device firmware to the SD repository |
+| `$FLASH CONFIRM id INSTALL_PATCHED_BOOTLOADER` | Confirm the offered bootloader installation, then retry that dump |
+| `$FLASH STATUS` | Upload, flash or dump progress and errors |
+| `$FLASH CANCEL` | Request cancellation; an in-progress programming sequence must finish |
 | `$LOG` | Show log levels |
 | `$LOG category level` | Set log level (ERROR/WARN/INFO/DEBUG) |
 | `$TRANSPARENT` | Raw UART passthrough (60s idle timeout) |
