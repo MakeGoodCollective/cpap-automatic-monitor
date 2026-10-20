@@ -682,7 +682,6 @@
   "ota.repositoryDownload": "Download",
   "ota.repositoryDelete": "Delete",
   "ota.repositoryAction": "{action}: {name}",
-  "ota.repositoryEntry": "{size} KiB | {path}",
   "ota.repositoryEmpty": "No firmware saved.",
   "ota.repositoryLoading": "Reading firmware repository...",
   "ota.repositoryRefreshing": "Updating the file list; waiting for SD access...",

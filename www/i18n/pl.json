@@ -686,7 +686,6 @@
   "ota.repositoryDownload": "Pobierz",
   "ota.repositoryDelete": "Usuń",
   "ota.repositoryAction": "{action}: {name}",
-  "ota.repositoryEntry": "{size} KiB | {path}",
   "ota.repositoryEmpty": "Nie zapisano firmware.",
   "ota.repositoryLoading": "Odczytywanie repozytorium firmware...",
   "ota.repositoryRefreshing": "Odświeżanie listy plików; oczekiwanie na dostęp do SD...",

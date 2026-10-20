@@ -2131,6 +2131,11 @@ protected:
                     jsonAddString(pending_, "name", entry.filename, false);
                     jsonAddString(pending_, "path", entry.path);
                     jsonAddUInt32(pending_, "size", entry.size);
+                    char modified[24];
+                    snprintf(modified, sizeof(modified), "%lld",
+                             static_cast<long long>(entry.modified > 0 ? entry.modified : 0));
+                    pending_ += ",\"modified\":";
+                    pending_ += modified;
                     jsonAddBool(pending_, "bootloader", entry.bootloader);
                     pending_ += '}';
                 } else { pending_ = "]}"; done_ = true; }

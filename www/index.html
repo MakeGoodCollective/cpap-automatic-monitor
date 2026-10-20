@@ -5329,7 +5329,9 @@ function renderFirmwareRepository() {
     uiText(name, uiMessage('storage.downloadFile', {name:relative}), 'aria-label');
     name.onclick = event => { if (name.getAttribute('aria-disabled') === 'true') event.preventDefault(); };
     const detail = document.createElement('small');
-    uiText(detail, uiMessage('ota.repositoryEntry', {path:entry.path, size:{number:entry.size/1024,max:1,min:1}}));
+    uiText(detail, uiMessage('common.value', {value:{items:[
+      uiMessage('common.unit', {value:{number:entry.size/1024,max:1,min:1}, unit:'KiB'}),
+      ...(entry.modified > 0 ? [syncStorageTimestamp(entry.modified)] : [])], separator:' | '}}));
     content.append(name, detail);
     const actions = document.createElement('div'); actions.className = 'storage-entry-actions';
     const install = document.createElement('button'); install.className = 'btn btn-accent';
