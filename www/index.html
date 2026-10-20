@@ -283,6 +283,35 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 /* Upload */
 .upload-area{border:2px dashed var(--border);border-radius:8px;padding:40px;text-align:center;margin:12px 0;cursor:pointer}
 .upload-area.dragover{border-color:var(--accent);background:var(--hover)}
+.firmware-note{font-size:13px;color:var(--text-dim);overflow-wrap:anywhere;margin:10px 0}
+.firmware-note:empty{display:none}
+#flashBlocked,#firmwareDumpBlocked,#firmwareRepositoryState{display:block;height:1.4em;line-height:1.4;overflow:auto;margin:8px 0}
+.firmware-toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+.firmware-toolbar .btn{white-space:nowrap}
+.firmware-section-title{margin:22px 0 12px;color:var(--blue);font-size:12px;font-weight:500;text-transform:uppercase}
+.firmware-messages{display:block;width:100%;height:150px;resize:vertical;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);padding:10px 12px;margin:8px 0 4px;font:12px/1.6 monospace}
+#flashCard .row{gap:16px}
+#flashCard .row>label{flex:1}
+#flashCard input[type=file]{max-width:100%;width:300px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font-size:12px}
+#flashCard .btn-group{justify-content:flex-start;margin-top:12px}
+#firmwareEntries .storage-row{grid-template-columns:minmax(0,1fr) auto}
+@media(max-width:768px){
+  #flashCard .row{flex-wrap:wrap}
+  #flashCard .row:has(input,select)>label{flex-basis:100%}
+  #flashCard .row>select,#flashCard input[type=file]{width:100%;max-width:100%}
+  #firmwareEntries .storage-row{grid-template-columns:minmax(0,1fr)}
+  #firmwareEntries .storage-entry-actions{justify-content:flex-start}
+  #flashBlocked,#firmwareDumpBlocked,#firmwareRepositoryState{height:2.8em}
+}
+.firmware-list{border:1px solid var(--border-light);border-radius:8px;overflow:hidden;background:var(--surface);min-height:60px}
+.firmware-list.dragover{border-color:var(--accent);background:var(--hover)}
+.firmware-list #firmwareRepositoryState{margin:0;padding:8px 12px;box-sizing:content-box}
+.firmware-dialog{width:min(440px,calc(100vw - 32px));box-sizing:border-box;padding:22px;border:1px solid var(--border-light);border-radius:10px;background:var(--surface);color:var(--text)}
+.firmware-dialog::backdrop{background:rgba(0,0,0,.55)}
+.firmware-dialog h3{margin:0 0 16px}
+.firmware-dialog label{display:flex;align-items:center;gap:8px;margin:20px 0}
+.firmware-dialog .btn-row{display:flex;justify-content:flex-end;gap:8px}
+#firmwareEntries .storage-entry-actions{grid-column:auto;flex-wrap:wrap}
 .progress{height:6px;background:var(--border);border-radius:3px;margin-top:12px;overflow:hidden;display:none}
 .progress .bar{height:100%;background:var(--accent);width:0;transition:width 0.3s}
 
@@ -302,7 +331,7 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 #p-storage .btn{font-family:inherit}
 #storageUsage{font-size:12px;color:var(--text-dim);margin-bottom:16px}
 .storage-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
-#storagePath{flex:1 1 200px;min-width:0;padding:9px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface);font:12px 'SF Mono',Consolas,monospace;overflow-wrap:anywhere}
+#storagePath,#firmwareRepositoryPath{flex:1 1 200px;min-width:0;padding:9px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface);font:12px 'SF Mono',Consolas,monospace;overflow-wrap:anywhere}
 .storage-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 #storageEntries:not(:empty){border:1px solid var(--border-light);border-radius:8px;overflow:hidden;background:var(--surface)}
 .storage-row{display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:12px;align-items:center;padding:11px 12px;border-bottom:1px solid var(--border)}
@@ -800,35 +829,19 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
         </div>
 
         <!-- ResMed OTA -->
-        <div class="card" style="border-left:3px solid var(--orange)">
-          <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
-            <div style="font-size:24px">&#9741;</div>
-            <div>
-              <div style="font-weight:600;font-size:15px"><span data-i18n="ota.resmedFirmware"></span></div>
-              <div style="font-size:12px;color:var(--text-dim)">STM32F4 &middot; AirSense 10</div>
-            </div>
-          </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-            <div>
-              <div class="upload-area" id="dropZone" style="padding:24px;border-color:var(--orange)">
-                <p style="font-size:13px"><span data-i18n="ota.selectResmed"></span><br><small style="color:var(--text-dim)"><span data-i18n="ota.drop"></span></small></p>
-                <input type="file" id="fileInput" style="display:none" accept=".bin,.img,.dat">
-              </div>
-            </div>
-            <div>
-              <div id="fileInfo" style="font-size:13px;color:var(--text-dim)"></div>
-              <div class="progress" id="uploadProgress"><div class="bar" id="uploadBar" style="background:var(--orange)"></div></div>
-              <div class="msg" id="uploadMsg"></div>
-              <div id="fwWarnings" style="margin-top:8px"></div>
-            </div>
-          </div>
-        </div>
-
-        <!-- ResMed Flash Controls (shown after upload) -->
-        <div class="card" id="flashCard" style="display:none;border-left:3px solid var(--orange)">
-          <h3 style="color:var(--orange)"><span data-i18n="ota.flashResmed"></span></h3>
+        <div class="card" id="flashCard" style="border-left:3px solid var(--orange)">
+          <h3 data-i18n="ota.resmedFirmware"></h3>
           <div class="row">
-            <label><span data-i18n="ota.blockType"></span></label>
+            <label data-i18n="ota.state"></label>
+            <span id="flashPhase">--</span>
+          </div>
+          <div class="row">
+            <label data-i18n="ota.progress"></label>
+            <span id="flashProgressText">--</span>
+          </div>
+          <div class="progress" id="flashProgress" style="display:none"><div class="bar" id="flashBar" style="background:var(--orange)"></div></div>
+          <div class="row">
+            <label for="flashBlock"><span data-i18n="ota.blockType"></span></label>
             <select id="flashBlock">
               <option value="" data-i18n="ota.autoDetect"></option>
               <option value="FULL" data-i18n="ota.fullImage"></option>
@@ -846,14 +859,42 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
             <label style="color:var(--red)"><span data-i18n="ota.forceBootloader"></span></label>
             <input type="checkbox" id="forceBlx">
           </div>
-          <div id="flashDetected" style="font-size:13px;color:var(--text-dim);padding:8px 0"></div>
-          <div class="btn-group" style="justify-content:flex-end">
-            <button class="btn" onclick="startFlash()" id="btnFlash" style="border-color:var(--orange);color:var(--orange)"><span data-i18n="ota.flash"></span></button>
+          <p class="firmware-note" id="flashBlocked"></p>
+          <section id="firmwareRepository" hidden aria-labelledby="firmwareRepositoryTitle">
+            <h4 class="firmware-section-title" id="firmwareRepositoryTitle" data-i18n="ota.repository"></h4>
+            <div class="firmware-toolbar">
+              <span id="firmwareRepositoryPath" hidden></span>
+              <button class="btn btn-accent" id="btnFirmwareAdd" onclick="rfi.click()" disabled><span data-i18n="ota.repositoryAdd"></span></button>
+              <button class="btn" id="btnFirmwareDump" onclick="dumpFirmware()" disabled><span data-i18n="ota.dumpCurrent"></span></button>
+              <button class="btn" id="btnFirmwareRefresh" onclick="refreshFirmwareRepository()" disabled data-i18n="common.refresh"></button>
+            </div>
+            <input type="file" id="firmwareRepositoryInput" hidden accept=".bin,.img,.dat" disabled>
+            <div class="firmware-list">
+              <p class="firmware-note" id="firmwareRepositoryState" role="status"></p>
+              <div id="firmwareEntries" role="group" data-i18n-aria-label="ota.repository"></div>
+            </div>
+            <p class="firmware-note" id="firmwareDumpBlocked"></p>
+          </section>
+          <section id="firmwareDumpConfirmation" hidden>
+            <p class="firmware-note" data-i18n="ota.dumpBootloaderWarning"></p>
+            <p class="firmware-note" id="firmwareRecoveryPath"></p>
+            <label><input type="checkbox" id="firmwareDumpConsent" onchange="renderResmedStatus()"> <span data-i18n="ota.dumpBootloaderConsent"></span></label>
+            <div class="btn-row" style="margin-top:12px">
+              <button class="btn btn-danger" id="btnConfirmFirmwareDump" onclick="confirmFirmwareDump()" disabled><span data-i18n="ota.confirmDump"></span></button>
+            </div>
+          </section>
+          <h4 class="firmware-section-title" data-i18n="ota.installAnother"></h4>
+          <div class="row">
+            <label for="fileInput" data-i18n="ota.firmwareImage"></label>
+            <input type="file" id="fileInput" accept=".bin,.img,.dat" disabled>
+          </div>
+          <div class="btn-group">
+            <button class="btn btn-accent" onclick="startFlash()" id="btnFlash" disabled><span data-i18n="ota.installImage"></span></button>
+            <button class="btn btn-danger" id="btnFirmwareUploadCancel" onclick="cancelFlash()" hidden><span data-i18n="common.cancel"></span></button>
             <button class="btn btn-danger" id="btnFlashCancel" onclick="cancelFlash()" style="display:none"><span data-i18n="common.cancel"></span></button>
           </div>
-          <div class="progress" id="flashProgress" style="display:none"><div class="bar" id="flashBar" style="background:var(--orange)"></div></div>
-          <div id="flashPhase" style="font-size:13px;color:var(--text-dim);margin-top:4px"></div>
-          <div class="msg" id="flashMsg"></div>
+          <label class="firmware-section-title" style="display:block" for="firmwareMessages" data-i18n="ota.messages"></label>
+          <textarea class="firmware-messages" id="firmwareMessages" readonly></textarea>
         </div>
       </div>
 
@@ -876,6 +917,16 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 
 <!-- Toast container -->
 <div class="toast-container" id="toastContainer"></div>
+
+<dialog id="firmwareBootloaderDialog" class="firmware-dialog" aria-labelledby="firmwareBootloaderTitle">
+  <h3 id="firmwareBootloaderTitle" data-i18n="ota.repositoryAdd"></h3>
+  <p id="firmwareBootloaderFile" class="firmware-note"></p>
+  <label><input type="checkbox" id="firmwareBootloader"> <span data-i18n="ota.uploadBootloader"></span></label>
+  <div class="btn-row">
+    <button class="btn" onclick="closeFirmwareUploadChoice()"><span data-i18n="common.cancel"></span></button>
+    <button class="btn btn-accent" id="btnFirmwareUploadChoice" onclick="confirmFirmwareUploadChoice()"><span data-i18n="ota.repositoryAdd"></span></button>
+  </div>
+</dialog>
 
 <dialog id="otaReleaseNotesDialog" class="release-notes-dialog" aria-labelledby="otaReleaseNotesTitle">
   <div class="release-notes-header">
@@ -1202,6 +1253,7 @@ function initSSE() {
     if (setupActive() && setupStep === 'network') loadSetupWifi();
   });
   evtSrc.onerror = () => {
+    resmedDisconnected();
     if (themeTarget === null) applyUiTheme('auto');
     exportsFresh = false;
     renderExports();
@@ -1211,6 +1263,7 @@ function initSSE() {
     if (li) li.style.background = 'var(--text-faint)';
   };
   evtSrc.onopen = () => {
+    resmedDisconnected(true);
     wifiRevision = null;
     wifiSerial++;
     otaSerial++;
@@ -1240,6 +1293,7 @@ function applyConfigRevision(d) {
 function updateStatusFromPush(d) {
   statusSerial++;
   applyConfigRevision(d);
+  appendFirmwareProgress(d);
   Object.assign(statusPush, d);
   Object.assign(lastStatus, d);
   renderStatus(d);
@@ -1580,7 +1634,8 @@ function showTab(id) {
   if (id === 'device') loadConfig();
   if (id === 'sync') renderExports();
   if (id === 'ota') {
-    checkFlashReady();
+    renderResmedStatus();
+    loadFirmwareRepository();
     if (otaStatus) renderOtaStatus(otaStatus);
   }
 }
@@ -1627,6 +1682,7 @@ function renderStatus(d) {
   }
   if (d.ui_language !== undefined) applyUiLanguage(d.ui_language);
   if (d.ui_theme !== undefined) applyUiTheme(d.ui_theme);
+  if (d.resmed !== undefined || d.firmware_upload !== undefined || d.firmware_repository_revision !== undefined) applyResmedStatus(d);
   if (d.report_source !== undefined || d.report_revision !== undefined || d.report_data_revision !== undefined || d.report_state !== undefined || d.report_error !== undefined || d.report_available !== undefined) applyReportStatus(d);
   if (d.system !== undefined || d.rop !== undefined) renderReportAvailability();
   if (d.sd !== undefined) {
@@ -4393,16 +4449,21 @@ function storageDownload(kind, name = null, selected = false) {
   document.body.append(link); link.click(); link.remove();
 }
 
-async function storageMutate(kind, body) {
-  if (storageLoading || storageUsbRequest || (lastStatus.sd && lastStatus.sd !== 'mounted')) return;
-  storageLoading = true;
-  storageControls();
-  const message = document.getElementById('storageMessage');
+async function storageMutate(kind, body, repository = false) {
+  if (repository ? !firmwareRepository?.ready || firmwareRepositoryDirty || firmwareRepositoryRead ||
+      firmwareRepositoryError || !resmedFresh || resmedRequest || firmwareUploadRequest :
+      storageLoading || storageUsbRequest || (lastStatus.sd && lastStatus.sd !== 'mounted')) return;
+  if (repository) { resmedRequest = true; renderResmedStatus(); }
+  else { storageLoading = true; storageControls(); }
+  const message = document.getElementById(repository ? 'firmwareRepositoryState' : 'storageMessage');
   uiText(message, uiMessage(kind === 'delete' ? 'storage.deleting' : 'storage.renaming'));
   let result;
   try {
     const response = await api('/api/storage/' + kind, {method:'POST', body});
-    if (!response) return;
+    if (!response) {
+      if (repository) { resmedAuthFailed = true; resmedDisconnected(); }
+      return;
+    }
     const data = await response.json();
     if (!response.ok || !data.ok) {
       const detail = data.error ? uiError(data.error) : uiMessage('storage.operationFailed');
@@ -4413,23 +4474,24 @@ async function storageMutate(kind, body) {
   } catch (error) {
     result = uiError(error);
   } finally {
-    storageLoading = false;
-    storageControls();
+    if (repository) { resmedRequest = false; renderResmedStatus(); }
+    else { storageLoading = false; storageControls(); }
   }
+  if (repository) { uiText(message, result); return; }
   // A failed or interrupted recursive delete may already have removed files.
   await loadStorage(storagePath, 0);
   if (lastStatus.sd === 'mounted') uiText(message, result);
 }
 
-async function storageRename(name) {
-  if (storageLoading) return;
-  const replacement = prompt(t('storage.newName', {name}), name);
-  if (replacement === null || replacement === name) return;
-  if (!replacement || /[\/\\\r\n]/.test(replacement) || replacement === '.' || replacement === '..') {
-    uiText(document.getElementById('storageMessage'), uiMessage('storage.nameNotPath'));
+async function storageRename(name, path = storageChild(name), repository = false) {
+  if (repository ? resmedRequest : storageLoading) return;
+  const replacement = prompt(t('storage.newName', {name}), path);
+  if (replacement === null || replacement === path || replacement === name) return;
+  if (!replacement || /[\\\r\n]/.test(replacement)) {
+    uiText(document.getElementById(repository ? 'firmwareRepositoryState' : 'storageMessage'), uiMessage('storage.invalidDestination'));
     return;
   }
-  await storageMutate('rename', new URLSearchParams({path:storageChild(name), name:replacement}));
+  await storageMutate('rename', new URLSearchParams({path, name:replacement}), repository);
 }
 
 async function storageDelete() {
@@ -4961,12 +5023,14 @@ function otaCheckRelease() { return otaAction('check'); }
 function otaInstallRelease() { return otaAction('install'); }
 
 // Upload
-const dz = document.getElementById('dropZone'), fi = document.getElementById('fileInput');
-dz.addEventListener('click', () => fi.click());
-dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
-dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
-dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('dragover'); uploadFile(e.dataTransfer.files[0]); });
-fi.addEventListener('change', e => { if (e.target.files[0]) uploadFile(e.target.files[0]); });
+const fi = document.getElementById('fileInput');
+const rfi = document.getElementById('firmwareRepositoryInput');
+fi.addEventListener('change', renderResmedStatus);
+rfi.addEventListener('change', e => prepareFirmwareUpload(e.target.files[0], true));
+const firmwareDrop = document.querySelector('#firmwareRepository .firmware-list');
+firmwareDrop.addEventListener('dragover', e => { e.preventDefault(); firmwareDrop.classList.add('dragover'); });
+firmwareDrop.addEventListener('dragleave', () => firmwareDrop.classList.remove('dragover'));
+firmwareDrop.addEventListener('drop', e => { e.preventDefault(); firmwareDrop.classList.remove('dragover'); prepareFirmwareUpload(e.dataTransfer.files[0], true); });
 
 // ESP32 OTA
 const edz = document.getElementById('espDropZone'), efi = document.getElementById('espFileInput');
@@ -5015,56 +5079,382 @@ async function espReboot() {
   try { await api('/api/reboot', {method:'POST'}); } catch(e) {}
 }
 
-function showFwWarnings(d) {
-  const el = document.getElementById('fwWarnings'); el.innerHTML = '';
-  const warn = (msg, cls) => { const div = document.createElement('div'); div.className = 'msg ' + cls; div.style.display = 'block'; uiText(div, msg); el.appendChild(div); };
+function firmwareImageMessages(d) {
+  const messages = [];
+  const warn = (key, params = {}) => messages.push(uiMessage(key, params));
   let allOk = true;
-  if (d.bid !== undefined && d.bid_ok === 'false') { warn(uiMessage('ota.unknownBootloader', {bid:d.bid, expected:'SX577-0200'}), 'err'); allOk = false; }
-  if (d.blx_crc === 'fail') { warn(uiMessage('ota.blxCrcMismatch'), 'err'); allOk = false; }
-  if (d.ccx_crc === 'fail') { warn(uiMessage('ota.ccxCrcMismatch'), 'err'); allOk = false; }
-  if (d.cdx_crc === 'fail') { warn(uiMessage('ota.cdxCrcMismatch'), 'err'); allOk = false; }
-  if (d.blx_patch === 'method_a') { warn(uiMessage('ota.dangerousBootloader'), 'err'); allOk = false; }
-  else if (d.blx_patch === 'method_b') { warn(uiMessage('ota.safeBootloaderPatch'), 'ok'); }
-  else if (d.blx_patch === 'none' && d.bid !== undefined) { warn(uiMessage('ota.stockBootloader'), 'ok'); }
-  if (allOk && d.bid !== undefined) warn(uiMessage('ota.verificationPassed', {bid:d.bid}), 'ok');
+  if (d.bid && d.bid_ok === false) { warn('ota.unsupportedBootloader', {bid:d.bid}); allOk = false; }
+  if (d.blx_crc === 'fail') { warn('ota.blxCrcMismatch'); allOk = false; }
+  if (d.ccx_crc === 'fail') { warn('ota.ccxCrcMismatch'); allOk = false; }
+  if (d.cdx_crc === 'fail') { warn('ota.cdxCrcMismatch'); allOk = false; }
+  if (d.blx_patch === 'method_a') { warn('ota.dangerousBootloader'); allOk = false; }
+  else if (d.blx_patch === 'method_b') warn('ota.safeBootloaderPatch');
+  else if (d.blx_patch === 'partial') { warn('ota.partialBootloaderPatch'); allOk = false; }
+  else if (d.blx_patch === 'none' && d.bid) warn('ota.noBootloaderPatch');
+  if (allOk && d.bid && d.bid_ok === true && d.crc_ok === true)
+    warn('ota.verificationPassed', {bid:d.bid});
+  return messages;
 }
 
-async function uploadFile(file) {
-  const msgEl = document.getElementById('uploadMsg');
-  uiText(document.getElementById('fileInfo'), uiMessage('ota.fileInfo', {name:file.name, size:{number:file.size/1024, max:1, min:1}}));
-  document.getElementById('fwWarnings').innerHTML = '';
-  const prog = document.getElementById('uploadProgress'), bar = document.getElementById('uploadBar');
-  prog.style.display = 'block'; bar.style.width = '0%';
-  const fd = new FormData(); fd.append('firmware', file);
+let resmedFresh = false, resmedRequest = false;
+let resmedAuthFailed = false, resmedConnectionSerial = 0;
+let firmwareRepository = null, firmwareRepositoryRead = null, firmwareRepositoryDirty = true;
+let firmwareRepositorySerial = 0, firmwareRepositoryRevision = null, firmwareRepositoryError = '';
+let firmwareConfirmationKey = '';
+let firmwareUploadRequest = false, firmwareUploadId = null;
+let firmwareUploadProgress = {sent:0,total:0,failed:false};
+let firmwareProgressKind = 'operation';
+let firmwareUploadAbort = null;
+let firmwareUploadChoice = null;
+let firmwareInstallIntent = null;
+
+function firmwarePhase(phase) {
+  const block = /^(Erase|Flash) (BLX|CCX|CDX|CMX)$/.exec(phase || '');
+  return block ? uiMessage('ota.phase.' + block[1], {block:block[2]}) :
+    uiMessage('ota.phase.' + phase, {}, phase || '--');
+}
+
+function appendFirmwareMessages(messages) {
+  if (!messages.length) return;
+  const el = document.getElementById('firmwareMessages');
+  const time = new Date().toLocaleTimeString(uiLanguage,
+    {hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});
+  el.value += messages.map(message => time + '  ' + uiValue(message)).join('\n') + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+
+function appendFirmwareProgress(data) {
+  // The first snapshot is a baseline, not a replay of an earlier operation.
+  if (!resmedFresh || resmedAuthFailed) return;
+  for (const key of ['firmware_upload', 'resmed']) {
+    const state = data[key], previous = lastStatus[key];
+    if (!state?.id || !previous) continue;
+    const old = state.id === previous.id ? previous : {};
+    const upload = key === 'firmware_upload', path = upload ? 'path' : 'source_path';
+    const messages = [];
+    if (state[path] && state[path] !== old[path]) messages.push(state[path]);
+    if (upload && state.detected_block && state.detected_block !== old.detected_block)
+      messages.push(uiMessage('ota.flashDetected', {block:state.detected_block, size:Math.round(state.size/1024)}));
+    if (['bid', 'bid_ok', 'crc_ok', 'blx_crc', 'ccx_crc', 'cdx_crc', 'blx_patch']
+        .some(field => state[field] !== old[field]))
+      messages.push(...firmwareImageMessages(state));
+    if (!upload && state.phase && state.phase !== 'Idle' && state.phase !== old.phase)
+      messages.push(firmwarePhase(state.phase));
+    if (state.error && state.error !== old.error)
+      messages.push(uiMessage(upload ? 'ota.uploadFailed' : 'ota.error', {error:uiError(state.error)}));
+    else if (upload && state.ready && !old.ready)
+      messages.push(uiMessage(state.repository ? 'ota.repositoryUploadReady' : 'ota.stagedUploadReady'));
+    appendFirmwareMessages(messages);
+  }
+}
+
+function resmedDisconnected(reconnect = false) {
+  resmedFresh = false;
+  firmwareInstallIntent = null;
+  fi.value = '';
+  closeFirmwareUploadChoice();
+  firmwareUploadAbort?.abort();
+  firmwareConfirmationKey = '';
+  document.getElementById('firmwareDumpConsent').checked = false;
+  if (reconnect) {
+    resmedConnectionSerial++;
+    firmwareRepositorySerial++;
+    firmwareRepositoryRevision = null;
+    firmwareRepository = null;
+    firmwareRepositoryDirty = true;
+    firmwareUploadId = null;
+    firmwareUploadProgress = {sent:0,total:0,failed:false};
+    delete lastStatus.resmed;
+    delete lastStatus.firmware_upload;
+    delete lastStatus.firmware_repository_revision;
+    renderFirmwareRepository();
+  }
+  renderResmedStatus();
+}
+
+function applyResmedStatus(data) {
+  if (resmedAuthFailed) return;
+  if (data.resmed !== undefined) resmedFresh = true;
+  if (data.firmware_upload?.active) firmwareProgressKind = 'upload';
+  if (data.resmed?.active) firmwareProgressKind = 'operation';
+  if (data.firmware_repository_revision !== undefined && data.firmware_repository_revision !== firmwareRepositoryRevision) {
+    firmwareRepositoryRevision = data.firmware_repository_revision;
+    firmwareRepositorySerial++;
+    firmwareRepositoryDirty = true;
+  }
+  renderResmedStatus();
+  loadFirmwareRepository();
+  continueFirmwareInstall();
+}
+
+async function loadFirmwareRepository() {
+  if (firmwareRepositoryRead || !firmwareRepositoryDirty || !resmedFresh ||
+      !document.getElementById('p-ota').classList.contains('active')) return;
+  const serial = firmwareRepositorySerial;
+  firmwareRepositoryDirty = false;
+  firmwareRepositoryError = '';
+  firmwareRepositoryRead = (async () => {
+    try {
+      const response = await api('/api/resmed/repository', undefined, 5000);
+      if (!response) { resmedAuthFailed = true; resmedDisconnected(); return; }
+      const data = await response.json();
+      if (serial !== firmwareRepositorySerial || !resmedFresh) return;
+      if (!response.ok) throw new Error(data.error || 'repository_unavailable');
+      if (typeof data.supported !== 'boolean' || typeof data.ready !== 'boolean' || !Array.isArray(data.entries))
+        throw new Error('repository_invalid_response');
+      firmwareRepository = data;
+      renderFirmwareRepository();
+    } catch(error) {
+      if (serial === firmwareRepositorySerial) firmwareRepositoryError = uiError(error);
+    }
+  })().finally(() => {
+    firmwareRepositoryRead = null;
+    renderResmedStatus();
+    if (firmwareRepositoryDirty) loadFirmwareRepository();
+  });
+  renderResmedStatus();
+  return firmwareRepositoryRead;
+}
+
+function renderFirmwareRepository() {
+  const entries = document.getElementById('firmwareEntries');
+  // An invalidated inventory is not an empty directory. Keep its rows inert
+  // until the owner publishes the replacement or the card becomes unavailable.
+  if (firmwareRepository?.supported && firmwareRepository.available !== false &&
+      !firmwareRepository.ready) return;
+  entries.replaceChildren();
+  if (!firmwareRepository?.ready) return;
+  for (const entry of [...firmwareRepository.entries].sort((a, b) => a.path.localeCompare(b.path))) {
+    const row = document.createElement('div'); row.className = 'storage-row';
+    const content = document.createElement('div');
+    const relative = entry.path.slice(firmwareRepository.root.length + 1);
+    const name = document.createElement('a'); name.textContent = relative;
+    name.href = '/api/storage/download?path=' + encodeURIComponent(entry.path);
+    name.download = entry.name;
+    uiText(name, uiMessage('storage.downloadFile', {name:relative}), 'aria-label');
+    name.onclick = event => { if (name.getAttribute('aria-disabled') === 'true') event.preventDefault(); };
+    const detail = document.createElement('small');
+    uiText(detail, uiMessage('ota.repositoryEntry', {path:entry.path, size:{number:entry.size/1024,max:1,min:1}}));
+    content.append(name, detail);
+    const actions = document.createElement('div'); actions.className = 'storage-entry-actions';
+    const install = document.createElement('button'); install.className = 'btn btn-accent';
+    install.dataset.firmwareAction = 'install';
+    install.dataset.path = entry.path;
+    uiText(install, uiMessage('ota.installImage'));
+    uiText(install, uiMessage('ota.repositoryAction', {action:uiMessage('ota.installImage'), name:relative}), 'aria-label');
+    install.onclick = () => startFlash(entry.path);
+    actions.append(install);
+    for (const kind of ['rename', 'delete']) {
+      if (kind === 'rename' && entry.bootloader === true) continue;
+      const button = document.createElement('button'); button.className = 'btn' + (kind === 'delete' ? ' btn-danger' : '');
+      button.dataset.firmwareAction = kind;
+      const action = uiMessage(kind === 'delete' ? 'ota.repositoryDelete' : 'storage.rename');
+      uiText(button, action);
+      uiText(button, uiMessage('ota.repositoryAction', {action,name:relative}), 'aria-label');
+      button.onclick = () => mutateFirmwareEntry(kind, entry);
+      actions.append(button);
+    }
+    row.append(content, actions); entries.append(row);
+  }
+}
+
+async function mutateFirmwareEntry(kind, entry) {
+  if (kind === 'rename') return storageRename(entry.name, entry.path, true);
+  if (confirm(t('storage.confirmDelete', {names:entry.name})))
+    return storageMutate('delete', new URLSearchParams({path:entry.path}), true);
+}
+
+async function refreshFirmwareRepository() {
+  if (!resmedFresh || resmedRequest || firmwareUploadRequest) return;
+  resmedRequest = true;
+  renderResmedStatus();
   try {
-    const xhr = new XMLHttpRequest();
-    xhr.upload.onprogress = e => { if (e.lengthComputable) bar.style.width = (e.loaded/e.total*100)+'%'; };
-    xhr.onload = () => {
-      try {
-        const d = uploadResponse(xhr);
-        showMsg(msgEl, uiMessage('ota.resmedUploadReady', {count:d.size, crc:d.crc || uiMessage('ota.notAvailable')}), 'ok', 0);
-        showFwWarnings(d);
-        showFlashCard();
-      } catch(e) { showMsg(msgEl, uiMessage('ota.uploadFailed', {error:uiError(e)}), 'err'); }
-    };
-    xhr.onerror = () => showMsg(msgEl, uiMessage('ota.uploadError'), 'err');
-    xhr.open('POST', '/api/upload'); xhr.send(fd);
-  } catch(e) { showMsg(msgEl, uiMessage('ota.error', {error:uiError(e)}), 'err'); }
+    const response = await api('/api/resmed/repository', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'refresh'})}, 5000);
+    if (!response) { resmedAuthFailed = true; resmedDisconnected(); return; }
+    const data = await response.json();
+    if (!response.ok || data.ok !== true) throw new Error(data.error || 'repository_unavailable');
+    // Completion is published by the repository owner, including unchanged scans.
+  } catch(error) { firmwareRepositoryError = uiError(error); }
+  finally { resmedRequest = false; renderResmedStatus(); }
 }
 
-async function checkFlashReady() {
-  try { const r = await api('/api/flash'); if (!r) return; const d = await r.json(); if (d.fw_size > 0) showFlashCard(); if (d.active === 'true') pollFlash(); } catch(e) {}
+function resmedInstallSource() {
+  const upload = lastStatus.firmware_upload;
+  if (upload?.ready === true && upload.repository === false &&
+      (firmwareUploadId === null || upload.id === firmwareUploadId)) return {upload_id:upload.id};
+  return null;
 }
 
-async function showFlashCard() {
-  const card = document.getElementById('flashCard'); card.style.display = 'block';
+function renderResmedStatus() {
+  const state = lastStatus.resmed || {}, upload = lastStatus.firmware_upload;
+  const repository = firmwareRepository;
+  const busy = resmedRequest || firmwareUploadRequest || !!firmwareInstallIntent;
+  const repositoryReady = resmedFresh && repository?.ready && !firmwareRepositoryDirty && !firmwareRepositoryRead && !firmwareRepositoryError;
+  document.getElementById('firmwareRepository').hidden = repository?.supported === false;
+  uiText(document.getElementById('firmwareRepositoryPath'), repository?.root || '');
+  document.getElementById('firmwareRepositoryPath').hidden = !repository?.root;
+  const uploadAllowed = resmedFresh && !busy && upload?.active !== true && state.upload_allowed === true;
+  const repositoryUploadAllowed = uploadAllowed && repositoryReady && repository?.supported === true;
+  fi.disabled = !uploadAllowed;
+  rfi.disabled = !repositoryUploadAllowed;
+  document.getElementById('btnFirmwareAdd').disabled = !repositoryUploadAllowed;
+  document.getElementById('firmwareBootloader').disabled = !repositoryUploadAllowed;
+  document.getElementById('btnFirmwareUploadChoice').disabled = !repositoryUploadAllowed || !firmwareUploadChoice;
+  const uploadCancel = document.getElementById('btnFirmwareUploadCancel');
+  uploadCancel.hidden = upload?.cancel_allowed !== true;
+  uploadCancel.disabled = !resmedFresh || resmedRequest;
+  uiText(uploadCancel, uiMessage(upload?.ready && upload.repository === false ? 'ota.discardStagedUpload' : 'common.cancel'));
+  document.getElementById('btnFirmwareRefresh').disabled = !resmedFresh || busy || !!firmwareRepositoryRead;
+  const staged = upload?.repository === false && (upload.active || upload.ready);
+  document.querySelectorAll('#firmwareEntries button').forEach(el => {
+    el.disabled = !repositoryReady || busy || staged ||
+      (el.dataset.firmwareAction === 'install' && state.install_allowed !== true);
+  });
+  document.querySelectorAll('#firmwareEntries a').forEach(el => { el.setAttribute('aria-disabled', String(!repositoryReady || busy)); });
+  uiText(document.getElementById('firmwareRepositoryState'), !resmedFresh ? uiMessage('ota.resmedStatusUnavailable') :
+    firmwareRepositoryError || (repository?.error ? uiError(repository.error) :
+      firmwareRepositoryRead || !repository ? uiMessage('ota.repositoryLoading') :
+      !repository.ready ? uiMessage('ota.repositoryUnavailable') : repository.truncated ? uiMessage('ota.repositoryTruncated') :
+      !repository.entries.length ? uiMessage('ota.repositoryEmpty') : ''));
+  document.getElementById('btnFirmwareDump').disabled = !resmedFresh || busy || state.dump_allowed !== true;
+  uiText(document.getElementById('firmwareDumpBlocked'), !resmedFresh ? uiMessage('ota.resmedStatusUnavailable') :
+    state.dump_blocked || state.blocked ? uiError(state.dump_blocked || state.blocked) : '');
+
+  const source = resmedInstallSource();
+  document.getElementById('btnFlash').disabled = !resmedFresh || busy || state.install_allowed !== true ||
+    !(source || (fi.files[0] && uploadAllowed));
+  document.querySelectorAll('#flashBlock, #flashBlx, #forceBlx').forEach(el => { el.disabled = !resmedFresh || busy || state.active === true; });
+  document.getElementById('btnFlashCancel').style.display = state.cancel_allowed === true ? '' : 'none';
+  document.getElementById('btnFlashCancel').disabled = !resmedFresh || busy;
+  uiText(document.getElementById('flashBlocked'), !resmedFresh ? uiMessage('ota.resmedStatusUnavailable') :
+    state.install_blocked || state.blocked ? uiError(state.install_blocked || state.blocked) : '');
+  const localUpload = firmwareUploadRequest || (firmwareUploadProgress.total > 0 &&
+    (firmwareUploadId === null || upload?.id !== firmwareUploadId));
+  const showUpload = !state.active && (firmwareUploadRequest || upload?.active ||
+    firmwareProgressKind === 'upload' || (!state.id && upload?.id));
+  // Chunk ACKs prove owner drain and can arrive before the corresponding SSE.
+  const uploadWritten = Math.max(upload?.written || 0,
+    firmwareUploadId !== null && upload?.id === firmwareUploadId ? firmwareUploadProgress.sent : 0);
+  const phase = showUpload ? uiMessage(localUpload ?
+    (firmwareUploadProgress.failed ? 'ota.phase.Error' : firmwareUploadRequest ? 'ota.uploadSending' : 'ota.uploadVerifying') :
+    upload?.error ? 'ota.phase.Error' : upload?.ready ?
+      (upload.repository ? 'ota.repositoryUploadReady' : 'ota.stagedUploadReady') :
+    upload?.active ? (uploadWritten < upload.size ? 'ota.uploadSending' : 'ota.uploadVerifying') :
+    'ota.phase.Idle') : firmwarePhase(state.phase);
+  uiText(document.getElementById('flashPhase'), !resmedFresh ? uiMessage('ota.resmedStatusUnavailable') :
+    phase);
+  const progressTotal = showUpload ? (localUpload ? firmwareUploadProgress.total : upload?.size) : state.total;
+  const progressSent = (showUpload ? (localUpload ? firmwareUploadProgress.sent : uploadWritten) : state.sent) || 0;
+  document.getElementById('flashProgress').style.display = progressTotal > 0 ? 'block' : 'none';
+  document.getElementById('flashBar').style.width = (progressTotal > 0 ? Math.max(0, Math.min(100, progressSent/progressTotal*100)) : 0) + '%';
+  uiText(document.getElementById('flashProgressText'), progressTotal > 0 ?
+    uiMessage('ota.transferProgress', {percent:Math.round(100 * progressSent / progressTotal),
+      sent:Math.round(progressSent/1024),total:Math.round(progressTotal/1024)}) : '--');
+
+  const confirmationKey = state.confirmation_required ? state.id + ':' + state.device_bid + ':' + state.recovery_path : '';
+  if (confirmationKey !== firmwareConfirmationKey) {
+    firmwareConfirmationKey = confirmationKey;
+    document.getElementById('firmwareDumpConsent').checked = false;
+  }
+  document.getElementById('firmwareDumpConfirmation').hidden = !state.confirmation_required;
+  document.getElementById('firmwareDumpConsent').disabled = !resmedFresh || busy || state.confirmation_required !== true;
+  uiText(document.getElementById('firmwareRecoveryPath'), state.recovery_path ?
+    uiMessage('ota.matchingBootloader', {bid:state.device_bid || '--',path:state.recovery_path}) : '');
+  document.getElementById('btnConfirmFirmwareDump').disabled = !resmedFresh || busy ||
+    state.confirmation_required !== true || state.recovery_available !== true || !state.recovery_path ||
+    !document.getElementById('firmwareDumpConsent').checked;
+
+}
+
+function prepareFirmwareUpload(file, repository = false) {
+  if (!file || (repository ? rfi : fi).disabled || firmwareUploadRequest) return;
+  if (file.size !== 16384 || !repository) return uploadFile(file, repository);
+  firmwareUploadChoice = file;
+  document.getElementById('firmwareBootloader').checked = false;
+  uiText(document.getElementById('firmwareBootloaderFile'), uiMessage('ota.fileInfo',
+    {name:file.name, size:{number:file.size/1024, max:1, min:1}}));
+  renderResmedStatus();
+  document.getElementById('firmwareBootloaderDialog').showModal();
+}
+
+function closeFirmwareUploadChoice() {
+  firmwareUploadChoice = null;
+  document.getElementById('firmwareBootloaderDialog').close();
+  document.getElementById('firmwareBootloader').checked = false;
+  rfi.value = '';
+}
+
+function confirmFirmwareUploadChoice() {
+  if (document.getElementById('btnFirmwareUploadChoice').disabled) return;
+  const file = firmwareUploadChoice;
+  const bootloader = document.getElementById('firmwareBootloader').checked;
+  closeFirmwareUploadChoice();
+  return uploadFile(file, true, bootloader);
+}
+
+document.getElementById('firmwareBootloaderDialog').addEventListener('cancel', closeFirmwareUploadChoice);
+
+async function uploadFile(file, repository = false, bootloader = false) {
+  if (!file || (repository ? rfi : fi).disabled || firmwareUploadRequest) return 0;
+  const connection = resmedConnectionSerial;
+  const controller = new AbortController();
+  firmwareUploadAbort = controller;
+  firmwareUploadRequest = true;
+  firmwareUploadId = null;
+  firmwareProgressKind = 'upload';
+  firmwareUploadProgress = {sent:0,total:file.size,failed:false};
+  appendFirmwareMessages([uiMessage('ota.uploadSending')]);
+  renderResmedStatus();
   try {
-    const r = await api('/api/flash'); if (!r) return; const d = await r.json();
-    uiText(document.getElementById('flashDetected'), uiMessage('ota.flashDetected', {block:d.detected_block, size:Math.round(d.fw_size/1024)}));
-    const sel = document.getElementById('flashBlock');
-    if (d.detected_block && d.detected_block !== 'unknown') { for (let i = 0; i < sel.options.length; i++) { if (sel.options[i].value === d.detected_block) sel.selectedIndex = i; } }
-    updateBlxVisibility();
-  } catch(e) { console.error(e); }
+    if (!file.size) throw uiFailure('ota.uploadRejected');
+    for (let offset = 0; offset < file.size; offset += 4096) {
+      if (controller.signal.aborted || connection !== resmedConnectionSerial) return;
+      const end = Math.min(offset + 4096, file.size);
+      const query = new URLSearchParams({offset, final:end === file.size ? '1' : '0'});
+      if (offset === 0) {
+        query.set('size', file.size);
+        query.set('name', file.name);
+        if (repository) query.set('repository', '1');
+        if (bootloader) query.set('bootloader', '1');
+      } else query.set('id', firmwareUploadId);
+
+      // The response acknowledges owner drain, not just receipt into its ring.
+      const response = await api('/api/upload?' + query, {method:'POST',
+        headers:{'Content-Type':'application/octet-stream'}, body:file.slice(offset, end), signal:controller.signal});
+      if (controller.signal.aborted || connection !== resmedConnectionSerial) return;
+      if (!response) {
+        resmedAuthFailed = true;
+        resmedDisconnected();
+        firmwareUploadProgress.failed = true;
+        appendFirmwareMessages([uiMessage('ota.uploadFailed', {error:uiError('authentication_failed')})]);
+        return;
+      }
+      const data = await response.json();
+      if (controller.signal.aborted || connection !== resmedConnectionSerial) return;
+      if (!response.ok || !data || data.ok !== true) throw data?.error ? new Error(data.error) : uiFailure('ota.uploadRejected');
+      if (!Number.isInteger(data.upload_id) || data.upload_id <= 0 ||
+          (firmwareUploadId !== null && data.upload_id !== firmwareUploadId)) throw uiFailure('ota.uploadRejected');
+      firmwareUploadId = data.upload_id;
+      firmwareUploadProgress.sent = end;
+      renderResmedStatus();
+    }
+    if (lastStatus.firmware_upload?.id !== firmwareUploadId || lastStatus.firmware_upload.active)
+      appendFirmwareMessages([uiMessage('ota.uploadVerifying')]);
+    return firmwareUploadId;
+  } catch(error) {
+    if (!controller.signal.aborted && connection === resmedConnectionSerial) {
+      firmwareUploadProgress.failed = true;
+      appendFirmwareMessages([uiMessage('ota.uploadFailed', {error:uiError(error)})]);
+    }
+    return 0;
+  } finally {
+    firmwareUploadAbort = null;
+    firmwareUploadRequest = false;
+    if (!repository) fi.value = '';
+    rfi.value = '';
+    document.getElementById('firmwareBootloader').checked = false;
+    renderResmedStatus();
+  }
 }
 
 function updateBlxVisibility() {
@@ -5077,63 +5467,93 @@ function updateBlxVisibility() {
 }
 document.getElementById('flashBlock').addEventListener('change', updateBlxVisibility);
 document.getElementById('flashBlx').addEventListener('change', updateBlxVisibility);
+updateBlxVisibility();
 
-let flashPollTimer = null;
-let flashPolling = false;
-async function startFlash() {
+async function startFlash(path = '') {
+  if (path) {
+    const button = [...document.querySelectorAll('#firmwareEntries [data-firmware-action=install]')]
+      .find(button => button.dataset.path === path);
+    if (!button || button.disabled) return;
+  } else if (document.getElementById('btnFlash').disabled) return;
+  const source = path ? {path} : resmedInstallSource();
+  const file = path ? null : fi.files[0];
+  if (!source && !file) return;
   const block = document.getElementById('flashBlock').value;
   const flashBlx = document.getElementById('flashBlx').checked;
   const forceBlx = document.getElementById('forceBlx').checked;
-  const msgEl = document.getElementById('flashMsg');
+  const name = path || (source ? lastStatus.firmware_upload.path || t('ota.stagedSource', {id:source.upload_id}) : file.name);
+  if (!confirm(t('ota.confirmInstall', {source:name}))) return;
+  const options = {block:block||undefined, flash_blx:flashBlx, force_blx:forceBlx};
+  if (source) return resmedCommand({...source, ...options});
+
+  // A click authorizes this upload only. SSE readiness, not the last HTTP ACK,
+  // permits the install; disconnect/cancel drops this browser continuation.
+  const intent = {options, upload_id:null};
+  firmwareInstallIntent = intent;
+  const id = await uploadFile(file);
+  if (firmwareInstallIntent !== intent) return;
+  if (!id) firmwareInstallIntent = null;
+  else { intent.upload_id = id; continueFirmwareInstall(); }
+  renderResmedStatus();
+}
+
+function continueFirmwareInstall() {
+  const intent = firmwareInstallIntent, upload = lastStatus.firmware_upload;
+  if (!intent?.upload_id || !resmedFresh || firmwareUploadRequest || resmedRequest) return;
+  if (upload?.id > intent.upload_id) {
+    firmwareInstallIntent = null;
+    appendFirmwareMessages([uiMessage('ota.uploadFailed', {error:uiError('upload_not_owned')})]);
+    renderResmedStatus();
+    return;
+  }
+  if (upload?.id !== intent.upload_id) return;
+  if (upload.error || (!upload.active && !upload.ready)) {
+    firmwareInstallIntent = null;
+    renderResmedStatus();
+    return;
+  }
+  if (!upload.ready || upload.repository) return;
+  firmwareInstallIntent = null;
+  resmedCommand({...intent.options, upload_id:intent.upload_id});
+}
+
+async function resmedCommand(body, cancel = false) {
+  if (!resmedFresh || resmedRequest) return;
+  const connection = resmedConnectionSerial;
+  resmedRequest = true;
+  if (!cancel && body.action !== 'confirm_dump') firmwareProgressKind = 'operation';
+  renderResmedStatus();
   try {
-    const r = await api('/api/flash', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({block:block||undefined,flash_blx:flashBlx,force_blx:forceBlx})});
-    if (!r) return; const d = await r.json();
-    if (d.ok === 'false' || d.error) { showMsg(msgEl, d.error ? uiMessage('ota.error', {error:uiError(d.error)}) : uiMessage('ota.flashFailed'), 'err'); return; }
-    showMsg(msgEl, uiMessage('ota.flashStarted', {block:d.block}), 'ok');
-    document.getElementById('btnFlash').disabled = true;
-    document.getElementById('btnFlashCancel').style.display = '';
-    document.getElementById('flashProgress').style.display = 'block';
-    pollFlash();
-  } catch(e) { showMsg(msgEl, uiMessage('ota.error', {error:uiError(e)}), 'err'); }
+    const response = await api(cancel ? '/api/flash/cancel' : '/api/flash', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}, 5000);
+    if (!response) { resmedAuthFailed = true; resmedDisconnected(); return; }
+    const data = await response.json();
+    if (connection !== resmedConnectionSerial) return;
+    if (!response.ok || (data.ok !== true && data.ok !== 'true')) throw new Error(data.error || 'resmed_request_rejected');
+  } catch(error) { appendFirmwareMessages([uiMessage('ota.error', {error:uiError(error)})]); }
+  finally { resmedRequest = false; renderResmedStatus(); }
 }
 
-function pollFlash() {
-  if (flashPolling) return;
-  flashPolling = true;
-  let failedAt = null;
-  const poll = async () => {
-    try {
-      const r = await api('/api/flash', undefined, 5000);
-      if (!r) { flashPolling = false; flashPollTimer = null; return; }
-      if (!r.ok) throw uiFailure('ota.flashStatusReadFailed');
-      const d = await r.json();
-      failedAt = null;
-      const bar = document.getElementById('flashBar'), phase = document.getElementById('flashPhase'), msgEl = document.getElementById('flashMsg');
-      if (d.total > 0) bar.style.width = (d.sent/d.total*100)+'%';
-      uiText(phase, d.total > 0 ? uiMessage('ota.flashPhaseProgress', {phase:d.phase, sent:Math.round(d.sent/1024), total:Math.round(d.total/1024)}) : uiMessage('ota.flashPhase', {phase:d.phase}));
-      if (d.active !== 'true') {
-        flashPolling = false; flashPollTimer = null;
-        document.getElementById('btnFlash').disabled = false;
-        document.getElementById('btnFlashCancel').style.display = 'none';
-        if (d.error) showMsg(msgEl, uiMessage('ota.error', {error:uiError(d.error)}), 'err');
-        else if (d.phase === 'Complete') showMsg(msgEl, uiMessage('ota.flashComplete'), 'ok');
-        else showMsg(msgEl, uiMessage('ota.flashFinished', {phase:d.phase}), 'ok');
-        return;
-      }
-    } catch(e) {
-      if (failedAt === null) failedAt = Date.now();
-      if (Date.now() - failedAt >= 30000) {
-        flashPolling = false; flashPollTimer = null;
-        showMsg(document.getElementById('flashMsg'), uiMessage('ota.flashStatusUnavailable'), 'err', 0);
-        return;
-      }
-    }
-    flashPollTimer = setTimeout(poll, 500);
-  };
-  flashPollTimer = setTimeout(poll, 500);
+function dumpFirmware() {
+  if (!document.getElementById('btnFirmwareDump').disabled) return resmedCommand({action:'dump'});
 }
 
-async function cancelFlash() { try { await api('/api/flash/cancel', {method:'POST'}); } catch(e) { console.error(e); } }
+function confirmFirmwareDump() {
+  if (document.getElementById('btnConfirmFirmwareDump').disabled) return;
+  const id = lastStatus.resmed.id;
+  document.getElementById('firmwareDumpConsent').checked = false;
+  return resmedCommand({action:'confirm_dump',id,confirm:'INSTALL_PATCHED_BOOTLOADER'});
+}
+
+function cancelFlash() {
+  if (!resmedFresh || resmedRequest) return;
+  firmwareInstallIntent = null;
+  if (lastStatus.firmware_upload?.cancel_allowed === true) {
+    firmwareUploadAbort?.abort();
+    return resmedCommand({}, true);
+  }
+  if (!document.getElementById('btnFlashCancel').disabled && lastStatus.resmed?.cancel_allowed === true)
+    return resmedCommand({}, true);
+}
 
 // Charts
 const WAVE_PTS = 500;     // ~20 s @ 25 Hz; covers 4-5 breath cycles
