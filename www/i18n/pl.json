@@ -683,6 +683,7 @@
   "ota.repositoryEntry": "{size} KiB | {path}",
   "ota.repositoryEmpty": "Nie zapisano firmware.",
   "ota.repositoryLoading": "Odczytywanie repozytorium firmware...",
+  "ota.repositoryRefreshing": "Odświeżanie listy plików; oczekiwanie na dostęp do SD...",
   "ota.repositoryUnavailable": "Repozytorium firmware nie jest gotowe. Zwróć kartę SD do AirBridge i odśwież.",
   "ota.repositoryTruncated": "Wyświetlono tylko część repozytorium firmware.",
   "ota.repositoryUploadReady": "Firmware zapisano w repozytorium na SD.",

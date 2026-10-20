@@ -344,8 +344,7 @@ a.btn:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .storage-row small{display:block;color:var(--text-dim);margin-top:4px;font:11px 'SF Mono',Consolas,monospace;overflow-wrap:anywhere;line-height:1.5}
 .storage-row .storage-download{width:38px;height:34px;padding:0;font-size:20px;line-height:1}
 .storage-entry-actions{display:flex;gap:8px;align-items:center}
-#storageMessage{font-size:12px;color:var(--text-dim);line-height:1.5}
-#storageMessage:not(:empty){margin:10px 0}
+#storageMessage{font-size:12px;color:var(--text-dim);line-height:1.5;height:3em;overflow:auto;margin:10px 0}
 .storage-pagination{display:flex;align-items:center;gap:8px;margin-top:12px}
 #storagePage{font-size:12px;color:var(--text-dim);margin:0 4px}
 
@@ -4261,6 +4260,7 @@ function renderExports(changed = null) {
 let storagePath = '/', storageOffset = 0, storageMore = false, storageLoading = false;
 let storageUsbRequest = false, storageListAbort = null, storageViewState = '';
 let storageReloadPending = false;
+let storageMutation = '';
 const storageSelection = new Set();
 const STORAGE_STATES = {mounted:'storage.state.mounted', unavailable:'storage.state.unavailable',
   unsupported:'storage.state.unsupported', usb_starting:'storage.state.usbStarting',
@@ -4311,7 +4311,7 @@ function renderStorageStatus(data) {
         usb_stopping:uiMessage('storage.remounting')}[data.sd] || ''));
   } else {
     if (storageViewState && storageViewState !== 'mounted') storageReloadPending = true;
-    if (data.sd_error || storageReloadPending)
+    if (!storageMutation && (data.sd_error || storageReloadPending))
       uiText(document.getElementById('storageMessage'), uiError(data.sd_error) || '');
   }
   storageViewState = data.sd;
@@ -4325,7 +4325,7 @@ function reloadStorageIfNeeded() {
 }
 
 function storageControls() {
-  const blocked = storageLoading || storageUsbRequest || (lastStatus.sd && lastStatus.sd !== 'mounted');
+  const blocked = !!storageMutation || storageLoading || storageReloadPending || storageUsbRequest || (lastStatus.sd && lastStatus.sd !== 'mounted');
   document.getElementById('storageRefresh').disabled = blocked;
   document.getElementById('storageUp').disabled = blocked || storagePath === '/';
   document.getElementById('storagePrev').disabled = blocked || !storageOffset;
@@ -4334,13 +4334,14 @@ function storageControls() {
   document.getElementById('storageSelected').disabled = blocked || !storageSelection.size;
   document.getElementById('storageDelete').disabled = blocked || !storageSelection.size;
   document.querySelectorAll('#storageEntries button, #storageEntries input').forEach(el => { el.disabled = blocked; });
-  document.getElementById('storageUsb').disabled = storageUsbRequest ||
+  document.querySelectorAll('#storageEntries a').forEach(el => { el.setAttribute('aria-disabled', String(blocked)); });
+  document.getElementById('storageUsb').disabled = !!storageMutation || storageUsbRequest ||
     !(lastStatus.sd === 'mounted' || lastStatus.sd === 'usb' ||
       (lastStatus.sd === 'usb_stopping' && lastStatus.sd_error));
 }
 
 async function storageUsb() {
-  if (storageUsbRequest) return;
+  if (storageMutation || storageUsbRequest) return;
   const enabled = lastStatus.sd === 'mounted';
   if (enabled && !confirm(t('storage.confirmUsbShare'))) return;
   if (!enabled && lastStatus.sd === 'usb' && !confirm(t('storage.confirmUsbReturn'))) return;
@@ -4363,7 +4364,7 @@ async function storageUsb() {
 function storageChild(name) { return (storagePath === '/' ? '' : storagePath) + '/' + name; }
 
 async function loadStorage(path = storagePath, offset = storageOffset) {
-  if (storageLoading || storageUsbRequest || (lastStatus.sd && lastStatus.sd !== 'mounted')) return;
+  if (storageMutation || storageLoading || storageUsbRequest || (lastStatus.sd && lastStatus.sd !== 'mounted')) return;
   storageReloadPending = false;
   const controller = new AbortController();
   storageListAbort = controller;
@@ -4392,8 +4393,11 @@ async function loadStorage(path = storagePath, offset = storageOffset) {
       const content = document.createElement('div');
       const link = document.createElement('a'); link.textContent = entry.name + (entry.directory ? '/' : '');
       link.href = entry.directory ? '#storage' : '/api/storage/download?path=' + encodeURIComponent(storageChild(entry.name));
-      if (entry.directory) link.onclick = event => { event.preventDefault(); loadStorage(storageChild(entry.name), 0); };
-      else link.download = entry.name;
+      link.onclick = event => {
+        if (link.getAttribute('aria-disabled') === 'true') { event.preventDefault(); return; }
+        if (entry.directory) { event.preventDefault(); loadStorage(storageChild(entry.name), 0); }
+      };
+      if (!entry.directory) link.download = entry.name;
       const detail = document.createElement('small');
       const unit = entry.size >= 1048576 ? 2 : entry.size >= 1024 ? 1 : 0;
       uiText(detail, uiMessage('common.value', {value:{items:[entry.directory ? uiMessage('storage.directory') :
@@ -4433,7 +4437,7 @@ function storageUp() {
 }
 
 function storageDownload(kind, name = null, selected = false) {
-  if (storageLoading || storageUsbRequest || (lastStatus.sd && lastStatus.sd !== 'mounted')) return;
+  if (storageMutation || storageLoading || storageReloadPending || storageUsbRequest || (lastStatus.sd && lastStatus.sd !== 'mounted')) return;
   let url = '/api/storage/' + kind + '?path=' + encodeURIComponent(name === null ? storagePath : storageChild(name));
   if (selected) {
     if (!storageSelection.size) return;
@@ -4450,11 +4454,18 @@ function storageDownload(kind, name = null, selected = false) {
 }
 
 async function storageMutate(kind, body, repository = false) {
+  if (storageMutation || storageLoading || storageUsbRequest) return;
   if (repository ? !firmwareRepository?.ready || firmwareRepositoryDirty || firmwareRepositoryRead ||
       firmwareRepositoryError || !resmedFresh || resmedRequest || firmwareUploadRequest :
-      storageLoading || storageUsbRequest || (lastStatus.sd && lastStatus.sd !== 'mounted')) return;
-  if (repository) { resmedRequest = true; renderResmedStatus(); }
-  else { storageLoading = true; storageControls(); }
+      storageReloadPending || (lastStatus.sd && lastStatus.sd !== 'mounted')) return;
+  storageMutation = kind;
+  // Do not let a file revision replace either list before mutation completion.
+  firmwareRepositorySerial++;
+  firmwareRepositoryDirty = true;
+  storageReloadPending = true;
+  if (!repository) storageLoading = true;
+  storageControls();
+  renderResmedStatus();
   const message = document.getElementById(repository ? 'firmwareRepositoryState' : 'storageMessage');
   uiText(message, uiMessage(kind === 'delete' ? 'storage.deleting' : 'storage.renaming'));
   let result;
@@ -4474,17 +4485,22 @@ async function storageMutate(kind, body, repository = false) {
   } catch (error) {
     result = uiError(error);
   } finally {
-    if (repository) { resmedRequest = false; renderResmedStatus(); }
-    else { storageLoading = false; storageControls(); }
+    storageMutation = '';
+    if (!repository) storageLoading = false;
+    // Completion is terminal; refresh also after partial failure or lost reply.
+    if (repository) await loadFirmwareRepository();
+    else await loadStorage(storagePath, 0);
+    storageControls();
+    renderResmedStatus();
+    reloadStorageIfNeeded();
+    loadFirmwareRepository();
   }
-  if (repository) { uiText(message, result); return; }
-  // A failed or interrupted recursive delete may already have removed files.
-  await loadStorage(storagePath, 0);
-  if (lastStatus.sd === 'mounted') uiText(message, result);
+  if (repository || lastStatus.sd === 'mounted') uiText(message, result);
 }
 
 async function storageRename(name, path = storageChild(name), repository = false) {
-  if (repository ? resmedRequest : storageLoading) return;
+  if (storageMutation || storageLoading || storageUsbRequest ||
+      (repository ? resmedRequest : storageReloadPending)) return;
   const replacement = prompt(t('storage.newName', {name}), path);
   if (replacement === null || replacement === path || replacement === name) return;
   if (!replacement || /[\\\r\n]/.test(replacement)) {
@@ -4495,7 +4511,7 @@ async function storageRename(name, path = storageChild(name), repository = false
 }
 
 async function storageDelete() {
-  if (storageLoading || !storageSelection.size) return;
+  if (storageMutation || storageLoading || storageReloadPending || !storageSelection.size) return;
   const names = [...storageSelection];
   if (!confirm(t('storage.confirmDelete', {names:{items:names, separator:'\n'}}))) return;
   const body = new URLSearchParams({path:storagePath});
@@ -5188,7 +5204,7 @@ function applyResmedStatus(data) {
 }
 
 async function loadFirmwareRepository() {
-  if (firmwareRepositoryRead || !firmwareRepositoryDirty || !resmedFresh ||
+  if (storageMutation || firmwareRepositoryRead || !firmwareRepositoryDirty || !resmedFresh ||
       !document.getElementById('p-ota').classList.contains('active')) return;
   const serial = firmwareRepositorySerial;
   firmwareRepositoryDirty = false;
@@ -5198,7 +5214,7 @@ async function loadFirmwareRepository() {
       const response = await api('/api/resmed/repository', undefined, 5000);
       if (!response) { resmedAuthFailed = true; resmedDisconnected(); return; }
       const data = await response.json();
-      if (serial !== firmwareRepositorySerial || !resmedFresh) return;
+      if (serial !== firmwareRepositorySerial || storageMutation || !resmedFresh) return;
       if (!response.ok) throw new Error(data.error || 'repository_unavailable');
       if (typeof data.supported !== 'boolean' || typeof data.ready !== 'boolean' || !Array.isArray(data.entries))
         throw new Error('repository_invalid_response');
@@ -5288,7 +5304,7 @@ function resmedInstallSource() {
 function renderResmedStatus() {
   const state = lastStatus.resmed || {}, upload = lastStatus.firmware_upload;
   const repository = firmwareRepository;
-  const busy = resmedRequest || firmwareUploadRequest || !!firmwareInstallIntent;
+  const busy = !!storageMutation || resmedRequest || firmwareUploadRequest || !!firmwareInstallIntent;
   const repositoryReady = resmedFresh && repository?.ready && !firmwareRepositoryDirty && !firmwareRepositoryRead && !firmwareRepositoryError;
   document.getElementById('firmwareRepository').hidden = repository?.supported === false;
   uiText(document.getElementById('firmwareRepositoryPath'), repository?.root || '');
@@ -5311,8 +5327,11 @@ function renderResmedStatus() {
       (el.dataset.firmwareAction === 'install' && state.install_allowed !== true);
   });
   document.querySelectorAll('#firmwareEntries a').forEach(el => { el.setAttribute('aria-disabled', String(!repositoryReady || busy)); });
-  uiText(document.getElementById('firmwareRepositoryState'), !resmedFresh ? uiMessage('ota.resmedStatusUnavailable') :
-    firmwareRepositoryError || (repository?.error ? uiError(repository.error) :
+  uiText(document.getElementById('firmwareRepositoryState'), storageMutation ?
+    uiMessage(storageMutation === 'delete' ? 'storage.deleting' : 'storage.renaming') :
+    !resmedFresh ? uiMessage('ota.resmedStatusUnavailable') :
+    firmwareRepositoryError || (repository?.error ? (['storage_busy', 'storage_changed'].includes(repository.error) ?
+      uiMessage('ota.repositoryRefreshing') : uiError(repository.error)) :
       firmwareRepositoryRead || !repository ? uiMessage('ota.repositoryLoading') :
       !repository.ready ? uiMessage('ota.repositoryUnavailable') : repository.truncated ? uiMessage('ota.repositoryTruncated') :
       !repository.entries.length ? uiMessage('ota.repositoryEmpty') : ''));

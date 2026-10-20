@@ -47,7 +47,8 @@ struct MutationStatus {
 // removes a waiting descriptor immediately. Mutations are not queued.
 // Ready runs outside the SD executor, including immediate activation failure.
 // Size zero for archives denotes HTTP chunked transfer.
-// Mutations return no Transfer; completion is also retained for the CLI.
+// Mutations return no Transfer; Ready runs after releasing SD and admission.
+// Completion is also retained for the CLI.
 // Released runs once after ending SD access, or without a session for work
 // cancelled/failed before activation. It is not called unless start returns
 // Started. An active slot outlives the producer until its response is released.

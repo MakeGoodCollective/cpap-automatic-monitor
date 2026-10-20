@@ -566,6 +566,8 @@ void produce(void *context) {
     auto job = std::move(*static_cast<std::shared_ptr<Job> *>(context));
     delete static_cast<std::shared_ptr<Job> *>(context);
     bool success = false;
+    uint32_t changed = 0;
+    const char *mutation_error = nullptr;
     job->report(LOG_DEBUG, "started");
     const SdStorage::Access access = mutating(job->request.kind)
         ? SdStorage::Access::Exclusive : SdStorage::Access::ReadOnly;
@@ -585,16 +587,10 @@ void produce(void *context) {
         Log::logf(CAT_STORAGE, LOG_DEBUG, "artifact admitted wait=%ums path=%s\n",
             unsigned(uint32_t(millis() - job->started_ms)), job->request.path);
     if (mutating(job->request.kind)) {
-        uint32_t changed = 0;
         const char *error = admitted ? mutate(*job, changed) : "storage_busy";
+        mutation_error = error;
         if (changed) ExportSync::request_backlog_refresh(true);
         success = !error;
-        portENTER_CRITICAL(&mutation_mux);
-        mutation.active = false;
-        mutation.succeeded = success;
-        mutation.changed = changed;
-        snprintf(mutation.error, sizeof(mutation.error), "%s", error ? error : "");
-        portEXIT_CRITICAL(&mutation_mux);
         log_level_t level = success ? LOG_INFO : LOG_WARN;
         if (!success) {
             if (job->failure) level = job->failure_level;
@@ -604,7 +600,6 @@ void produce(void *context) {
             "%s %s: %s (%u changed)\n",
             job->request.kind == Kind::Rename ? "rename" : "delete",
             job->request.path, job->failure ? job->failure : error ? error : "done", changed);
-        job->ready(success ? 200 : 409, error, nullptr, changed);
     } else if (!admitted) {
         job->report(LOG_DEBUG, "storage_busy");
         job->ready(409, "storage_busy", nullptr, 0);
@@ -629,7 +624,7 @@ void produce(void *context) {
         job->ready(200, nullptr, job, 0);
         success = archive(*job);
     } else job->ready(409, "archive_unavailable", nullptr, 0);
-    job->ready = nullptr;
+    if (!mutating(job->request.kind)) job->ready = nullptr;
     if (!mutating(job->request.kind) && admitted)
         job->report(success ? LOG_DEBUG : job->failure_level,
             success ? "producer_done" : job->failure);
@@ -640,6 +635,21 @@ void produce(void *context) {
     job->copy_buffer = nullptr;
     job->error.store(!success);
     job->done.store(true);
+    if (mutating(job->request.kind)) {
+        portENTER_CRITICAL(&mutation_mux);
+        mutation.active = false;
+        mutation.succeeded = success;
+        mutation.changed = changed;
+        snprintf(mutation.error, sizeof(mutation.error), "%s", mutation_error ? mutation_error : "");
+        portEXIT_CRITICAL(&mutation_mux);
+        // Completion permits the next operation, including from this callback.
+        if (job->registered) {
+            job->registered = false;
+            release_slot();
+        }
+        job->ready(success ? 200 : 409, mutation_error, nullptr, changed);
+        job->ready = nullptr;
+    }
     job.reset();
     vTaskDeleteWithCaps(nullptr);
 }

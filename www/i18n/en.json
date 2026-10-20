@@ -679,6 +679,7 @@
   "ota.repositoryEntry": "{size} KiB | {path}",
   "ota.repositoryEmpty": "No firmware saved.",
   "ota.repositoryLoading": "Reading firmware repository...",
+  "ota.repositoryRefreshing": "Updating the file list; waiting for SD access...",
   "ota.repositoryUnavailable": "Firmware repository is not ready. Return the SD card to AirBridge and refresh.",
   "ota.repositoryTruncated": "Only part of the firmware repository is shown.",
   "ota.repositoryUploadReady": "Firmware saved to the SD repository.",
