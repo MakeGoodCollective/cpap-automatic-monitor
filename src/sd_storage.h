@@ -114,10 +114,14 @@ bool usb_transfer(bool write, uint32_t sector, uint8_t *buffer, size_t size,
                   void (*done)(bool));
 void usb_ejected();
 
-// Explicit rename/delete steps, including partial jobs, and successful mounts.
-// Recorder/catalog commits and private cache writes have separate revisions.
-uint32_t files_revision();
-void notify_files_changed();
+// External file changes are scoped to the owners that consume those paths.
+// Recorder/catalog commits and private cache writes retain their own revisions.
+enum class FileScope : uint8_t { All, Catalog, Recording, Reports, Export, Firmware, Count };
+uint32_t files_revision(FileScope scope = FileScope::All);
+// Canonical absolute paths; includes descendants and affected parent directories.
+// Rename supplies both paths. Omit paths when the change extent is unknown.
+// Unknown changes and successful remounts invalidate all scopes.
+void notify_files_changed(const char *path = nullptr, const char *destination = nullptr);
 
 // Recorder/recovery only. Waits for current local I/O, never for a network
 // consumer; acquisition invalidates all previously admitted background work.

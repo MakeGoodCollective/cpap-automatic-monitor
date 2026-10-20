@@ -392,7 +392,7 @@ const char *mutate(Job &job, uint32_t &changed) {
             if (!check(fs)) return false;
             error = "rename_failed";
             if (!fs.rename(job.request.path, destination)) return false;
-            SdStorage::notify_files_changed();
+            SdStorage::notify_files_changed(job.request.path, destination);
             return true;
         });
         if (!renamed) return error;
@@ -409,7 +409,7 @@ const char *mutate(Job &job, uint32_t &changed) {
         const bool removed = job.session.mutate(entry.path, [&](fs::FS &fs) {
             if (job.cancelled.load()) return false;
             if (!(entry.directory ? fs.rmdir(entry.path) : fs.remove(entry.path))) return false;
-            SdStorage::notify_files_changed();
+            SdStorage::notify_files_changed(entry.path);
             return true;
         });
         if (!removed) { error = job.session.valid() ? "delete_failed" : "cancelled"; break; }
@@ -587,9 +587,11 @@ void produce(void *context) {
         Log::logf(CAT_STORAGE, LOG_DEBUG, "artifact admitted wait=%ums path=%s\n",
             unsigned(uint32_t(millis() - job->started_ms)), job->request.path);
     if (mutating(job->request.kind)) {
+        const uint32_t exports = SdStorage::files_revision(SdStorage::FileScope::Export);
         const char *error = admitted ? mutate(*job, changed) : "storage_busy";
         mutation_error = error;
-        if (changed) ExportSync::request_backlog_refresh(true);
+        if (exports != SdStorage::files_revision(SdStorage::FileScope::Export))
+            ExportSync::request_backlog_refresh(true);
         success = !error;
         log_level_t level = success ? LOG_INFO : LOG_WARN;
         if (!success) {

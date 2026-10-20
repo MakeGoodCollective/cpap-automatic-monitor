@@ -249,7 +249,7 @@ const char *scan(Builder &builder, uint32_t files, SdStorage::Session &session) 
             if (visited == MAX_SCAN_ENTRIES) break;
         }
     }
-    if (!session.valid() || files != SdStorage::files_revision()) error = "storage_changed";
+    if (!session.valid() || files != SdStorage::files_revision(SdStorage::FileScope::Firmware)) error = "storage_changed";
     session.end();
     return error;
 }
@@ -310,7 +310,7 @@ void init() {
 void poll() {
     if (!mutex) return;
     const bool available = SdStorage::mounted() && SdStorage::local_access_allowed();
-    const uint32_t files = SdStorage::files_revision();
+    const uint32_t files = SdStorage::files_revision(SdStorage::FileScope::Firmware);
     xSemaphoreTake(mutex, portMAX_DELAY);
     const bool changed = last_available != available || files != status.files_revision;
     if (changed) {
@@ -362,7 +362,7 @@ std::shared_ptr<const Snapshot> snapshot(Status &out) {
 
 bool notify_published(const char *path) {
     if (!valid_path(path)) return false;
-    SdStorage::notify_files_changed();
+    SdStorage::notify_files_changed(path);
     request_refresh();
     return true;
 }

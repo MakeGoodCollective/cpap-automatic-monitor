@@ -49,7 +49,50 @@ static Status status = {
     "",
 };
 static portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
-static uint32_t file_mutation_revision = 0;
+static uint32_t file_mutation_revision[size_t(FileScope::Count)] = {};
+
+namespace {
+bool paths_overlap(const char *left, const char *right) {
+    if (!left || !*left || !right || !*right) return false;
+    size_t a = strlen(left), b = strlen(right);
+    while (a > 1 && left[a - 1] == '/') --a;
+    while (b > 1 && right[b - 1] == '/') --b;
+    const size_t common = std::min(a, b);
+    if (strncasecmp(left, right, common)) return false;
+    return a == b || common == 1 || (a < b ? right[a] : left[b]) == '/';
+}
+
+uint32_t file_scope_mask(const char *path) {
+    constexpr uint32_t all = (1u << unsigned(FileScope::Count)) - 1;
+    if (!path || path[0] != '/') return all;
+    constexpr uint32_t catalog = 1u << unsigned(FileScope::Catalog);
+    constexpr uint32_t recording = 1u << unsigned(FileScope::Recording);
+    constexpr uint32_t reports = 1u << unsigned(FileScope::Reports);
+    constexpr uint32_t exports = 1u << unsigned(FileScope::Export);
+    constexpr uint32_t firmware = 1u << unsigned(FileScope::Firmware);
+    constexpr uint32_t sources = recording | reports | exports;
+    static constexpr struct { const char *path; uint32_t scopes; } roots[] = {
+        {"/DATALOG", sources},
+        {"/STR.edf", sources}, {"/STR.edf.part", sources}, {"/STR.edf.bak", sources},
+        {"/Identification.tgt", sources}, {"/Identification.crc", sources},
+        {"/Identification.tgt.part", sources}, {"/Identification.crc.part", sources},
+        {"/Identification.tgt.bak", sources}, {"/Identification.crc.bak", sources},
+        {"/airbridge/catalog.bin", catalog | sources},
+        {"/airbridge/catalog.bin.part", catalog | sources},
+        {"/airbridge/catalog.bin.bak", catalog | sources},
+        {"/airbridge/pending", recording},
+        {"/airbridge/report", reports},
+        {"/airbridge/resmed-firmware", firmware},
+    };
+    uint32_t mask = 1u << unsigned(FileScope::All);
+    for (const auto &root : roots)
+        if (paths_overlap(path, root.path)) mask |= root.scopes;
+    // Receipt directories are account-specific; the roots above cover ancestors.
+    if (!strncasecmp(path, "/airbridge/smb_", 15) ||
+        !strncasecmp(path, "/airbridge/shq_", 15)) mask |= exports;
+    return mask;
+}
+}  // namespace
 
 #if AB_STORAGE_HAS_SDCARD
 namespace {
@@ -312,14 +355,6 @@ void notify_background_waiter() {
     const auto notify = waiting.notify;
     waiting.notify = nullptr;
     if (notify) notify(waiting.context);
-}
-
-bool paths_overlap(const char *left, const char *right) {
-    if (!left || !*left || !right || !*right) return false;
-    const size_t a = strlen(left), b = strlen(right);
-    const size_t common = std::min(a, b);
-    if (strncasecmp(left, right, common)) return false;
-    return a == b || common == 1 || (a < b ? right[a] : left[b]) == '/';
 }
 
 bool mutation_blocked(Request &request) {
@@ -934,7 +969,7 @@ void mount_card() {
     set_bus_status(mount_card_info);
 #endif
     // Also covers a USB round trip missed by consumers observing mounted=true.
-    __atomic_add_fetch(&file_mutation_revision, 1, __ATOMIC_RELEASE);
+    for (auto &revision : file_mutation_revision) ++revision;
     __atomic_store_n(&status.mounted, true, __ATOMIC_RELEASE);
     portEXIT_CRITICAL(&status_mux);
 #if !AB_STORAGE_SPI_SD_ENABLED
@@ -1196,16 +1231,19 @@ const char *bus_name(Bus bus) {
     }
 }
 
-uint32_t files_revision() {
+uint32_t files_revision(FileScope scope) {
     portENTER_CRITICAL(&status_mux);
-    const uint32_t revision = file_mutation_revision;
+    const uint32_t revision = file_mutation_revision[size_t(scope)];
     portEXIT_CRITICAL(&status_mux);
     return revision;
 }
 
-void notify_files_changed() {
+void notify_files_changed(const char *path, const char *destination) {
+    const uint32_t mask = file_scope_mask(path) |
+        (destination ? file_scope_mask(destination) : 0);
     portENTER_CRITICAL(&status_mux);
-    ++file_mutation_revision;
+    for (size_t i = 0; i < size_t(FileScope::Count); ++i)
+        if (mask & (1u << i)) ++file_mutation_revision[i];
     portEXIT_CRITICAL(&status_mux);
 }
 
@@ -1438,7 +1476,7 @@ bool Session::ensure_parent(const char *path) const {
                 return directory && directory.isDirectory();
             }
             if (!fs.mkdir(parent)) return false;
-            notify_files_changed();
+            notify_files_changed(parent);
             return true;
         });
         *p = saved;

@@ -578,11 +578,11 @@ void invalidate_publications() {
     aircannect::Memory::free(publications);
     publications = nullptr;
     publication_count = publication_capacity = 0;
-    publication_files_revision = SdStorage::files_revision();
+    publication_files_revision = SdStorage::files_revision(SdStorage::FileScope::Reports);
 }
 
 CachedPublication *publication_entry(uint16_t day, uint16_t period) {
-    if (publication_files_revision != SdStorage::files_revision()) invalidate_publications();
+    if (publication_files_revision != SdStorage::files_revision(SdStorage::FileScope::Reports)) invalidate_publications();
     // Descending days followed by periods: normal cold discovery appends, and
     // index serialization finds retained metadata without another linear scan.
     const uint32_t key = period ? 65536u + period : 65535u - day;
@@ -821,7 +821,7 @@ bool refresh_index(const SdStorage::Session &session, const Job *job = nullptr) 
         else if (!changes.catalog.ready) index_failure = IndexFailure::WaitingCatalog;
         return false;
     }
-    const uint32_t files = SdStorage::files_revision();
+    const uint32_t files = SdStorage::files_revision(SdStorage::FileScope::Reports);
     const uint32_t invalidation = __atomic_load_n(&invalidation_generation, __ATOMIC_ACQUIRE);
     const bool invalidated = invalidation != indexed_invalidation;
     if (index_ready && !invalidated && changes.catalog.generation == catalog_generation && files == file_revision)
@@ -919,7 +919,7 @@ bool refresh_index(const SdStorage::Session &session, const Job *job = nullptr) 
     EdfCatalog::Status current;
     EdfCatalog::get_status(current);
     if (aborted(job, session) || !current.ready || current.generation != index_scan.catalog ||
-        SdStorage::files_revision() != index_scan.files ||
+        SdStorage::files_revision(SdStorage::FileScope::Reports) != index_scan.files ||
         __atomic_load_n(&invalidation_generation, __ATOMIC_ACQUIRE) != index_scan.invalidation) {
         index_failure = IndexFailure::Preempted;
         return false;
@@ -1992,7 +1992,7 @@ bool prepare_period(const SdStorage::Session &session, Job &job) {
     if (!summary_json(session, job) || job.issue || aborted(&job, session, false)) return false;
     EdfCatalog::Status current;
     EdfCatalog::get_status(current);
-    if (current.generation != catalog_generation || SdStorage::files_revision() != file_revision) return false;
+    if (current.generation != catalog_generation || SdStorage::files_revision(SdStorage::FileScope::Reports) != file_revision) return false;
     if (!ReportArtifact::document_publish(session, prefix, key,
         reinterpret_cast<const uint8_t *>(job.body.c_str()), job.body.length(), document))
         return note_issue(job, "publication_write", prefix);
@@ -2236,7 +2236,7 @@ bool prepare_json(const SdStorage::Session &session, Job &job) {
     // A catalog/STR update during production must not become the current head.
     EdfCatalog::Status current;
     EdfCatalog::get_status(current);
-    if (current.generation != catalog_generation || SdStorage::files_revision() != file_revision) return false;
+    if (current.generation != catalog_generation || SdStorage::files_revision(SdStorage::FileScope::Reports) != file_revision) return false;
     if (!ReportArtifact::document_publish(session, manifest, manifest_key,
         reinterpret_cast<const uint8_t *>(job.body.c_str()), job.body.length(), saved))
         return note_issue(job, "publication_write", manifest);
@@ -2379,7 +2379,7 @@ bool discard_index(const SdStorage::Session &session, const uint8_t digest[32]) 
 
 bool retire_index(const SdStorage::Session &session) {
     if (!retired_index.bytes) return true;
-    if (retired_index_files != SdStorage::files_revision()) {
+    if (retired_index_files != SdStorage::files_revision(SdStorage::FileScope::Reports)) {
         retired_index = {};
         return true; // External edits invalidate provenance; leave it for discovery.
     }
@@ -2427,16 +2427,16 @@ ReportArtifact::Lookup index_shape(const aircannect::LargeTextBuffer &body) {
 }
 
 bool index_cleanup_pending() {
-    return index_cleanup.files != SdStorage::files_revision() ||
+    return index_cleanup.files != SdStorage::files_revision(SdStorage::FileScope::Reports) ||
         !index_cleanup.discovered || index_cleanup.shard < 256;
 }
 
 bool cleanup_indexes(const SdStorage::Session &session) {
     auto *context = const_cast<SdStorage::Session *>(&session);
     if (cleanup_cancelled(context)) return false;
-    if (index_cleanup.files != SdStorage::files_revision()) {
+    if (index_cleanup.files != SdStorage::files_revision(SdStorage::FileScope::Reports)) {
         index_cleanup = {};
-        index_cleanup.files = SdStorage::files_revision();
+        index_cleanup.files = SdStorage::files_revision(SdStorage::FileScope::Reports);
     }
     SdStorage::Reader directory;
     SdStorage::Reader::Entry entry;
@@ -2518,7 +2518,7 @@ bool publish_index(const SdStorage::Session &session) {
     }
     published_index_data = data;
     published_index_artifacts = artifacts;
-    retired_index_files = SdStorage::files_revision();
+    retired_index_files = SdStorage::files_revision(SdStorage::FileScope::Reports);
     index_commit_pending = false;
     retire_index(session);
     return true;
@@ -3540,7 +3540,7 @@ struct DayCleanup {
 };
 
 bool artifact_cleanup_pending() {
-    return !artifact_cleanup.complete || artifact_cleanup.files != SdStorage::files_revision() ||
+    return !artifact_cleanup.complete || artifact_cleanup.files != SdStorage::files_revision(SdStorage::FileScope::Reports) ||
         artifact_cleanup.data != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE) ||
         artifact_cleanup.artifacts != status.artifact_revision;
 }
@@ -3560,13 +3560,13 @@ bool cleanup_artifacts(const SdStorage::Session &session) {
     xSemaphoreGive(mutex);
     if (busy) return false;
     const uint32_t data = __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE);
-    if (artifact_cleanup.files != SdStorage::files_revision() || artifact_cleanup.data != data ||
+    if (artifact_cleanup.files != SdStorage::files_revision(SdStorage::FileScope::Reports) || artifact_cleanup.data != data ||
         artifact_cleanup.artifacts != status.artifact_revision) {
-        if (artifact_cleanup.files != SdStorage::files_revision())
+        if (artifact_cleanup.files != SdStorage::files_revision(SdStorage::FileScope::Reports))
             for (size_t i = 0; i < daily_capacity; ++i) daily_cache[i].cleanup_checked = false;
         artifact_cleanup.~ArtifactCleanup();
         new (&artifact_cleanup) ArtifactCleanup;
-        artifact_cleanup.files = SdStorage::files_revision();
+        artifact_cleanup.files = SdStorage::files_revision(SdStorage::FileScope::Reports);
         artifact_cleanup.data = data;
         artifact_cleanup.artifacts = status.artifact_revision;
     }
@@ -3686,7 +3686,7 @@ bool dirty() {
     EdfCatalog::get_status(catalog);
     return !index_ready || __atomic_load_n(&invalidation_generation, __ATOMIC_ACQUIRE) != indexed_invalidation ||
         catalog.generation != catalog_generation ||
-        SdStorage::files_revision() != file_revision;
+        SdStorage::files_revision(SdStorage::FileScope::Reports) != file_revision;
 }
 
 bool reindex(const SdStorage::Session &session, Job &job) {
@@ -3915,7 +3915,7 @@ bool work_once() {
         job->progress.attempt();
         job->wait_reason = "working";
         job->indexing = true;
-        job->files_revision = SdStorage::files_revision();
+        job->files_revision = SdStorage::files_revision(SdStorage::FileScope::Reports);
         job->recovered_index = false;
     }
     JobTiming timing(job);
@@ -4109,9 +4109,9 @@ bool work_once() {
     const bool interrupted = !AirSenseState::local_background_allowed() || !session.valid();
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
-    const bool changed = SdStorage::files_revision() != job->files_revision ||
+    const bool changed = SdStorage::files_revision(SdStorage::FileScope::Reports) != job->files_revision ||
         job->data_revision != __atomic_load_n(&data_revision, __ATOMIC_ACQUIRE) ||
-        (!recovered_index && (catalog.generation != catalog_generation || SdStorage::files_revision() != file_revision));
+        (!recovered_index && (catalog.generation != catalog_generation || SdStorage::files_revision(SdStorage::FileScope::Reports) != file_revision));
     const bool yielded = !success && (job->storage_yielded || session.yield_requested());
     if (success && !job->background && job->request.action == Action::Prepare &&
         !interrupted && !changed && !yielded) {
@@ -4249,7 +4249,7 @@ void tick() {
     const bool local = SdStorage::local_access_allowed();
     const bool mounted = SdStorage::mounted();
     const bool available = local && mounted && worker_task && AirSenseState::local_background_allowed();
-    const uint32_t catalog = EdfCatalog::revision(), files = SdStorage::files_revision();
+    const uint32_t catalog = EdfCatalog::revision(), files = SdStorage::files_revision(SdStorage::FileScope::Reports);
     bool changed = false, invalidated = false;
     portENTER_CRITICAL(&status_mux);
     // A deliberate USB unmount pauses reports, not a request to rebuild metadata.
@@ -4322,7 +4322,7 @@ bool submit(const Request &request, uint32_t &id, const char **error) {
     EdfCatalog::get_status(catalog);
     const bool current_index = catalog.ready &&
         catalog.generation == publication.catalog_generation &&
-        SdStorage::files_revision() == publication.files_revision;
+        SdStorage::files_revision(SdStorage::FileScope::Reports) == publication.files_revision;
     Job *slot = nullptr, *delivered = nullptr;
     size_t active = 0;
     bool background_active = false, days_active = false;
@@ -4459,7 +4459,7 @@ int poll(uint32_t id, Result &out) {
         get_status(publication);
         if (job.code == 200 && (!SdStorage::local_access_allowed() || !SdStorage::mounted() || !publication.mounted ||
             job.data_revision != publication.data_revision ||
-            SdStorage::files_revision() != job.files_revision)) { code = 409; break; }
+            SdStorage::files_revision(SdStorage::FileScope::Reports) != job.files_revision)) { code = 409; break; }
         EdfCatalog::Status catalog;
         EdfCatalog::get_status(catalog);
         // A saved index is explicitly stale, but usable before the RAM index

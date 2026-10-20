@@ -1142,14 +1142,14 @@ struct Run::DayWork {
         EdfCatalog::get_status(published);
         if (continuing && !strcmp(day, selected) && published.ready &&
             catalog_revision == EdfCatalog::revision() &&
-            files_revision == SdStorage::files_revision()) {
+            files_revision == SdStorage::files_revision(SdStorage::FileScope::Export)) {
             source = storage;
             return true;
         }
         DaySnapshot fresh;
         if (!snapshot_day(storage, selected, fresh, error, error_size)) return false;
         const uint32_t catalog = EdfCatalog::revision();
-        const uint32_t files = SdStorage::files_revision();
+        const uint32_t files = SdStorage::files_revision(SdStorage::FileScope::Export);
         const bool same_day = !strcmp(day, selected);
         const bool external_change = files_revision != files;
         const bool roots_changed = external_change || catalog_revision != catalog;
@@ -1536,7 +1536,7 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
                         EdfCatalog::Status catalog;
                         EdfCatalog::get_status(catalog);
                         if (catalog.ready && work.catalog_revision == EdfCatalog::revision() &&
-                            work.files_revision == SdStorage::files_revision()) {
+                            work.files_revision == SdStorage::files_revision(SdStorage::FileScope::Export)) {
                             work.source = *checkpoint.storage;
                             run.checkpointed_ = false;
                             return true;
@@ -1546,7 +1546,7 @@ bool Run::sync_day(SdStorage::Session &storage, const char *day, bool repair,
                         // Finish that HTTP body, then refresh roots before any
                         // verification or processing of the day's manifest.
                         if (catalog.ready && !checkpoint.root &&
-                            work.files_revision == SdStorage::files_revision()) return true;
+                            work.files_revision == SdStorage::files_revision(SdStorage::FileScope::Export)) return true;
                         return false;
                     };
                 }

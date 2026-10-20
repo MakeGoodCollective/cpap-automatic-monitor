@@ -163,7 +163,7 @@ static bool read_valid_header(fs::File &file, Header &header) {
 
 // Called only under the catalog mutex and the caller's SD ownership.
 static bool load_catalog() {
-    const uint32_t revision = SdStorage::files_revision();
+    const uint32_t revision = SdStorage::files_revision(SdStorage::FileScope::Catalog);
     if (status.ready && validated_files_revision == revision) return true;
     storage = SdStorage::filesystem();
     if (!storage) return false;
@@ -181,7 +181,7 @@ static bool load_catalog() {
         return false;
     }
     if (!read_valid_entries(file, header, loaded) ||
-        revision != SdStorage::files_revision()) {
+        revision != SdStorage::files_revision(SdStorage::FileScope::Catalog)) {
         aircannect::Memory::free(loaded);
         set_error("validation failed");
         return false;
@@ -248,7 +248,7 @@ static void recover_catalog() {
 }  // namespace
 
 void init() {
-    if (status.ready && validated_files_revision == SdStorage::files_revision()) return;
+    if (status.ready && validated_files_revision == SdStorage::files_revision(SdStorage::FileScope::Catalog)) return;
     portENTER_CRITICAL(&status_mux);
     status.error[0] = 0;
     __atomic_add_fetch(&status_revision, 1, __ATOMIC_RELEASE);
@@ -446,7 +446,7 @@ bool snapshot_day(const char *day, Entry *&out, uint32_t &count) {
 void get_status(Status &out) {
     portENTER_CRITICAL(&status_mux);
     out = status;
-    out.ready &= validated_files_revision == SdStorage::files_revision();
+    out.ready &= validated_files_revision == SdStorage::files_revision(SdStorage::FileScope::Catalog);
     portEXIT_CRITICAL(&status_mux);
 }
 
@@ -457,7 +457,7 @@ uint32_t revision() {
 bool changes_since(uint32_t generation, Changes &out) {
     portENTER_CRITICAL(&status_mux);
     out.catalog = status;
-    out.catalog.ready &= validated_files_revision == SdStorage::files_revision();
+    out.catalog.ready &= validated_files_revision == SdStorage::files_revision(SdStorage::FileScope::Catalog);
     const uint32_t distance = status.generation - generation;
     const bool complete = out.catalog.ready && distance <= change_count;
     out.count = complete ? distance : 0;

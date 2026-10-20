@@ -487,7 +487,7 @@ struct SmbSource {
     const char *path;
     bool root;
     uint64_t size = 0, offset = 0;
-    uint32_t files = SdStorage::files_revision(), catalog = EdfCatalog::revision();
+    uint32_t files = SdStorage::files_revision(SdStorage::FileScope::Export), catalog = EdfCatalog::revision();
     SdStorage::Session token = storage;
 
     bool checkpoint(RunContext &run, SdStorage::Reader *input, bool &changed,
@@ -507,7 +507,7 @@ struct SmbSource {
             copy_text(error, error_size, "preempted");
             return false;
         }
-        changed = files != SdStorage::files_revision() ||
+        changed = files != SdStorage::files_revision(SdStorage::FileScope::Export) ||
             (root && catalog != EdfCatalog::revision());
         token = storage;
         if (!changed && input && (!input->open(storage, path) ||
@@ -821,7 +821,7 @@ static bool sync_smb_file(StorageSmbClient &client, const char *local_path,
         SmbSource source{local_path, root != nullptr};
         bool changed = false;
         if (!source.checkpoint(run, nullptr, changed, error, error_size)) return false;
-        if (root && (root->files_revision != SdStorage::files_revision() ||
+        if (root && (root->files_revision != SdStorage::files_revision(SdStorage::FileScope::Export) ||
                      root->catalog_revision != EdfCatalog::revision())) {
             if (!config) { copy_text(error, error_size, "source_changed"); return false; }
             if (!read_root_state(*config, local_path, buffer, buffer_size, refreshed,
@@ -1021,7 +1021,7 @@ static Backlog completed_backlog(const RunContext &run, const EdfCatalog::Status
     EdfCatalog::Status current;
     EdfCatalog::get_status(current);
     if (!current.ready || current.generation != catalog.generation ||
-        SdStorage::files_revision() != files_revision || run_interrupted(run)) return {};
+        SdStorage::files_revision(SdStorage::FileScope::Export) != files_revision || run_interrupted(run)) return {};
 
     Backlog completed = {};
     completed.known = true;
@@ -1058,7 +1058,7 @@ static bool run_smb(const Request &request, RunContext &run) {
     set_state(State::Working);
     advance_export(run, 0, "catalog");
 
-    const uint32_t files_revision = SdStorage::files_revision();
+    const uint32_t files_revision = SdStorage::files_revision(SdStorage::FileScope::Export);
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
     if (!catalog.ready) {
@@ -1296,7 +1296,7 @@ static bool run_sleephq(const Request &request, RunContext &run) {
     set_sleephq_state(State::Working);
     advance_export(run, 0, "catalog");
 
-    const uint32_t files_revision = SdStorage::files_revision();
+    const uint32_t files_revision = SdStorage::files_revision(SdStorage::FileScope::Export);
     EdfCatalog::Status catalog;
     EdfCatalog::get_status(catalog);
     if (!catalog.ready) {
@@ -1515,7 +1515,7 @@ static void retain_backlog_counts(Backlog &current, const Backlog &previous) {
 }
 
 static void refresh_backlog() {
-    const uint32_t files_revision = SdStorage::files_revision();
+    const uint32_t files_revision = SdStorage::files_revision(SdStorage::FileScope::Export);
     EdfCatalog::Changes changes;
     const bool incremental = EdfCatalog::changes_since(backlog_catalog_generation, changes);
     const auto &catalog = changes.catalog;
@@ -1660,7 +1660,7 @@ static void refresh_backlog() {
     EdfCatalog::Status current;
     EdfCatalog::get_status(current);
     if (!storage.valid() || !current.ready || current.generation != catalog.generation ||
-        SdStorage::files_revision() != files_revision ||
+        SdStorage::files_revision(SdStorage::FileScope::Export) != files_revision ||
         Config::revision(Config::Section::Smb) != smb_revision ||
         Config::revision(Config::Section::SleepHq) != shq_revision) {
         // An interrupted marker read is not evidence that the marker is absent.
@@ -2058,7 +2058,7 @@ static void validate_backlog(Backlog &out, Config::Section section) {
     if (!catalog.ready || !SdStorage::mounted() ||
         out.config_revision != Config::revision(section) ||
         out.catalog_generation != catalog.generation ||
-        out.files_revision != SdStorage::files_revision()) out = {};
+        out.files_revision != SdStorage::files_revision(SdStorage::FileScope::Export)) out = {};
 }
 
 uint32_t revision() {
@@ -2067,7 +2067,7 @@ uint32_t revision() {
 
 PublicationStamp publication_stamp() {
     return {revision(), Config::revision(Config::Section::Smb),
-        Config::revision(Config::Section::SleepHq), EdfCatalog::revision(), SdStorage::files_revision(),
+        Config::revision(Config::Section::SleepHq), EdfCatalog::revision(), SdStorage::files_revision(SdStorage::FileScope::Export),
         WiFiSetup::revision(), Arbiter::get_state(), AirSenseState::rop(),
         SdStorage::mounted(), SdStorage::local_access_allowed(),
         __atomic_load_n(&backlog_refresh, __ATOMIC_ACQUIRE),

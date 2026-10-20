@@ -2856,7 +2856,7 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
 
     session_native_day = day;
     if (str_collected.day != day || str_collected.device != identity.generation ||
-        str_collected.generation != generation || str_collected.files != SdStorage::files_revision() ||
+        str_collected.generation != generation || str_collected.files != SdStorage::files_revision(SdStorage::FileScope::Recording) ||
         str_collected.clock != __atomic_load_n(&clock_write_generation, __ATOMIC_ACQUIRE))
         clear_str_collection();
     auto &trace = str_collected.trace;
@@ -2868,7 +2868,7 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
         str_collected.day = day;
         str_collected.device = identity.generation;
         str_collected.generation = generation;
-        str_collected.files = SdStorage::files_revision();
+        str_collected.files = SdStorage::files_revision(SdStorage::FileScope::Recording);
         str_collected.clock = __atomic_load_n(&clock_write_generation, __ATOMIC_ACQUIRE);
         str_collected.ready = collect_str_summary(record, generation, trace,
                                                   str_collected.cursor, compare_saved && !required);
@@ -2954,7 +2954,7 @@ static bool refresh_str_day(uint16_t day, uint32_t generation,
         }
         SdStorage::release();
         if (file_changed && !count) {
-            SdStorage::notify_files_changed();
+            SdStorage::notify_files_changed("/STR.edf");
             ExportSync::request_backlog_refresh(true);
         }
         if (success && summary_ready && (catalog_changed || file_changed || pending_resolved)) {
@@ -3099,7 +3099,7 @@ static PendingResult sync_pending() {
 
     // SD contention must not cause a ZEN/SSD probe loop before any useful work.
     const bool catch_up_pending = routine_str.active || !have_synced_generation ||
-        synced_device_generation != identity.generation || synced_files_revision != SdStorage::files_revision();
+        synced_device_generation != identity.generation || synced_files_revision != SdStorage::files_revision(SdStorage::FileScope::Recording);
     if (!SdStorage::try_acquire(catch_up_pending)) return PendingResult::Deferred;
     SdStorage::release();
     const uint32_t device = identity.generation;
@@ -3107,12 +3107,12 @@ static PendingResult sync_pending() {
     if (!read_u32_variable("ZEN", generation)) return PendingResult::Failed;
     if (device != AirSenseState::identity_generation()) return PendingResult::Deferred;
     if (routine_str.active && (routine_str.device != device ||
-        routine_str.generation != generation || routine_str.files != SdStorage::files_revision())) {
+        routine_str.generation != generation || routine_str.files != SdStorage::files_revision(SdStorage::FileScope::Recording))) {
         routine_str = {};
         clear_str_collection();
     }
     const bool same_device = have_synced_generation && device == synced_device_generation &&
-        synced_files_revision == SdStorage::files_revision();
+        synced_files_revision == SdStorage::files_revision(SdStorage::FileScope::Recording);
     if (!routine_str.active && same_device && generation == synced_str_generation) {
         request_summary_export();
         return PendingResult::Idle;
@@ -3139,14 +3139,14 @@ static PendingResult sync_pending() {
                 uint32_t(generation - synced_str_generation) != 1)) first = min(first, uint16_t(saved_day - 1));
             first = max(first, oldest);
             routine_str = {true, !same_device, device, generation,
-                           SdStorage::files_revision(), first, uint16_t(saved_day)};
+                           SdStorage::files_revision(SdStorage::FileScope::Recording), first, uint16_t(saved_day)};
         }
     }
     if (routine_str.active) {
         if (!refresh_str_day(routine_str.next_day, generation, identity, false,
                              "catch_up", routine_str.compare_saved ||
                              uint32_t(routine_str.next_day) + 1 < routine_str.saved_day)) return PendingResult::Failed;
-        routine_str.files = SdStorage::files_revision();
+        routine_str.files = SdStorage::files_revision(SdStorage::FileScope::Recording);
         if (routine_str.next_day++ < routine_str.saved_day) return PendingResult::More;
         saved_day = routine_str.saved_day;
         routine_str.active = false;
@@ -3156,7 +3156,7 @@ static PendingResult sync_pending() {
         synced_str_generation = generation;
         synced_device_generation = device;
         synced_saved_day = saved_day;
-        synced_files_revision = SdStorage::files_revision();
+        synced_files_revision = SdStorage::files_revision(SdStorage::FileScope::Recording);
         have_synced_generation = true;
         clear_str_collection();
         request_summary_export();
@@ -3169,7 +3169,7 @@ static void process_pending() {
     post_processing_yielded = false;
     if (pending_retry_delay_ms &&
         (pending_retry_device != AirSenseState::identity_generation() ||
-         pending_retry_files != SdStorage::files_revision() ||
+         pending_retry_files != SdStorage::files_revision(SdStorage::FileScope::Recording) ||
          pending_retry_clock != __atomic_load_n(&clock_write_generation, __ATOMIC_ACQUIRE))) {
         pending_retry_delay_ms = 0;
         next_pending_ms = 0;
@@ -3201,7 +3201,7 @@ static void process_pending() {
         pending_retry_delay_ms = min(STR_RETRY_MAX_MS,
             pending_retry_delay_ms ? pending_retry_delay_ms * 2 : STR_RETRY_MIN_MS);
         pending_retry_device = AirSenseState::identity_generation();
-        pending_retry_files = SdStorage::files_revision();
+        pending_retry_files = SdStorage::files_revision(SdStorage::FileScope::Recording);
         pending_retry_clock = __atomic_load_n(&clock_write_generation, __ATOMIC_ACQUIRE);
         next_pending_ms = millis() + pending_retry_delay_ms;
     } else {
