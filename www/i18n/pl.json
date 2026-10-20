@@ -693,7 +693,7 @@
   "ota.stagedSource": "Obraz tymczasowy #{id}",
   "ota.discardStagedUpload": "Odrzuć obraz tymczasowy",
   "ota.stagedUploadReady": "Firmware sprawdzono i zapisano tymczasowo. Jest gotowe do ręcznej instalacji.",
-  "ota.uploadVerifying": "Zapisywanie i sprawdzanie firmware...",
+  "ota.uploadSaving": "Zapisywanie firmware...",
   "ota.uploadSending": "Przesyłanie firmware...",
   "ota.uploadBootloader": "Zmodyfikowany bootloader do zrzutów firmware",
   "ota.resmedStatusUnavailable": "Oczekiwanie na bieżący status firmware ResMed. Akcje są wyłączone; operacje nie są ponawiane automatycznie.",

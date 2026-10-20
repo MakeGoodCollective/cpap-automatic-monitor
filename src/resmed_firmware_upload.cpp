@@ -50,12 +50,6 @@ bool interrupted() {
     return result;
 }
 
-bool partition_read(void *context, uint64_t offset, uint8_t *out, size_t size) {
-    const auto *source = static_cast<const esp_partition_t *>(context);
-    return !interrupted() && offset <= source->size && size <= source->size - offset &&
-        esp_partition_read(source, size_t(offset), out, size) == ESP_OK;
-}
-
 #if AB_STORAGE_HAS_SDCARD
 bool file_read(void *context, uint64_t offset, uint8_t *out, size_t size) {
     return !interrupted() && static_cast<SdStorage::Reader *>(context)->read_at(offset, out, size);
@@ -67,47 +61,14 @@ bool publish_file(SdStorage::Session &session, const char *part, const char *pat
     });
 }
 
-bool store_bootloader(SdStorage::Session &session, SdStorage::Reader &source,
-                      const ResmedFirmwareImage::Result &image, uint8_t *scratch,
-                      size_t scratch_size, char *destination, bool explicit_bootloader) {
-    using namespace ResmedFirmwareImage;
-    if (!explicit_bootloader && image.dump_extension != DumpExtension::Recognized) return true;
-    if (!image.bid_supported || image.status != ResmedFirmwareImage::Status::Ok) return !explicit_bootloader;
-    const BlockCheck *blx = nullptr;
-    for (size_t i = 0; i < image.block_count; ++i)
-        if (image.blocks[i].range.block == Block::BLX) blx = &image.blocks[i];
-    if (!blx || !blx->crc_ok) return !explicit_bootloader;
-    if (!ResmedFirmwareRepository::bootloader_path(image.bid, destination, 256)) return false;
-    if (image.target == Block::BLX) return session.ensure_parent(destination);
-    bool exists = false;
-    if (!session.run([&](fs::FS &fs) { exists = fs.exists(destination); return true; })) return false;
-    if (exists) { destination[0] = 0; return true; }
-    char temporary[256];
-    snprintf(temporary, sizeof(temporary), "%s.part", destination);
-    if (!session.ensure_parent(destination) || !session.run([&](fs::FS &fs) {
-        return !fs.exists(temporary);
-    })) return false;
-    SdStorage::Writer output;
-    bool ok = output.open(session, temporary);
-    for (size_t offset = 0; ok && offset < blx->range.size;) {
-        const size_t size = std::min(scratch_size, size_t(blx->range.size) - offset);
-        ok = file_read(&source, blx->source_offset + offset, scratch, size) && output.write(scratch, size);
-        offset += size;
-    }
-    ok = ok && output.finish(blx->range.size);
-    output.close();
-    if (ok) ok = publish_file(session, temporary, destination);
-    if (ok) ResmedFirmwareRepository::notify_published(destination);
-    else session.mutate(temporary, [&](fs::FS &fs) { return !fs.exists(temporary) || fs.remove(temporary); });
-    destination[0] = 0;
-    return ok;
-}
 #endif
 
 void run_upload() {
     xSemaphoreTake(mutex, portMAX_DELAY);
     const Destination destination = status.destination;
+#if AB_STORAGE_HAS_SDCARD
     const bool explicit_bootloader = status.bootloader;
+#endif
     const uint32_t id = status.id;
     const uint32_t expected_size = status.size;
     char path[256];
@@ -193,28 +154,25 @@ void run_upload() {
 
     if (!failure && !interrupted()) {
         xSemaphoreTake(mutex, portMAX_DELAY);
-        status.state = State::Verifying;
+        status.state = State::Finalizing;
         changed();
         xSemaphoreGive(mutex);
-        ResmedFirmwareImage::Reader reader;
-        reader.size = written;
-        if (destination == Destination::Staging) {
-            reader.context = const_cast<esp_partition_t *>(partition);
-            reader.read_at = partition_read;
-        }
 #if AB_STORAGE_HAS_SDCARD
-        else if (!output.finish(written) || !input.open(session, temporary)) failure = "sd_finish_failed";
-        else { reader.context = &input; reader.read_at = file_read; }
-#endif
-        if (!failure) {
-            ResmedFirmwareImage::inspect(reader, image, {}, ring, capacity);
-            if (image.status == ResmedFirmwareImage::Status::ReadError ||
-                image.status == ResmedFirmwareImage::Status::InvalidArgument)
-                failure = "image_read_failed";
-            if (explicit_bootloader && (written != 0x4000 ||
-                image.status != ResmedFirmwareImage::Status::Ok || !image.bid_supported ||
-                !image.bid_matches || !image.crc_ok())) failure = "invalid_bootloader";
+        if (destination == Destination::Repository && !output.finish(written)) failure = "sd_finish_failed";
+        if (!failure && explicit_bootloader) {
+            if (!input.open(session, temporary)) failure = "image_read_failed";
+            else {
+                ResmedFirmwareImage::Reader reader{&input, written, file_read};
+                ResmedFirmwareImage::inspect(reader, image, {}, ring, capacity);
+                if (written != 0x4000 || image.status != ResmedFirmwareImage::Status::Ok ||
+                    !image.bid_supported || !image.bid_matches || !image.crc_ok())
+                    failure = "invalid_bootloader";
+                else if (!ResmedFirmwareRepository::bootloader_path(image.bid, path, sizeof(path)) ||
+                         !session.ensure_parent(path)) failure = "bootloader_store_failed";
+            }
+            input.close();
         }
+#endif
         xSemaphoreTake(mutex, portMAX_DELAY);
         if (!failure && !status.error[0]) {
             sealed = true;
@@ -224,12 +182,6 @@ void run_upload() {
         xSemaphoreGive(mutex);
 #if AB_STORAGE_HAS_SDCARD
         if (!failure && !interrupted() && destination == Destination::Repository) {
-            char bootloader[256] = {};
-            if (!store_bootloader(session, input, image, ring, std::min(capacity, MAX_CHUNK_BYTES), bootloader,
-                                  explicit_bootloader))
-                failure = "bootloader_store_failed";
-            if (*bootloader) snprintf(path, sizeof(path), "%s", bootloader);
-            input.close();
             if (!failure && !(committed = publish_file(session, temporary, path))) failure = "publish_failed";
             if (committed) ResmedFirmwareRepository::notify_published(path);
         }
@@ -479,7 +431,7 @@ bool copy_source(uint32_t id, Source &out) {
     if (!mutex) return false;
     xSemaphoreTake(mutex, portMAX_DELAY);
     if (id && status.id == id && status.source_ready && !claimed && status.destination == Destination::Staging)
-        out = {partition, status.size, status.id, status.image};
+        out = {partition, status.size, status.id};
     xSemaphoreGive(mutex);
     return out.partition != nullptr;
 }
@@ -493,7 +445,7 @@ bool claim_source(uint32_t id, Source &out, const char **error) {
         OtaManager::begin_resmed_flash(error, true)) {
         claimed = true;
         status.cancel_allowed = false;
-        out = {partition, status.size, status.id, status.image};
+        out = {partition, status.size, status.id};
         changed();
     }
     xSemaphoreGive(mutex);

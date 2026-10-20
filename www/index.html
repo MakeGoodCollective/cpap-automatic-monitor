@@ -5504,10 +5504,10 @@ function renderResmedStatus() {
   const uploadWritten = Math.max(upload?.written || 0,
     firmwareUploadId !== null && upload?.id === firmwareUploadId ? firmwareUploadProgress.sent : 0);
   const phase = showUpload ? uiMessage(localUpload ?
-    (firmwareUploadProgress.failed ? 'ota.phase.Error' : firmwareUploadRequest ? 'ota.uploadSending' : 'ota.uploadVerifying') :
+    (firmwareUploadProgress.failed ? 'ota.phase.Error' : firmwareUploadRequest ? 'ota.uploadSending' : 'ota.uploadSaving') :
     upload?.error ? 'ota.phase.Error' : upload?.ready ?
       (upload.repository ? 'ota.repositoryUploadReady' : 'ota.stagedUploadReady') :
-    upload?.active ? (uploadWritten < upload.size ? 'ota.uploadSending' : 'ota.uploadVerifying') :
+    upload?.active ? (uploadWritten < upload.size ? 'ota.uploadSending' : 'ota.uploadSaving') :
     'ota.phase.Idle') : firmwarePhase(state.phase);
   uiText(document.getElementById('flashPhase'), !resmedFresh ? uiMessage('ota.resmedStatusUnavailable') :
     phase);
@@ -5609,7 +5609,7 @@ async function uploadFile(file, repository = false, bootloader = false) {
       renderResmedStatus();
     }
     if (lastStatus.firmware_upload?.id !== firmwareUploadId || lastStatus.firmware_upload.active)
-      appendFirmwareMessages([uiMessage('ota.uploadVerifying')]);
+      appendFirmwareMessages([uiMessage('ota.uploadSaving')]);
     return firmwareUploadId;
   } catch(error) {
     if (!controller.signal.aborted && connection === resmedConnectionSerial) {

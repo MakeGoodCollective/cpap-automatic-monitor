@@ -11,7 +11,7 @@ namespace ResmedFirmwareUpload {
 constexpr size_t MAX_IMAGE_BYTES = 1024 * 1024;
 constexpr size_t MAX_CHUNK_BYTES = 4096;
 enum class Destination : uint8_t { Repository, Staging };
-enum class State : uint8_t { Idle, Receiving, Verifying, Ready, Failed, Cancelled };
+enum class State : uint8_t { Idle, Receiving, Finalizing, Ready, Failed, Cancelled };
 enum class Result : uint8_t {
     Accepted, Busy, Unsupported, Unavailable, InvalidName, InvalidSize,
     UnknownId, InvalidChunk, QueueFull, NoMemory, Closed
@@ -38,7 +38,6 @@ struct Source {
     const esp_partition_t *partition = nullptr;
     uint32_t size = 0;
     uint32_t token = 0;
-    ResmedFirmwareImage::Result image;
 };
 
 void init();
@@ -72,8 +71,8 @@ using Drained = std::function<void(bool success)>;
 Result when_drained(uint32_t id, size_t end, Drained notify);
 
 // Staging Ready retains the OtaManager manual-upload reservation and partition
-// until the read-only engine releases this exact token. Verification never
-// releases the lease early. Source has no owning allocation. Repository Ready
+// until the engine releases this exact token. Image inspection belongs to
+// the programmer, not ordinary upload. Source has no owning allocation. Repository Ready
 // releases all ingress buffers/session/lease before publishing complete.
 bool copy_source(uint32_t id, Source &out);
 // Atomically promotes the manual-upload lease to ResMed ownership. A claimed

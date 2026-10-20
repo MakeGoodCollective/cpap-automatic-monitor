@@ -377,7 +377,7 @@ static void appendFirmwareUpload(Output &json, const ResmedFirmwareUpload::Statu
     using State = ResmedFirmwareUpload::State;
     jsonAddUInt32(json, "revision", status.revision, false);
     jsonAddUInt32(json, "id", status.id);
-    jsonAddBool(json, "active", status.state == State::Receiving || status.state == State::Verifying);
+    jsonAddBool(json, "active", status.state == State::Receiving || status.state == State::Finalizing);
     jsonAddBool(json, "ready", status.source_ready);
     jsonAddBool(json, "cancel_allowed", status.cancel_allowed);
     jsonAddBool(json, "repository", status.destination == ResmedFirmwareUpload::Destination::Repository);
@@ -386,7 +386,7 @@ static void appendFirmwareUpload(Output &json, const ResmedFirmwareUpload::Statu
     jsonAddUInt32(json, "written", status.written);
     jsonAddString(json, "path", status.path);
     jsonAddString(json, "error", status.error);
-    appendFirmwareImage(json, status.image);
+    if (status.bootloader) appendFirmwareImage(json, status.image);
 }
 
 template<class Output>

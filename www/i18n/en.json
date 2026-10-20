@@ -689,7 +689,7 @@
   "ota.stagedSource": "Staged upload #{id}",
   "ota.discardStagedUpload": "Discard staged image",
   "ota.stagedUploadReady": "Firmware checked and staged. Ready for manual installation.",
-  "ota.uploadVerifying": "Saving and checking firmware...",
+  "ota.uploadSaving": "Saving firmware...",
   "ota.uploadSending": "Uploading firmware...",
   "ota.uploadBootloader": "Patched bootloader for firmware dumps",
   "ota.resmedStatusUnavailable": "Waiting for current ResMed firmware status. Actions are disabled; no operation is retried automatically.",

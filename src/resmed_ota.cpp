@@ -224,14 +224,7 @@ bool prepare(Input &input, Plan &plan) {
     options.target = full ? Image::Block::FULL : selected;
     const auto shape = full ? Image::Block::FULL : selected != Image::Block::Unknown
         ? selected : input.size == BLX_BYTES ? Image::Block::BLX : Image::Block::Unknown;
-    const auto &staged_image = work.staged.image;
-    const bool inspected_staging = work.source == Source::Staging &&
-        staged_image.status == Image::Status::Ok && staged_image.size == input.size &&
-        staged_image.platform == plan.profile->platform && staged_image.target == shape;
-    // The promoted upload lease preserves these exact bytes and their inspector
-    // facts. Do not repeat its CRC pass. Unclassified blocks need target/layout.
-    if (inspected_staging) plan.image = staged_image;
-    else if (!Image::inspect(input.reader(), plan.image, options, input.scratch, SOURCE_CHUNK)) {
+    if (!Image::inspect(input.reader(), plan.image, options, input.scratch, SOURCE_CHUNK)) {
         portENTER_CRITICAL(&status_mux);
         published.image = plan.image;
         ++published.revision;
