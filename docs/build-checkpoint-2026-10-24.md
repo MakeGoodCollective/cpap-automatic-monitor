@@ -162,9 +162,9 @@ The working baseline means the project can now build on the existing decoded liv
 
 ## Immediate next software goal
 
-Add the smallest possible diagnostic monitoring layer on top of the existing live data path before implementing alarms.
+Add the smallest possible **temporary diagnostic capture** layer on top of the existing live data path before implementing alarms.
 
-The next implementation should expose or log enough information to characterize deliberate test cases such as:
+The AirSense itself already records the long-term therapy data. The ESP32 should therefore **not become a redundant physiological data logger**. For development, it only needs enough short-lived history to characterize deliberate test cases such as:
 
 - normal therapy,
 - intentional leak,
@@ -172,9 +172,13 @@ The next implementation should expose or log enough information to characterize 
 - mask replacement,
 - therapy stop/start.
 
-The first detector should remain observational: log state changes, leak/flow/pressure behavior, and candidate mask-off intervals without yet triggering the final alarm/snooze/escalation behavior.
+The diagnostic capture should hold a limited trace in RAM/PSRAM and make it downloadable over the local web interface, for example as CSV. It is acceptable for this diagnostic trace to disappear on reboot; its purpose is algorithm development, not clinical archival.
 
-Those measurements can then be used to choose thresholds and timing rules based on actual AirSense data rather than assumptions.
+The first detector should remain observational: record pressure/flow/leak behavior and candidate mask-off intervals without yet triggering the final alarm/snooze/escalation behavior.
+
+Those measurements can then be compared with the AirSense's own recorded data and used to choose thresholds and timing rules based on actual behavior rather than assumptions.
+
+An SD-card attachment is therefore **not required for this phase**. Persistent AirBridge storage can be reconsidered later only if a real need emerges that is not already met by the CPAP's own SD-card record.
 
 ## Planned later behavior
 
@@ -182,11 +186,10 @@ After reliable live-state detection is established, likely additions include:
 
 - local mask-off alarm,
 - short and long snooze options,
-- event logging,
+- compact event logging for alarm-system-specific events such as detections, snoozes, and escalations,
 - longest mask-off interval,
-- large-leak episode tracking,
-- overnight summary,
+- large-leak episode tracking if useful for alarm logic,
 - remote escalation after a sustained problem,
 - optional phone-motion context if real data shows it helps.
 
-The first implementation should avoid unnecessary behavioral rules until real overnight data is available.
+The ESP32 should avoid duplicating long-term pressure/flow/leak history already recorded by the AirSense.
