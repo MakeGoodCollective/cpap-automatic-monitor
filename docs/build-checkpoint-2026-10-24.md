@@ -75,6 +75,77 @@ The upstream AirBridge code defines live stream schemas that include fields such
 
 Additional stream schemas in the upstream code include event and breathing-summary channels such as APN, CSN, PBT, and BRH.
 
+## AirBridge firmware baseline verified
+
+The AirBridge-derived firmware has now been built and flashed successfully to the XIAO ESP32-S3 Plus using the repository's `xiao-esp32s3-plus` PlatformIO target.
+
+Verified end-to-end path:
+
+```text
+AirSense 10
+  -> custom service-UART connector
+  -> XIAO ESP32-S3 Plus
+  -> AirBridge firmware
+  -> Wi-Fi
+  -> browser dashboard
+```
+
+The existing AirBridge dashboard has been verified to show:
+
+- AirSense state transitions between `STANDBY` and `THERAPY`,
+- live mask pressure,
+- live respiratory flow,
+- live mask leak.
+
+Starting and stopping therapy at the CPAP is reflected correctly in the browser dashboard. This establishes a known-good baseline for the UART decoder, live data path, web UI, and prototype hardware.
+
+## Home-network baseline verified
+
+The ESP32 has also been verified to connect to the normal 2.4 GHz home Wi-Fi network in AirBridge `Auto` mode.
+
+Confirmed:
+
+- the selected home access point is visible at strong signal level,
+- STA association succeeds,
+- DHCP assigns a LAN address,
+- the dashboard is reachable over the normal home LAN,
+- `airbridge.local` resolves and loads, confirming mDNS operation,
+- the fallback AirBridge AP can remain available only as a recovery path while Auto mode handles normal STA operation.
+
+The actual private SSID, password, and DHCP address are intentionally not recorded in this public repository.
+
+## Wi-Fi troubleshooting note: duplicate SSID profiles
+
+A configuration trap was found while correcting capitalization of a saved SSID.
+
+The setup/configuration flow added a second Wi-Fi profile rather than replacing the original profile. This left two saved entries whose SSIDs differed only by capitalization. AirBridge scan matching is case-insensitive, so the stale first profile could still match the visible access point and continue to be selected.
+
+Symptoms included repeated transitions through scanning, connecting, and AP fallback, while the serial debug log showed the stale SSID spelling.
+
+Useful diagnostics were:
+
+```text
+$WIFI STATUS
+$WIFI LIST
+$LOG WIFI DEBUG
+```
+
+USB serial debug output can be monitored at 115200 baud with:
+
+```bash
+pio device monitor -b 115200
+```
+
+The stale profile was identified with `$WIFI LIST` and removed with:
+
+```text
+$WIFI REMOVE <slot>
+```
+
+After removal, the remaining corrected profile connected successfully.
+
+This behavior is worth keeping in mind for a future firmware/UI fix: editing an existing SSID should not silently leave a stale case-variant profile that can continue to win matching/selection.
+
 ## Upstream code status
 
 The current repository is a fork of AirBridge and already contains:
@@ -84,29 +155,26 @@ The current repository is a fork of AirBridge and already contains:
 - live stream schema discovery and fallback handling,
 - decoding logic for live frames,
 - web UI generation code,
-- and supporting logging/network infrastructure.
+- network and mDNS support,
+- and supporting logging infrastructure.
 
-This means the next step should be to build on the existing AirBridge implementation rather than re-create the protocol parser from scratch.
+The working baseline means the project can now build on the existing decoded live values rather than re-create the protocol parser or network stack.
 
 ## Immediate next software goal
 
-Get the existing AirBridge-derived firmware running on the prototype hardware and expose useful live values through the existing local interface.
+Add the smallest possible diagnostic monitoring layer on top of the existing live data path before implementing alarms.
 
-Priority live values:
+The next implementation should expose or log enough information to characterize deliberate test cases such as:
 
-1. mask pressure,
-2. respiratory flow,
-3. leak.
-
-Then deliberately test:
-
-- therapy running normally,
-- breathing waveform response,
+- normal therapy,
 - intentional leak,
-- mask removal,
-- mask replacement.
+- complete mask removal,
+- mask replacement,
+- therapy stop/start.
 
-Those observations will guide the actual mask-off / large-leak detection thresholds and timing logic.
+The first detector should remain observational: log state changes, leak/flow/pressure behavior, and candidate mask-off intervals without yet triggering the final alarm/snooze/escalation behavior.
+
+Those measurements can then be used to choose thresholds and timing rules based on actual AirSense data rather than assumptions.
 
 ## Planned later behavior
 
